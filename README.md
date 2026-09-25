@@ -49,10 +49,21 @@ In practice, most models are smaller because symbols with a zero histogram count
 
 The rank table is generated during the first compression pass from the symbol histogram.
 
+**Note:** if at compression we detect that the data is too random to get a gain, we store the value 255 for k, no rank table and encode raw value.
+
+### Two passes
+
+As we use static models, we need two passes to compress the texture :
+* first pass will collect histograms for all models, sort the rank table and choose the best k
+* second pass wil encode the texture in the stream
+
+### Multiple streams
+
+As the decompression happens on the GPU we need to decompress in parallel multiple streams. The texture is split in 64 parts vertically, each thread decodes a part of the image. As Rice encoding output is non-fixed, we stored in the stream 64 offsets (uint32_t) so each thread knows where to start.
+
 ### Endpoints
 
 BC1 endpoints are predicted from the previous block's endpoints.
-
 Three independent Rice-Golomb models are used for the R, G, and B components.
 
 For each block:
@@ -64,7 +75,6 @@ blue_delta  = (current_blue  - previous_blue) - green_delta / 2
 ```
 
 The deltas are then encoded using their respective Rice-Golomb models.
-
 The blocks are traversed in a zigzag order to avoid a discontinuity at the end of each scanline:
 
 ```C
@@ -73,17 +83,27 @@ uint32_t zigzag_x = (y & 1) ? x : width - x - 1;
 
 This keeps the prediction direction continuous when moving from one scanline to the next.
 
-## Indices
+**Note:** it might interesting to just store the delta without rank table, raw delta value with rice encoding (using zigzag to get unsigned value)
+
+```C
+static inline uint8_t zigzag8_encode(int8_t v)
+{
+    return (uint8_t)(((uint8_t)v << 1) ^ (v >> 7));
+}
+```
+
+### Indices
 
 BC1 contains a 32-bit index field for each block.
 
-### Top table
+#### Top table
 
-A top table is built from the most frequently occurring index patterns, sorted by usage frequency.
 
-A vector-quantization pass further refines the entries of the top table to better represent the index patterns found in the texture.
+* The compressor first scans the entire texture and builds a histogram of every unique 32-bit index pattern found.
+* It selects the Top 256 most frequently occurring index patterns to form the top_table.
+* The top table is refined using vector quantization. This algorithm implements Stochastic Bit-Level K-Means Clustering to optimize a BC1 VQ table. It uses Adaptive Jittered Sampling with error-feedback to efficiently assign image blocks to centroids based on Hamming Distance. Centroids are refined via Bitwise Majority Voting, flipping bits that differ in more than 50% of assigned blocks to mathematically minimize total bit-error across iterations.
 
-### Block indices
+#### Block indices
 
 For each block, we find the closest top-table entry using Hamming distance:
 
@@ -92,9 +112,7 @@ distance = popcount(block_indices XOR table_entry)
 ```
 
 The selected top-table index is encoded using a Rice-Golomb model.
-
 The XOR difference is then encoded as a sparse residual.
-
 First, a 4-bit mask identifies which bytes of the difference are non-zero:
 
 ```C
@@ -111,3 +129,66 @@ The mask itself is encoded using a Rice-Golomb model.
 For each set bit in the mask, the corresponding difference byte is encoded using a Rice-Golomb model.
 
 This avoids storing zero bytes in the residual and makes the representation particularly compact when the block is close to one of the top-table patterns.
+
+
+
+## Compressed stream
+
+Pseudo-description of the stream
+
+### Models
+* Endpoints red model
+* Endpoints green model
+* Endpoints blue model
+* Top-table reference model
+* Indices mask model
+* Table difference model
+
+### Top-table
+
+* number of top-table entry (uint8_t)
+* top-table entries (uint32_t each)
+
+### Offsets
+* 64 x stream start (uint32_t)
+
+### Data
+* Compressed rice encoded data
+
+
+## API
+
+```C
+
+typedef struct bc1_packed_mem_interface
+{
+    void*  (*malloc_fn)(size_t size, void* user);
+    void*  (*realloc_fn)(void* old_ptr, size_t old_size, size_t new_size, void* user);
+    void   (*free_fn)(void* ptr, void* user);
+    void*   user;
+} bc1_packed_mem_interface;
+
+bc1_packed_context* bc1_packed_init(bc1_packed_mem_interface* mem);
+
+size_t bc1_packed_compress(bc1_packed_context* ctx, const void* input, void* output);
+
+// cpu decompression, only for unit tests and validation
+void bc1_packed_uncompress(bc1_packed_context* ctx, const void* input, size_t length, void* output);
+```
+
+## Validation 
+
+Everything must be validated on CPU, on multiple images
+
+* Load a power-of-two image (stb_image.h)
+* Compress the image into BC1 (stb_dxt.h)
+* bc1_pack(), store the output stream. 
+* Compute the compression ratio
+* bc1_unpack, compare decompressed stream, should be byte-exact with BC1 texture
+* Gather total compression ratio
+* Proceed the next image
+
+
+To be interesting the ratio should be high than 1.4x, AC version of bc_crunch achieves 1.59:1, the huffman version 1.51:1 for example.
+
+Compression is expected to be a lot slower than decompression
