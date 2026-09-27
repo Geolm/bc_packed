@@ -20,6 +20,7 @@ typedef struct bc1_packed_context bc1_packed_context;
 
 bc1_packed_context* bc1_packed_init(bc1_packed_mem_interface* mem);
 size_t bc1_packed_maxsize(uint32_t width, uint32_t height);
-size_t bc1_packed_compress(const void* bc1_image, uint32_t width, uint32_t height, void* output);
+size_t bc1_packed_compress(bc1_packed_context* ctx, const void* bc1_image, uint32_t width, uint32_t height, void* output);
+void bc1_packed_terminate(bc1_packed_context* ctx);
 
 #endif
