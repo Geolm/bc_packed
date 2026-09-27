@@ -155,26 +155,6 @@ Pseudo-description of the stream
 * Compressed rice encoded data
 
 
-## API
-
-```C
-
-typedef struct bc1_packed_mem_interface
-{
-    void*  (*malloc_fn)(size_t size, void* user);
-    void*  (*realloc_fn)(void* old_ptr, size_t old_size, size_t new_size, void* user);
-    void   (*free_fn)(void* ptr, void* user);
-    void*   user;
-} bc1_packed_mem_interface;
-
-bc1_packed_context* bc1_packed_init(bc1_packed_mem_interface* mem);
-
-size_t bc1_packed_compress(bc1_packed_context* ctx, const void* input, void* output);
-
-// cpu decompression, only for unit tests and validation
-void bc1_packed_uncompress(bc1_packed_context* ctx, const void* input, size_t length, void* output);
-```
-
 ## Validation 
 
 Everything must be validated on CPU, on multiple images

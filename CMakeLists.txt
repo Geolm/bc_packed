@@ -11,8 +11,8 @@ if(MSVC)
     set(CMAKE_C_FLAGS_DEBUG "/Zi /Od /DDEBUG /W4")
     set(CMAKE_C_FLAGS_RELEASE "/O2 /W4")
 else()
-    set(CMAKE_C_FLAGS_DEBUG "-g -O0 -DDEBUG -Wpedantic -Werror -Wall -Wextra")
-    set(CMAKE_C_FLAGS_RELEASE "-O3 -Wpedantic -Werror -Wall -Wextra")
+    set(CMAKE_C_FLAGS_DEBUG "-g -O0 -DDEBUG -Wpedantic -Werror -Wall -Wextra -Wstrict-prototypes -Wgnu-empty-initializer -Wnewline-eof")
+    set(CMAKE_C_FLAGS_RELEASE "-O3 -Wpedantic -Werror -Wall -Wextra -Wstrict-prototypes -Wgnu-empty-initializer -Wnewline-eof")
 endif()
 
 add_executable(unit_tests
