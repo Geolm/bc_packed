@@ -17,7 +17,7 @@ The compressor is CPU-side and can use significantly more computation than the d
 
 ## Compression
 
-Several ideas are borrowed from [bc_crunch](https://github.com/Geolm/bc_crunch), but some techniques are adapted to make GPU decompression fast and simple:
+The techniques are adapted to make GPU decompression fast and simple:
 
 * **Rice-Golomb coding** instead of arithmetic or Huffman coding. Rice-Golomb decoding is particularly well suited to GPU execution because it requires only simple integer operations and bit manipulation.
 * **Static symbol ranking.** Symbols are remapped so that the most frequently used symbols have the lowest indices. The rank table is generated from a histogram during compression.
@@ -83,7 +83,7 @@ uint32_t zigzag_x = (y & 1) ? x : width - x - 1;
 
 This keeps the prediction direction continuous when moving from one scanline to the next.
 
-**Note:** it might interesting to just store the delta without rank table, raw delta value with rice encoding (using zigzag to get unsigned value)
+**Note:** For endpoints, we use adaptive models with zigzag8_encode to get unsigned value. Also BC1 color is R5G6B5 so delta always fit in 7 bits or less.
 
 ```C
 static inline uint8_t zigzag8_encode(int8_t v)
@@ -97,7 +97,6 @@ static inline uint8_t zigzag8_encode(int8_t v)
 BC1 contains a 32-bit index field for each block.
 
 #### Top table
-
 
 * The compressor first scans the entire texture and builds a histogram of every unique 32-bit index pattern found.
 * It selects the Top 256 most frequently occurring index patterns to form the top_table.
