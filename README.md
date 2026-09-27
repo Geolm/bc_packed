@@ -49,8 +49,6 @@ In practice, most models are smaller because symbols with a zero histogram count
 
 The rank table is generated during the first compression pass from the symbol histogram.
 
-**Note:** if at compression we detect that the data is too random to get a gain, we store the value 255 for k, no rank table and encode raw value.
-
 ### Two passes
 
 As we use static models, we need two passes to compress the texture :
@@ -59,7 +57,11 @@ As we use static models, we need two passes to compress the texture :
 
 ### Multiple streams
 
-As the decompression happens on the GPU we need to decompress in parallel multiple streams. The texture is split in 64 parts vertically, each thread decodes a part of the image. As Rice encoding output is non-fixed, we stored in the stream 64 offsets (uint32_t) so each thread knows where to start.
+As the decompression happens on the GPU we need to decompress in parallel multiple streams. The texture is split in 64 parts, each thread decodes a part of the image. 
+
+For example for a 1024x1024 texture : each thread will decode 256 blocks (in width) x 4 blocks (in height). In order to not depend on other threads, rice model are initialized in each thread (adaptive model are init and static are loaded le_static_model_load with the same data written in the stream)
+
+As Rice encoding output is non-fixed, we stored in the stream 64 offsets (uint32_t) so each thread knows where to start.
 
 ### Endpoints
 
@@ -133,12 +135,11 @@ This avoids storing zero bytes in the residual and makes the representation part
 
 ## Compressed stream
 
-Pseudo-description of the stream
+Pseudo-description of the stream.
+
+Note : the stream does not include width, height or format, only the compressed data. This is intended, it's up to the user to store that somewhere.
 
 ### Models
-* Endpoints red model
-* Endpoints green model
-* Endpoints blue model
 * Top-table reference model
 * Indices mask model
 * Table difference model
