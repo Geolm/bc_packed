@@ -47,3 +47,4 @@ size_t bc1_packed_compress(bc1_packed_context* ctx, const void* bc1_image, uint3
 size_t bc1_packed_uncompress(bc1_packed_context* ctx, const void* input, size_t input_length, void* output, size_t output_length);
 
 #endif
+

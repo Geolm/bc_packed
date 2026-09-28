@@ -349,7 +349,7 @@ void build_top_table(hashmap_entry* hashmap, const void* input, uint32_t num_blo
 }
 
 //-----------------------------------------------------------------------------------------------------------------------------
-void init_static_models(bc1_packed_context* ctx, const void* input, uint32_t width_blocks, uint32_t height_blocks, uint32_t strip_width)
+void init_static_models(bc1_packed_context* ctx, const void* input, uint32_t width_blocks, uint32_t strip_width)
 {
     uint32_t hist_red[1<<COLOR_DELTA_NUM_BITS];
     uint32_t hist_green[1<<COLOR_DELTA_NUM_BITS];
@@ -357,8 +357,6 @@ void init_static_models(bc1_packed_context* ctx, const void* input, uint32_t wid
     uint32_t hist_reference[TOP_TABLE_SIZE];
     uint32_t hist_mask[16];
     uint32_t hist_difference[LE_ALPHABET_SIZE];
-
-    bc1_block previous = {0};
 
     memset(hist_red, 0, sizeof(hist_red));
     memset(hist_green, 0, sizeof(hist_green));
@@ -499,7 +497,7 @@ size_t bc1_packed_compress(bc1_packed_context* ctx, const void* bc1_image, uint3
     const uint32_t strip_width = height_blocks / NUM_STRIPS;
 
     build_top_table(ctx->hashmap, bc1_image, num_blocks, ctx->top_table, &ctx->top_table_size);
-    init_static_models(ctx, bc1_image, width_blocks, height_blocks, strip_width);
+    init_static_models(ctx, bc1_image, width_blocks, strip_width);
 
     byte_stream stream = {.buffer = output, .length = output_length, .pos = 0};
 

@@ -37,7 +37,7 @@
 
 ## Build & Test
 
-- Config: `cmake -B build -S .`
+- Config: `cmake -B build -S . -DCMAKE_BUILD_TYPE=Release`
 - Build: `cmake --build build`
 - Clean: `rm -rf build/`
 - Test: `./build/unit_tests`
