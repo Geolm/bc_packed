@@ -596,7 +596,7 @@ size_t bc1_packed_compress(bc1_packed_context* ctx, const void* bc1_image, uint3
             }
         }
 
-        le_end_encode(&compressed_stream);
+        stream.pos += le_end_encode(&compressed_stream);
         stream_align(&stream, sizeof(uint32_t));
     }
 
