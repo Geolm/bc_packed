@@ -369,14 +369,12 @@ void init_static_models(bc1_packed_context* ctx, const void* input, uint32_t wid
 
     for(uint32_t strip_index=0; strip_index<NUM_STRIPS; ++strip_index)
     {
-        bc1_block previous = {0};
+        bc1_block previous = {.color = {bc1_pack_565(8, 16, 8), bc1_pack_565(24, 48, 24)}}; // TODO : better default previous, average?
         uint32_t start_y = strip_index * strip_width;
         for(uint32_t y = start_y; y < start_y + strip_width; ++y)
         {
             for(uint32_t x = 0; x < width_blocks; ++x)
             {
-
-    
                 // zig-zag pattern delta compression for colors
                 uint32_t zigzag_x = (y&1) ? x : width_blocks - x - 1;
 
@@ -434,7 +432,7 @@ void init_static_models(bc1_packed_context* ctx, const void* input, uint32_t wid
 
 
 //-----------------------------------------------------------------------------------------------------------------------------
-static inline stream_align(byte_stream* stream, size_t alignment)
+static inline void stream_align(byte_stream* stream, size_t alignment)
 {
     // align with 0 value padding
     while ((stream->pos % alignment) != 0 && stream->pos < stream->length)
@@ -511,6 +509,13 @@ size_t bc1_packed_compress(bc1_packed_context* ctx, const void* bc1_image, uint3
     if (!save_static_model(&ctx->difference_mask_model, &stream)) return 0;
     if (!save_static_model(&ctx->table_difference_model, &stream)) return 0;
 
+    if (stream.pos + ctx->top_table_size + 1 >= stream.length)
+        return 0;
+
+    stream.buffer[stream.pos++] = (uint8_t) (ctx->top_table_size - 1); // there is no zero toptable, so minus 1 to fit in a uint8_t
+    for(uint32_t i=0; i<ctx->top_table_size; ++i)
+        stream.buffer[stream.pos++] = ctx->top_table[i];
+
     stream_align(&stream, sizeof(uint16_t));
     size_t strips_offset_array_size = sizeof(uint16_t) * NUM_STRIPS;
 
@@ -522,21 +527,77 @@ size_t bc1_packed_compress(bc1_packed_context* ctx, const void* bc1_image, uint3
     uint16_t* strips_offset = (uint16_t*) &stream.buffer[stream.pos];
     stream.pos += strips_offset_array_size;
 
+    // compressed data is aligned on 4 bytes to allow fast gpu loading
+    stream_align(&stream, sizeof(uint32_t));
+    size_t previous_offset = stream.pos;
 
     for(uint32_t strip_index=0; strip_index<NUM_STRIPS; ++strip_index)
     {
-        bc1_block previous = {0};
+        le_stream compressed_stream;
+        le_init(&compressed_stream, &stream.buffer[stream.pos], stream.length - stream.pos);
+        le_begin_encode(&compressed_stream);
+
+        // strip offset is counted in dword, based on the previous one (delta compression)
+        strips_offset[strip_index] = (uint16_t)((stream.pos - previous_offset) / sizeof(uint32_t));
+        previous_offset = stream.pos;
+
+        bc1_block previous = {.color = {bc1_pack_565(8, 16, 8), bc1_pack_565(24, 48, 24)}};
         uint32_t start_y = strip_index * strip_width;
         for(uint32_t y = start_y; y < start_y + strip_width; ++y)
         {
             for(uint32_t x = 0; x < width_blocks; ++x)
             {
+                // zig-zag pattern delta compression for colors
+                uint32_t zigzag_x = (y&1) ? x : width_blocks - x - 1;
 
+                const bc1_block* current = (const bc1_block*) bc1_image + (y * width_blocks) + x;
+
+                for(uint32_t j=0; j<2; ++j)
+                {
+                    uint8_t current_red, current_green, current_blue;
+                    uint8_t previous_red, previous_green, previous_blue;
+
+                    bc1_extract_565(current->color[j], &current_red, &current_green, &current_blue);
+                    bc1_extract_565(previous.color[j], &previous_red, &previous_green, &previous_blue);
+
+                    int dred = current_red - previous_red;
+                    int dgreen = current_green - previous_green;
+                    int dblue = current_blue - previous_blue;
+
+                    le_encode_symbol(&compressed_stream, &ctx->green_model, dgreen + COLOR_DELTA_OFFSET);
+
+                    dgreen /= 2;
+                    dred -= dgreen;
+                    dblue -= dgreen;
+
+                    le_encode_symbol(&compressed_stream, &ctx->red_model, dred + COLOR_DELTA_OFFSET);
+                    le_encode_symbol(&compressed_stream, &ctx->blue_model, dblue + COLOR_DELTA_OFFSET);
+                }
+
+                uint8_t reference = nearest32(ctx->top_table, ctx->top_table_size, current->indices) & 0xff;
+
+                le_encode_symbol(&compressed_stream, &ctx->table_reference_model, reference);
+
+                uint32_t difference = current->indices ^ ctx->top_table[reference];
+                uint32_t mask = 0;
+                if ((difference & 0x000000FF) != 0) mask |= 1;
+                if ((difference & 0x0000FF00) != 0) mask |= 2;
+                if ((difference & 0x00FF0000) != 0) mask |= 4;
+                if ((difference & 0xFF000000) != 0) mask |= 8;
+
+                le_encode_symbol(&compressed_stream, &ctx->table_reference_model, reference);
+
+                for(uint32_t j=0; j<4; ++j)
+                    if (mask & (1u << j))
+                        le_encode_symbol(&compressed_stream, &ctx->table_difference_model, (difference >> (j*8)) & 0xff);
             }
         }
+
+        le_end_encode(&compressed_stream);
+        stream_align(&stream, sizeof(uint32_t));
     }
 
-    return 0;
+    return stream.length - stream.pos;
 }
 
 //-----------------------------------------------------------------------------------------------------------------------------
