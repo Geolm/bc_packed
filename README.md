@@ -169,6 +169,6 @@ Everything must be validated on CPU, on multiple images
 * Proceed the next image
 
 
-To be interesting the ratio should be high than 1.4x, AC version of bc_crunch achieves 1.59:1, the huffman version 1.51:1 for example.
+To be interesting the ratio should be higher than 1.4x.
 
-Compression is expected to be a lot slower than decompression
+Compression is expected to be a lot slower than decompression.

@@ -42,9 +42,9 @@ size_t bc1_packed_compress(bc1_packed_context* ctx, const void* bc1_image, uint3
 
 //----------------------------------------------------------------------------------------------------------------------------
 // CPU decompression, for unit tests and validation.
-// [output] must be at least width*height/2 bytes (width/height are read from the stream).
+// [output] must be at least width*height/2 bytes
 // Returns the number of bytes written (= width*height/2), or 0 on failure (the output is zeroed).
-size_t bc1_packed_uncompress(bc1_packed_context* ctx, const void* input, size_t input_length, void* output, size_t output_length);
+size_t bc1_packed_uncompress(bc1_packed_context* ctx, const void* input, size_t input_length, uint32_t width, uint32_t height, void* output);
 
 #endif
 
