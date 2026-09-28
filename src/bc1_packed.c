@@ -63,6 +63,13 @@ typedef struct bc1_block
     uint32_t indices;
 } bc1_block;
 
+typedef struct byte_stream
+{
+    uint8_t* buffer;
+    size_t length;
+    size_t pos;
+} byte_stream;
+
 
 //-----------------------------------------------------------------------------------------------------------------------------
 // Private functions
@@ -425,6 +432,33 @@ void init_static_models(bc1_packed_context* ctx, const void* input, uint32_t wid
     le_static_model_init(&ctx->table_difference_model, hist_difference, LE_ALPHABET_SIZE);
 }
 
+
+//-----------------------------------------------------------------------------------------------------------------------------
+static inline stream_align(byte_stream* stream, size_t alignment)
+{
+    // align with 0 value padding
+    while ((stream->pos % alignment) != 0 && stream->pos < stream->length)
+        stream->buffer[stream->pos++] = 0;
+}
+
+//-----------------------------------------------------------------------------------------------------------------------------
+static inline bool save_static_model(const le_model* model, byte_stream* stream)
+{
+    size_t model_size = 2 + model->num_symbols;
+
+    if (stream->pos + model_size >= stream->length || model->num_symbols == 0)
+        return false;
+
+    stream->buffer[stream->pos++] = (uint8_t)(model->num_symbols - 1); // at this point we know num_symbols > 0 and we minus 1 to store 256 symbols count on uint8_t
+    stream->buffer[stream->pos++] = model->k;
+
+    for(uint32_t i=0; i<model->num_symbols; ++i)
+        stream->buffer[stream->pos++] = model->alphabet[i];
+
+    return true;
+}
+
+
 //-----------------------------------------------------------------------------------------------------------------------------
 // Public functions
 //-----------------------------------------------------------------------------------------------------------------------------
@@ -454,7 +488,7 @@ size_t bc1_packed_maxsize(uint32_t width, uint32_t height)
 }
 
 //-----------------------------------------------------------------------------------------------------------------------------
-size_t bc1_packed_compress(bc1_packed_context* ctx, const void* bc1_image, uint32_t width, uint32_t height, uint8_t* output)
+size_t bc1_packed_compress(bc1_packed_context* ctx, const void* bc1_image, uint32_t width, uint32_t height, uint8_t* output, size_t output_length)
 {
     if (width < 16 || height < 16 || !bc1_image || !ctx || !output)
         return 0;
@@ -467,7 +501,27 @@ size_t bc1_packed_compress(bc1_packed_context* ctx, const void* bc1_image, uint3
     build_top_table(ctx->hashmap, bc1_image, num_blocks, ctx->top_table, &ctx->top_table_size);
     init_static_models(ctx, bc1_image, width_blocks, height_blocks, strip_width);
 
-    // TODO : save models in the output
+    byte_stream stream = {.buffer = output, .length = output_length, .pos = 0};
+
+    // store models
+    if (!save_static_model(&ctx->red_model, &stream)) return 0;
+    if (!save_static_model(&ctx->green_model, &stream)) return 0;
+    if (!save_static_model(&ctx->blue_model, &stream)) return 0;
+    if (!save_static_model(&ctx->table_reference_model, &stream)) return 0;
+    if (!save_static_model(&ctx->difference_mask_model, &stream)) return 0;
+    if (!save_static_model(&ctx->table_difference_model, &stream)) return 0;
+
+    stream_align(&stream, sizeof(uint16_t));
+    size_t strips_offset_array_size = sizeof(uint16_t) * NUM_STRIPS;
+
+    // check if we have enough space
+    if (stream.pos + strips_offset_array_size >= stream.length)
+        return 0;
+    
+    // keep a pointer to strips offset
+    uint16_t* strips_offset = (uint16_t*) &stream.buffer[stream.pos];
+    stream.pos += strips_offset_array_size;
+
 
     for(uint32_t strip_index=0; strip_index<NUM_STRIPS; ++strip_index)
     {
