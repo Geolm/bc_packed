@@ -417,6 +417,8 @@ void init_static_models(bc1_packed_context* ctx, const void* input, uint32_t wid
                 for(uint32_t j=0; j<4; ++j)
                     if (mask & (1u << j))
                         hist_difference[(difference >> (j*8)) & 0xff]++;
+
+                previous = *current;
             }
         }
     }
@@ -590,6 +592,8 @@ size_t bc1_packed_compress(bc1_packed_context* ctx, const void* bc1_image, uint3
                 for(uint32_t j=0; j<4; ++j)
                     if (mask & (1u << j))
                         le_encode_symbol(&compressed_stream, &ctx->table_difference_model, (difference >> (j*8)) & 0xff);
+
+                previous = *current;
             }
         }
 
