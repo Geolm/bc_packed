@@ -1,6 +1,7 @@
 #include "bc1_packed.h"
 #include "../third_party/lite_encoding.h"
 #include <stdlib.h>
+#include <assert.h>
 
 
 #if defined(__aarch64__) || defined(_M_ARM64) || defined(__ARM_NEON)
@@ -26,8 +27,11 @@
 // Constants
 //-----------------------------------------------------------------------------------------------------------------------------
 
-#define HASHMAP_SIZE        (1U << 20U)
+#define HASHMAP_SIZE            (1U << 20U)
 #define TOP_TABLE_SIZE          (256U)
+#define COLOR_DELTA_NUM_BITS    (7)
+#define COLOR_DELTA_OFFSET      (1 << (COLOR_DELTA_NUM_BITS-1))
+#define NUM_STRIPS              (64)
 
 
 //-----------------------------------------------------------------------------------------------------------------------------
@@ -45,6 +49,12 @@ struct bc1_packed_context
     bc1_packed_mem_interface mem;
 
     le_model red_model, green_model, blue_model;
+    le_model difference_mask_model; // 4 bits
+    le_model table_reference_model;
+    le_model table_difference_model;
+
+    uint32_t top_table[TOP_TABLE_SIZE];
+    uint32_t top_table_size;
 };
 
 typedef struct bc1_block
@@ -332,6 +342,90 @@ void build_top_table(hashmap_entry* hashmap, const void* input, uint32_t num_blo
 }
 
 //-----------------------------------------------------------------------------------------------------------------------------
+void init_static_models(bc1_packed_context* ctx, const void* input, uint32_t width_blocks, uint32_t height_blocks, uint32_t strip_width)
+{
+    uint32_t hist_red[1<<COLOR_DELTA_NUM_BITS];
+    uint32_t hist_green[1<<COLOR_DELTA_NUM_BITS];
+    uint32_t hist_blue[1<<COLOR_DELTA_NUM_BITS];
+    uint32_t hist_reference[TOP_TABLE_SIZE];
+    uint32_t hist_mask[16];
+    uint32_t hist_difference[LE_ALPHABET_SIZE];
+
+    bc1_block previous = {0};
+
+    memset(hist_red, 0, sizeof(hist_red));
+    memset(hist_green, 0, sizeof(hist_green));
+    memset(hist_blue, 0, sizeof(hist_blue));
+    memset(hist_reference, 0, sizeof(hist_reference));
+    memset(hist_mask, 0, sizeof(hist_mask));
+    memset(hist_difference, 0, sizeof(hist_difference));
+
+    for(uint32_t strip_index=0; strip_index<NUM_STRIPS; ++strip_index)
+    {
+        bc1_block previous = {0};
+        uint32_t start_y = strip_index * strip_width;
+        for(uint32_t y = start_y; y < start_y + strip_width; ++y)
+        {
+            for(uint32_t x = 0; x < width_blocks; ++x)
+            {
+
+    
+                // zig-zag pattern delta compression for colors
+                uint32_t zigzag_x = (y&1) ? x : width_blocks - x - 1;
+
+                const bc1_block* current = (const bc1_block*) input + (y * width_blocks) + x;
+
+                for(uint32_t j=0; j<2; ++j)
+                {
+                    uint8_t current_red, current_green, current_blue;
+                    uint8_t previous_red, previous_green, previous_blue;
+
+                    bc1_extract_565(current->color[j], &current_red, &current_green, &current_blue);
+                    bc1_extract_565(previous.color[j], &previous_red, &previous_green, &previous_blue);
+
+                    int dred = current_red - previous_red;
+                    int dgreen = current_green - previous_green;
+                    int dblue = current_blue - previous_blue;
+
+                    hist_green[dgreen + COLOR_DELTA_OFFSET]++;
+
+                    dgreen /= 2;
+                    dred -= dgreen;
+                    dblue -= dgreen;
+
+                    hist_red[dred + COLOR_DELTA_OFFSET]++;
+                    hist_blue[dblue + COLOR_DELTA_OFFSET]++;
+                }
+
+                uint8_t reference = nearest32(ctx->top_table, ctx->top_table_size, current->indices) & 0xff;
+                hist_reference[reference]++;
+
+                uint32_t difference = current->indices ^ ctx->top_table[reference];
+                uint32_t mask = 0;
+                if ((difference & 0x000000FF) != 0) mask |= 1;
+                if ((difference & 0x0000FF00) != 0) mask |= 2;
+                if ((difference & 0x00FF0000) != 0) mask |= 4;
+                if ((difference & 0xFF000000) != 0) mask |= 8;
+
+                hist_mask[mask]++;
+
+                for(uint32_t j=0; j<4; ++j)
+                    if (mask & (1u << j))
+                        hist_difference[(difference >> (j*8)) & 0xff]++;
+            }
+        }
+    }
+
+    le_static_model_init(&ctx->red_model, hist_red, 1<<COLOR_DELTA_NUM_BITS);
+    le_static_model_init(&ctx->blue_model, hist_blue, 1<<COLOR_DELTA_NUM_BITS);
+    le_static_model_init(&ctx->green_model, hist_green, 1<<COLOR_DELTA_NUM_BITS);
+
+    le_static_model_init(&ctx->table_reference_model, hist_reference, TOP_TABLE_SIZE);
+    le_static_model_init(&ctx->difference_mask_model, hist_mask, 16);
+    le_static_model_init(&ctx->table_difference_model, hist_difference, LE_ALPHABET_SIZE);
+}
+
+//-----------------------------------------------------------------------------------------------------------------------------
 // Public functions
 //-----------------------------------------------------------------------------------------------------------------------------
 
@@ -345,7 +439,7 @@ bc1_packed_context* bc1_packed_init(bc1_packed_mem_interface* user_mem)
 
     *ctx = (bc1_packed_context)
     {
-        .hashmap = mem.malloc_fn(sizeof(uint32_t) * HASHMAP_SIZE, mem.user),
+        .hashmap = mem.malloc_fn(sizeof(hashmap_entry) * HASHMAP_SIZE, mem.user),
         .mem = mem
     };
 
@@ -360,8 +454,34 @@ size_t bc1_packed_maxsize(uint32_t width, uint32_t height)
 }
 
 //-----------------------------------------------------------------------------------------------------------------------------
-size_t bc1_packed_compress(bc1_packed_context* ctx, const void* bc1_image, uint32_t width, uint32_t height, void* output)
+size_t bc1_packed_compress(bc1_packed_context* ctx, const void* bc1_image, uint32_t width, uint32_t height, uint8_t* output)
 {
+    if (width < 16 || height < 16 || !bc1_image || !ctx || !output)
+        return 0;
+
+    const uint32_t num_blocks = (width*height) / 16;
+    const uint32_t height_blocks = height / 4;
+    const uint32_t width_blocks = width / 4;
+    const uint32_t strip_width = height_blocks / NUM_STRIPS;
+
+    build_top_table(ctx->hashmap, bc1_image, num_blocks, ctx->top_table, &ctx->top_table_size);
+    init_static_models(ctx, bc1_image, width_blocks, height_blocks, strip_width);
+
+    // TODO : save models in the output
+
+    for(uint32_t strip_index=0; strip_index<NUM_STRIPS; ++strip_index)
+    {
+        bc1_block previous = {0};
+        uint32_t start_y = strip_index * strip_width;
+        for(uint32_t y = start_y; y < start_y + strip_width; ++y)
+        {
+            for(uint32_t x = 0; x < width_blocks; ++x)
+            {
+
+            }
+        }
+    }
+
     return 0;
 }
 

@@ -38,7 +38,7 @@ size_t bc1_packed_maxsize(uint32_t width, uint32_t height);
 //----------------------------------------------------------------------------------------------------------------------------
 // Compresses a BC1 texture (width x height pixels, must be a multiple of 4) into [output].
 // Returns the size of the compressed stream in bytes, or 0 on failure.
-size_t bc1_packed_compress(bc1_packed_context* ctx, const void* bc1_image, uint32_t width, uint32_t height, void* output);
+size_t bc1_packed_compress(bc1_packed_context* ctx, const void* bc1_image, uint32_t width, uint32_t height, uint8_t* output);
 
 //----------------------------------------------------------------------------------------------------------------------------
 // CPU decompression, for unit tests and validation.
