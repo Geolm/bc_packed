@@ -1,17 +1,17 @@
 # BC1 packed
 
-An asymmetric lossless compressor for already-compressed BC1 textures, designed for full GPU decompression.
+An asymmetric lossless compressor for BC1 textures, designed for fast GPU decompression.
 
-At runtime, the compressed stream is uploaded to the GPU, decompressed with a compute shader, and written directly to BC1 texture memory. The resulting textures can then be sampled normally.
+The compressor works on a *packed* representation of BC1: 8 bytes per 4×4 block (two 16-bit 565 endpoint colors + one 32-bit word of 2-bit indices), half the size of the standard 16-byte BC1 block. At runtime, the compressed stream is uploaded to the GPU, decompressed with a compute shader, and written directly to standard BC1 texture memory. The resulting textures can then be sampled normally.
 
 The compressor is CPU-side and can use significantly more computation than the decompressor.
 
 ## Design goals
 
 * Lossless.
-* Input and output are standard BC1 textures.
+* Input is a packed BC1 texture (8 bytes per 4×4 block: two 565 endpoints + one 32-bit index word); output is a standard BC1 texture (16 bytes per block).
 * GPU decompression only requires a compute shader.
-* Blocks can be decompressed independently.
+* The texture is split into 64 independent strips, one GPU thread decodes each strip, with no dependency between threads.
 * No CPU-side work is required at runtime.
 * The decompressed result can be used directly as a normal BC1 texture.
 
@@ -21,9 +21,9 @@ The techniques are adapted to make GPU decompression fast and simple:
 
 * **Rice-Golomb coding** instead of arithmetic or Huffman coding. Rice-Golomb decoding is particularly well suited to GPU execution because it requires only simple integer operations and bit manipulation.
 * **Static symbol ranking.** Symbols are remapped so that the most frequently used symbols have the lowest indices. The rank table is generated from a histogram during compression.
-* **Parallel decompression.** The texture is divided into independent blocks. 64 GPU threads decompress blocks in parallel, with no dependency between threads.
+* **Parallel decompression.** The texture is divided into 64 independent strips. 64 GPU threads decompress the strips in parallel, with no dependency between threads.
 
-Multiple independent Rice-Golomb models are used for different data streams, such as endpoint components, index patterns, masks, and residual bytes.
+Multiple independent Rice-Golomb models are used for the different data: endpoint color deltas (red, green, blue), top-table references, difference masks, and residual difference bytes.
 
 ### Rice-Golomb model
 
@@ -31,44 +31,44 @@ Each model contains a symbol count, a Rice parameter, and a rank table:
 
 | Offset |  Size (bytes) | Description                |
 | -----: | ------------: | -------------------------- |
-|      0 |             1 | Number of symbols, max 256 |
+|      0 |             1 | Number of symbols − 1      |
 |      1 |             1 | Rice `k` value             |
 |      2 | `num_symbols` | Sorted rank table          |
 
-The rank table contains only symbols that occur in the stream. Symbols are sorted by frequency, with the most frequently used symbols receiving the lowest indices.
-
-Since the GPU operates most efficiently on 32-bit values, each model is padded to a 4-byte boundary with zeroes.
+The rank table contains only symbols that occur in the stream. Symbols are sorted by frequency, with the most frequently used symbols receiving the lowest indices (ties are broken by the lower symbol first).
 
 The maximum model size is therefore:
 
 ```text
-2 + 256 + padding = 260 bytes
+1 + 1 + 256 = 258 bytes
 ```
 
-In practice, most models are smaller because symbols with a zero histogram count are discarded.
+In practice, most models are smaller because symbols with a zero histogram count are discarded. No padding is written between models.
 
-The rank table is generated during the first compression pass from the symbol histogram.
+The rank table and the best `k` are generated during the first compression pass from the symbol histogram.
 
 ### Two passes
 
 As we use static models, we need two passes to compress the texture :
-* first pass will collect histograms for all models, sort the rank table and choose the best k
-* second pass wil encode the texture in the stream
+* first pass builds the top table, then collects histograms for all models, sorts the rank tables and chooses the best `k`
+* second pass encodes the texture in the stream
 
 ### Multiple streams
 
-As the decompression happens on the GPU we need to decompress in parallel multiple streams. The texture is split in 64 parts, each thread decodes a part of the image. 
+As the decompression happens on the GPU we need to decompress in parallel multiple streams. The texture is split in 64 strips, each thread decodes a strip of the image.
 
-For example for a 1024x1024 texture : each thread will decode 256 blocks (in width) x 4 blocks (in height). In order to not depend on other threads, rice model are initialized in each thread (adaptive model are init and static are loaded le_static_model_load with the same data written in the stream)
+For example for a 1024x1024 texture : each thread will decode 256 blocks (in width) x 4 blocks (in height).
 
-As Rice encoding output is non-fixed, we stored in the stream 64 offsets (uint32_t) so each thread knows where to start.
+As the models are static, each thread just loads the same six models from the stream (`le_static_model_load`); there is no adaptive state to keep in sync between threads.
+
+As Rice encoding output is non-fixed, we stored in the stream 64 offsets (uint16_t), each a delta in dword units relative to the previous strip, so each thread knows where to start.
 
 ### Endpoints
 
 BC1 endpoints are predicted from the previous block's endpoints.
 Three independent Rice-Golomb models are used for the R, G, and B components.
 
-For each block:
+For each endpoint of each block:
 
 ```text
 green_delta = current_green - previous_green
@@ -76,23 +76,15 @@ red_delta   = (current_red   - previous_red) - green_delta / 2
 blue_delta  = (current_blue  - previous_blue) - green_delta / 2
 ```
 
-The deltas are then encoded using their respective Rice-Golomb models.
+BC1 colors are R5G6B5, so the deltas always fit in 7 bits. Each delta is stored as an unsigned value offset by 64, and encoded with its respective static Rice-Golomb model.
+
 The blocks are traversed in a zigzag order to avoid a discontinuity at the end of each scanline:
 
 ```C
-uint32_t zigzag_x = (y & 1) ? x : width - x - 1;
+uint32_t zigzag_x = (y & 1) ? x : width_blocks - x - 1;
 ```
 
-This keeps the prediction direction continuous when moving from one scanline to the next.
-
-**Note:** For endpoints, we use adaptive models with zigzag8_encode to get unsigned value. Also BC1 color is R5G6B5 so delta always fit in 7 bits or less.
-
-```C
-static inline uint8_t zigzag8_encode(int8_t v)
-{
-    return (uint8_t)(((uint8_t)v << 1) ^ (v >> 7));
-}
-```
+This keeps the prediction direction continuous when moving from one scanline to the next. The first block of each strip is predicted from a hardcoded default color (see Status).
 
 ### Indices
 
@@ -103,6 +95,7 @@ BC1 contains a 32-bit index field for each block.
 * The compressor first scans the entire texture and builds a histogram of every unique 32-bit index pattern found.
 * It selects the Top 256 most frequently occurring index patterns to form the top_table.
 * The top table is refined using vector quantization. This algorithm implements Stochastic Bit-Level K-Means Clustering to optimize a BC1 VQ table. It uses Adaptive Jittered Sampling with error-feedback to efficiently assign image blocks to centroids based on Hamming Distance. Centroids are refined via Bitwise Majority Voting, flipping bits that differ in more than 50% of assigned blocks to mathematically minimize total bit-error across iterations.
+* Clusters that end up empty are dropped, so the final table may contain fewer than 256 entries.
 
 #### Block indices
 
@@ -112,7 +105,7 @@ For each block, we find the closest top-table entry using Hamming distance:
 distance = popcount(block_indices XOR table_entry)
 ```
 
-The selected top-table index is encoded using a Rice-Golomb model.
+The selected top-table index (8 bits) is encoded using a Rice-Golomb model.
 The XOR difference is then encoded as a sparse residual.
 First, a 4-bit mask identifies which bytes of the difference are non-zero:
 
@@ -131,40 +124,55 @@ For each set bit in the mask, the corresponding difference byte is encoded using
 
 This avoids storing zero bytes in the residual and makes the representation particularly compact when the block is close to one of the top-table patterns.
 
-
-
 ## Compressed stream
 
 Pseudo-description of the stream.
 
 Note : the stream does not include width, height or format, only the compressed data. This is intended, it's up to the user to store that somewhere.
 
-### Models
-* Top-table reference model
-* Indices mask model
-* Table difference model
+The output buffer must be at least `bc1_packed_maxsize(width, height)` bytes. This is a very rough bound: `(width/4) * (height/4) * 16`, i.e. the size of the standard raw BC1 texture (2× the packed input). In practice the stream is much smaller.
 
-### Top-table
+```text
+* 6 static models, in order: red, green, blue, top-table reference, difference mask, table difference.
+  Each is 2 + num_symbols bytes, no padding (max 258 bytes).
+* Top table: one uint8_t (number of entries − 1), then the entries, 4 bytes each (little-endian uint32_t).
+* Padded to a 2-byte boundary.
+* 64 strip offsets (uint16_t each), relative deltas in dword units.
+* Padded to a 4-byte boundary.
+* 64 strip bitstreams, each 4-byte aligned, each flushed independently.
+```
 
-* number of top-table entry (uint8_t)
-* top-table entries (uint32_t each)
+Within a strip, the blocks are traversed in the zigzag row order. For each block:
 
-### Offsets
-* 64 x stream start (uint32_t)
+```text
+* Two endpoints, each: green, red, blue deltas (7-bit values offset by 64).
+* Top-table reference (8-bit index).
+* Difference mask (4 bits).
+* One difference byte per set mask bit.
+```
 
-### Data
-* Compressed rice encoded data
+All symbols are encoded with Rice-Golomb using one of the six static models.
 
+## Status
+
+`bc1_packed_compress` is implemented and the stream matches the format documented above, but the work is still in progress:
+
+* CPU decompression (`bc1_packed_uncompress`) is declared in the header but not implemented yet — the CPU validation loop below is pending on it.
+* Unit tests are stubs; the future validation suite will use `stb_image.h` and `stb_dxt.h` from `third_party/`, which the library itself does not depend on.
+* The endpoint prediction seed (the "previous block" of the first block of each strip) is a hardcoded mid-gray default; a better default (e.g. an average) is a TODO in the code.
+* Textures whose height in blocks is not a multiple of 64 (i.e. height not a multiple of 256) silently drop the trailing block rows.
+* GPU decoding: `src/gpu_decoding.h` is a Metal port of the lite-encoding bit reader (device uint32 `le_stream`, `le_model` with `is_static`, `rice_decode`) for the decompression compute shader.
 
 ## Validation 
 
 Everything must be validated on CPU, on multiple images
 
-* Load a power-of-two image (stb_image.h)
-* Compress the image into BC1 (stb_dxt.h)
-* bc1_pack(), store the output stream. 
-* Compute the compression ratio
-* bc1_unpack, compare decompressed stream, should be byte-exact with BC1 texture
+* Load a power-of-two image (third_party/stb_image.h)
+* Compress the image into standard BC1 (third_party/stb_dxt.h); this is the reference texture
+* Pack it into packed BC1 (8 bytes per 4×4 block)
+* bc1_packed_compress, store the output stream. 
+* Compute the compression ratio against the standard BC1 size
+* bc1_packed_uncompress, compare the output, should be byte-exact with the packed input
 * Gather total compression ratio
 * Proceed the next image
 
