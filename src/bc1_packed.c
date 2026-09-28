@@ -514,7 +514,8 @@ size_t bc1_packed_compress(bc1_packed_context* ctx, const void* bc1_image, uint3
 
     stream.buffer[stream.pos++] = (uint8_t) (ctx->top_table_size - 1); // there is no zero toptable, so minus 1 to fit in a uint8_t
     for(uint32_t i=0; i<ctx->top_table_size; ++i)
-        stream.buffer[stream.pos++] = ctx->top_table[i];
+        for(uint32_t j=0; j<4; ++j)
+            stream.buffer[stream.pos++] = (ctx->top_table[i] >> (j*8)) & 0xff;
 
     stream_align(&stream, sizeof(uint16_t));
     size_t strips_offset_array_size = sizeof(uint16_t) * NUM_STRIPS;
@@ -585,7 +586,7 @@ size_t bc1_packed_compress(bc1_packed_context* ctx, const void* bc1_image, uint3
                 if ((difference & 0x00FF0000) != 0) mask |= 4;
                 if ((difference & 0xFF000000) != 0) mask |= 8;
 
-                le_encode_symbol(&compressed_stream, &ctx->table_reference_model, reference);
+                le_encode_symbol(&compressed_stream, &ctx->difference_mask_model, mask);
 
                 for(uint32_t j=0; j<4; ++j)
                     if (mask & (1u << j))
@@ -599,7 +600,7 @@ size_t bc1_packed_compress(bc1_packed_context* ctx, const void* bc1_image, uint3
         stream_align(&stream, sizeof(uint32_t));
     }
 
-    return stream.length - stream.pos;
+    return stream.pos;
 }
 
 //-----------------------------------------------------------------------------------------------------------------------------
