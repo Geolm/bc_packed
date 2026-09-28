@@ -378,7 +378,7 @@ void init_static_models(bc1_packed_context* ctx, const void* input, uint32_t wid
                 // zig-zag pattern delta compression for colors
                 uint32_t zigzag_x = (y&1) ? x : width_blocks - x - 1;
 
-                const bc1_block* current = (const bc1_block*) input + (y * width_blocks) + x;
+                const bc1_block* current = (const bc1_block*) input + (y * width_blocks) + zigzag_x;
 
                 for(uint32_t j=0; j<2; ++j)
                 {
@@ -552,7 +552,7 @@ size_t bc1_packed_compress(bc1_packed_context* ctx, const void* bc1_image, uint3
                 // zig-zag pattern delta compression for colors
                 uint32_t zigzag_x = (y&1) ? x : width_blocks - x - 1;
 
-                const bc1_block* current = (const bc1_block*) bc1_image + (y * width_blocks) + x;
+                const bc1_block* current = (const bc1_block*) bc1_image + (y * width_blocks) + zigzag_x;
 
                 for(uint32_t j=0; j<2; ++j)
                 {
