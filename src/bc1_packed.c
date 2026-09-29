@@ -31,7 +31,6 @@
 #define TOP_TABLE_SIZE          (256U)
 #define COLOR_DELTA_NUM_BITS    (7)
 #define COLOR_DELTA_OFFSET      (1 << (COLOR_DELTA_NUM_BITS-1))
-#define NUM_STRIPS              (64)
 
 
 //-----------------------------------------------------------------------------------------------------------------------------
@@ -365,7 +364,7 @@ void init_static_models(bc1_packed_context* ctx, const void* input, uint32_t wid
     memset(hist_mask, 0, sizeof(hist_mask));
     memset(hist_difference, 0, sizeof(hist_difference));
 
-    for(uint32_t strip_index=0; strip_index<NUM_STRIPS; ++strip_index)
+    for(uint32_t strip_index=0; strip_index<BC1_PACKED_NUM_STRIPS; ++strip_index)
     {
         bc1_block previous = {.color = {bc1_pack_565(8, 16, 8), bc1_pack_565(24, 48, 24)}}; // TODO : better default previous, average?
         uint32_t start_y = strip_index * strip_width;
@@ -458,6 +457,29 @@ static inline bool save_static_model(const le_model* model, byte_stream* stream)
 
 
 //-----------------------------------------------------------------------------------------------------------------------------
+// static inline bool load_static_model(le_model* model, const uint8_t* in, size_t length, size_t* pos)
+// {
+//     // mirror of save_static_model
+//     if (*pos + 2 >= length)
+//         return false;
+
+//     uint8_t num_symbols = in[(*pos)++] + 1;
+//     uint8_t k = in[(*pos)++];
+
+//     if (k >= LE_Q_ESCAPE_SIZE)
+//         k = (uint8_t)(LE_Q_ESCAPE_SIZE - 1); 
+
+//     if (*pos + num_symbols >= length)
+//         return false;
+
+//     le_static_model_load(model, &in[*pos], num_symbols, k);
+//     *pos += num_symbols;
+
+//     return true;
+// }
+
+
+//-----------------------------------------------------------------------------------------------------------------------------
 // Public functions
 //-----------------------------------------------------------------------------------------------------------------------------
 
@@ -494,7 +516,7 @@ size_t bc1_packed_compress(bc1_packed_context* ctx, const void* bc1_image, uint3
     const uint32_t num_blocks = (width*height) / 16;
     const uint32_t height_blocks = height / 4;
     const uint32_t width_blocks = width / 4;
-    const uint32_t strip_width = height_blocks / NUM_STRIPS;
+    const uint32_t strip_width = height_blocks / BC1_PACKED_NUM_STRIPS;
 
     build_top_table(ctx->hashmap, bc1_image, num_blocks, ctx->top_table, &ctx->top_table_size);
     init_static_models(ctx, bc1_image, width_blocks, strip_width);
@@ -518,7 +540,7 @@ size_t bc1_packed_compress(bc1_packed_context* ctx, const void* bc1_image, uint3
             stream.buffer[stream.pos++] = (ctx->top_table[i] >> (j*8)) & 0xff;
 
     stream_align(&stream, sizeof(uint16_t));
-    size_t strips_offset_array_size = sizeof(uint16_t) * NUM_STRIPS;
+    size_t strips_offset_array_size = sizeof(uint16_t) * BC1_PACKED_NUM_STRIPS;
 
     // check if we have enough space
     if (stream.pos + strips_offset_array_size >= stream.length)
@@ -532,7 +554,7 @@ size_t bc1_packed_compress(bc1_packed_context* ctx, const void* bc1_image, uint3
     stream_align(&stream, sizeof(uint32_t));
     size_t previous_offset = stream.pos;
 
-    for(uint32_t strip_index=0; strip_index<NUM_STRIPS; ++strip_index)
+    for(uint32_t strip_index=0; strip_index<BC1_PACKED_NUM_STRIPS; ++strip_index)
     {
         le_stream compressed_stream;
         le_init(&compressed_stream, &stream.buffer[stream.pos], stream.length - stream.pos);
