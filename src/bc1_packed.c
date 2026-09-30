@@ -439,11 +439,18 @@ static inline void stream_align(byte_stream* stream, size_t alignment)
 }
 
 //-----------------------------------------------------------------------------------------------------------------------------
+static inline void read_stream_align(byte_stream* stream, size_t power_two_alignment)
+{
+    size_t mask = power_two_alignment - 1;
+    stream->pos = (stream->pos + mask) & ~(mask);
+}
+
+//-----------------------------------------------------------------------------------------------------------------------------
 static inline bool save_static_model(const le_model* model, byte_stream* stream)
 {
     size_t model_size = 2 + model->num_symbols;
 
-    if (stream->pos + model_size >= stream->length || model->num_symbols == 0)
+    if (stream->pos + model_size > stream->length || model->num_symbols == 0)
         return false;
 
     stream->buffer[stream->pos++] = (uint8_t)(model->num_symbols - 1); // at this point we know num_symbols > 0 and we minus 1 to store 256 symbols count on uint8_t
@@ -455,12 +462,11 @@ static inline bool save_static_model(const le_model* model, byte_stream* stream)
     return true;
 }
 
-
 //-----------------------------------------------------------------------------------------------------------------------------
 static inline bool load_static_model(le_model* model, byte_stream* stream)
 {
     // mirror of save_static_model
-    if (stream->pos + 2 >= stream->length)
+    if (stream->pos + 2 > stream->length)
         return false;
 
     uint8_t num_symbols = stream->buffer[stream->pos++] + 1;
@@ -469,7 +475,7 @@ static inline bool load_static_model(le_model* model, byte_stream* stream)
     if (k >= LE_Q_ESCAPE_SIZE)
         k = (uint8_t)(LE_Q_ESCAPE_SIZE - 1); 
 
-    if (stream->pos + num_symbols >= stream->length)
+    if (stream->pos + num_symbols > stream->length)
         return false;
 
     le_static_model_load(model, &stream->buffer[stream->pos], num_symbols, k);
@@ -490,12 +496,20 @@ bc1_packed_context* bc1_packed_init(bc1_packed_mem_interface* user_mem)
     bc1_packed_mem_interface mem = (user_mem) ? *user_mem : default_allocator();
 
     bc1_packed_context* ctx = mem.malloc_fn(sizeof(bc1_packed_context), mem.user);
+    if (ctx == NULL)
+        return NULL;
 
     *ctx = (bc1_packed_context)
     {
         .hashmap = mem.malloc_fn(sizeof(hashmap_entry) * HASHMAP_SIZE, mem.user),
         .mem = mem
     };
+
+    if (ctx->hashmap == NULL)
+    {
+        mem.free_fn(ctx, mem.user);
+        return NULL;
+    }
 
     return ctx;
 }
@@ -510,7 +524,7 @@ size_t bc1_packed_maxsize(uint32_t width, uint32_t height)
 //-----------------------------------------------------------------------------------------------------------------------------
 size_t bc1_packed_compress(bc1_packed_context* ctx, const void* bc1_image, uint32_t width, uint32_t height, uint8_t* output, size_t output_length)
 {
-    if (width < 16 || height < 16 || !bc1_image || !ctx || !output)
+    if (width < 16 || height < 256 || !bc1_image || !ctx || !output)
         return 0;
 
     const uint32_t num_blocks = (width*height) / 16;
@@ -633,8 +647,8 @@ size_t bc1_packed_compress(bc1_packed_context* ctx, const void* bc1_image, uint3
 //-----------------------------------------------------------------------------------------------------------------------------
 bool bc1_packed_uncompress(bc1_packed_context* ctx, const void* input, size_t input_length, uint32_t width, uint32_t height, void* output, uint32_t strip_index)
 {
-    if (width < 16 || height < 16 || !input || !ctx || !output || strip_index >= BC1_PACKED_NUM_STRIPS)
-        return 0;
+    if (width < 16 || height < 256 || !input || !ctx || !output || strip_index >= BC1_PACKED_NUM_STRIPS)
+        return false;
 
     const uint32_t height_blocks = height / 4;
     const uint32_t width_blocks = width / 4;
@@ -653,8 +667,8 @@ bool bc1_packed_uncompress(bc1_packed_context* ctx, const void* input, size_t in
     if (stream.pos >= stream.length)
         return false;
 
-    ctx->top_table_size = stream.buffer[stream.pos++] + 1;
-    stream_align(&stream, sizeof(uint32_t));
+    ctx->top_table_size = (uint32_t)stream.buffer[stream.pos++] + 1;
+    read_stream_align(&stream, sizeof(uint32_t));
 
     for(uint32_t i=0; i<ctx->top_table_size; ++i)
     {
@@ -665,7 +679,7 @@ bool bc1_packed_uncompress(bc1_packed_context* ctx, const void* input, size_t in
     }
 
     // strip offsets
-    stream_align(&stream, sizeof(uint16_t));
+    read_stream_align(&stream, sizeof(uint16_t));
     size_t strips_offset_array_size = sizeof(uint16_t) * BC1_PACKED_NUM_STRIPS;
 
     if (stream.pos + strips_offset_array_size >= stream.length)
@@ -674,7 +688,7 @@ bool bc1_packed_uncompress(bc1_packed_context* ctx, const void* input, size_t in
     uint16_t* strips_offset_array = (uint16_t*) &stream.buffer[stream.pos];
     stream.pos += strips_offset_array_size;
 
-    stream_align(&stream, sizeof(uint32_t));
+    read_stream_align(&stream, sizeof(uint32_t));
 
     // compute the current strip offset and setup compressed stream
     size_t strip_offset = stream.pos;
@@ -682,7 +696,7 @@ bool bc1_packed_uncompress(bc1_packed_context* ctx, const void* input, size_t in
         strip_offset += strips_offset_array[i] * sizeof(uint32_t);
 
     le_stream compressed_stream;
-    le_init(&compressed_stream, &stream.buffer[strip_offset], stream.length - stream.pos);
+    le_init(&compressed_stream, &stream.buffer[strip_offset], stream.length - strip_offset);
     le_begin_decode(&compressed_stream);
     
     bc1_block previous = {.color = {bc1_pack_565(8, 16, 8), bc1_pack_565(24, 48, 24)}};
@@ -704,12 +718,12 @@ bool bc1_packed_uncompress(bc1_packed_context* ctx, const void* input, size_t in
                 uint8_t delta_blue = le_decode_symbol(&compressed_stream, &ctx->blue_model);
 
                 // red and blue delta are based on green delta
-                int dgreen_orig = (int)delta_green - 64;
+                int dgreen_orig = (int)delta_green - COLOR_DELTA_OFFSET;
                 int current_green_value = reference_green + dgreen_orig;
                 int dgreen_halved = dgreen_orig / 2;
 
-                int dred_orig = ((int)delta_red - 64) + dgreen_halved;
-                int dblue_orig = ((int)delta_blue - 64) + dgreen_halved;
+                int dred_orig = ((int)delta_red - COLOR_DELTA_OFFSET) + dgreen_halved;
+                int dblue_orig = ((int)delta_blue - COLOR_DELTA_OFFSET) + dgreen_halved;
 
                 int current_red_value = reference_red + dred_orig;
                 int current_blue_value = reference_blue + dblue_orig;
