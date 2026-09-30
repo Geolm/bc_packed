@@ -68,10 +68,15 @@ TEST test_all_images_in_folder(const char *dir_path)
     size_t compressed_buffer_size = bc1_packed_maxsize(IMAGE_MAX_SIDE,  IMAGE_MAX_SIDE);
     void* compressed_buffer = malloc(compressed_buffer_size);
     ASSERT(compressed_buffer != NULL);
-    uint8_t* original_bc1 = malloc((IMAGE_MAX_SIDE/4)*(IMAGE_MAX_SIDE/4)*sizeof(bc1_block));
-    ASSERT(original_bc1 != NULL);
+    size_t max_image_size = (IMAGE_MAX_SIDE/4)*(IMAGE_MAX_SIDE/4)*sizeof(bc1_block);
+    uint8_t* original_bc1 = malloc(max_image_size);
+    uint8_t* decompressed_bc1 = malloc(max_image_size);
+    ASSERT(original_bc1 != NULL && decompressed_bc1 != NULL);
 
     fprintf(stats, "filename,width,height,compression_ratio\n");
+
+    float global_ratio = 0.f;
+    uint32_t num_images = 0;
 
     struct dirent *entry;
     while ((entry = readdir(dir)) != NULL) 
@@ -83,6 +88,7 @@ TEST test_all_images_in_folder(const char *dir_path)
         char file_path[1024];
         snprintf(file_path, sizeof(file_path), "%s/%s", dir_path, entry->d_name);
         
+        // load and convert to bc1
         uint32_t width, height, num_channels;
         uint8_t *rgba = stbi_load(file_path, (int*)&width, (int*)&height, (int*)&num_channels, 4);
 
@@ -101,19 +107,38 @@ TEST test_all_images_in_folder(const char *dir_path)
             }
         }
 
+        // compress the bc1 image
         size_t compressed_buffer_length = bc1_packed_compress(ctx, original_bc1, width, height, compressed_buffer, compressed_buffer_size);
         ASSERT(compressed_buffer_length != 0);
 
-        const float compression_ratio = 0.f;
+        const size_t image_size = (width/4)*(height/4)*sizeof(bc1_block);
+        const float compression_ratio = (float) image_size / (float) compressed_buffer_length;
         fprintf(stats, "%s,%" PRIu32 ",%" PRIu32 ",%.6f\n", file_path, width, height, compression_ratio);
         fflush(stats);
 
+        global_ratio += compression_ratio;
+        num_images++;
+
+        // roundtrip test
+        for(uint32_t i=0; i<BC1_PACKED_NUM_STRIPS; ++i)
+        {
+            ASSERT(bc1_packed_uncompress(ctx, compressed_buffer, compressed_buffer_length, width, height, decompressed_bc1, i));
+        }
+
+        for(uint32_t i=0; i<image_size; ++i)
+        {
+            ASSERT_EQ(original_bc1[i], decompressed_bc1[i]);
+        }
 
         stbi_image_free(rgba);
     }
     closedir(dir);
     free(original_bc1);
+    free(decompressed_bc1);
+    free(compressed_buffer);
     fclose(stats);
+
+    fprintf(stdout, "\n==> %u images, average compression ratio : %2.2f:1\n\n", num_images, global_ratio / (float) num_images);
 
     PASS();
 }
