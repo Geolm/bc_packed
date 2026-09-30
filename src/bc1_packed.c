@@ -474,7 +474,7 @@ static inline bool load_static_model(le_model* model, byte_stream* stream)
     if (stream->pos + 2 > stream->length)
         return false;
 
-    uint8_t num_symbols = stream->buffer[stream->pos++] + 1;
+    uint32_t num_symbols = stream->buffer[stream->pos++] + 1;
     uint8_t k = stream->buffer[stream->pos++];
 
     if (k >= LE_Q_ESCAPE_SIZE)

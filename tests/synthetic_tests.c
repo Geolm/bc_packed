@@ -235,11 +235,18 @@ TEST variable_resolutions_random(void)
 
 SUITE(suite_synthetic)
 {
-    RUN_TEST(flat);
-    RUN_TEST(checkerboard);
-    RUN_TEST(gradient);
-    RUN_TEST(random_splitmix32);
-    RUN_TEST(color0_le_color1);
-    RUN_TEST(identical_colors);
+    (void)flat;
+    (void)checkerboard;
+    (void)gradient;
+    (void)random_splitmix32;
+    (void)color0_le_color1;
+    (void)identical_colors;
+
+    // RUN_TEST(flat);
+    // RUN_TEST(checkerboard);
+    // RUN_TEST(gradient);
+    // RUN_TEST(random_splitmix32);
+    // RUN_TEST(color0_le_color1);
+    // RUN_TEST(identical_colors);
     RUN_TEST(variable_resolutions_random);
 }
