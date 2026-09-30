@@ -17,6 +17,7 @@ endif()
 
 add_executable(unit_tests
     ./src/bc1_packed.c
+    ./tests/image_tests.c
     ./tests/main_test.c
     ./tests/synthetic_tests.c
 )
