@@ -546,7 +546,7 @@ size_t bc1_packed_compress(bc1_packed_context* ctx, const void* bc1_image, uint3
     if (!save_static_model(&ctx->table_difference_model, &stream)) return 0;
 
     // top-table
-    if (stream.pos + ctx->top_table_size + 1 >= stream.length)
+    if (stream.pos + ctx->top_table_size + 1 > stream.length)
         return 0;
 
     stream.buffer[stream.pos++] = (uint8_t) (ctx->top_table_size - 1); // there is no zero toptable, so minus 1 to fit in a uint8_t

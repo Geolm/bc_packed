@@ -17,7 +17,8 @@ endif()
 
 add_executable(unit_tests
     ./src/bc1_packed.c
-    ./tests/test.c
+    ./tests/main_test.c
+    ./tests/synthetic_tests.c
 )
 
 target_include_directories(unit_tests PRIVATE ./src ./third_party)
