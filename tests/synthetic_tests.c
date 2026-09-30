@@ -186,6 +186,50 @@ TEST identical_colors(void)
     return roundtrip(image, TEST_IMAGE_WIDTH, TEST_IMAGE_HEIGHT);
 }
 
+//-----------------------------------------------------------------------------------------------------------------------------
+// Test 7: Multi-resolution roundtrip testing with SplitMix32 random blocks
+TEST variable_resolutions_random(void)
+{
+    const uint32_t widths[] = { 32, 64, 128, 256, 512, 1024, 2048, 4096 };
+    const uint32_t heights[] = { 256, 512, 1024, 2048, 4096 };
+    const size_t num_widths = sizeof(widths) / sizeof(widths[0]);
+    const size_t num_heights = sizeof(heights) / sizeof(heights[0]);
+
+    uint32_t rng_state = 0xA5A5A5A5u;
+
+    for (size_t w = 0; w < num_widths; ++w)
+    {
+        for (size_t h = 0; h < num_heights; ++h)
+        {
+            uint32_t width = widths[w];
+            uint32_t height = heights[h];
+            size_t num_blocks = (width / 4) * (height / 4);
+
+            bc1_block* image = malloc(num_blocks * sizeof(bc1_block));
+            if (!image) return GREATEST_TEST_RES_FAIL;
+
+            for (size_t i = 0; i < num_blocks; ++i)
+            {
+                uint32_t r1 = splitmix32(&rng_state);
+                uint32_t r2 = splitmix32(&rng_state);
+
+                image[i] = (bc1_block)
+                {
+                    .color = { (uint16_t)(r1 & 0xFFFF), (uint16_t)(r1 >> 16) },
+                    .indices = r2
+                };
+            }
+
+            enum greatest_test_res res = roundtrip(image, width, height);
+            free(image);
+
+            if (res != GREATEST_TEST_RES_PASS) return res;
+        }
+    }
+
+    PASS();
+}
+
 
 SUITE(suite_synthetic)
 {
@@ -195,4 +239,5 @@ SUITE(suite_synthetic)
     RUN_TEST(random_splitmix32);
     RUN_TEST(color0_le_color1);
     RUN_TEST(identical_colors);
+    RUN_TEST(variable_resolutions_random);
 }
