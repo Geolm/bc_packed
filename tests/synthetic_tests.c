@@ -20,6 +20,7 @@ const uint16_t cyan  = 0x07FF;
 // helper function to validate roundtrip
 TEST roundtrip(const bc1_block* bc1_image, uint32_t width, uint32_t height)
 {
+    const size_t num_blocks = (width/4) * (height/4);
     bc1_packed_context* ctx = bc1_packed_init(NULL);
     ASSERT(ctx != NULL);
 
@@ -30,7 +31,7 @@ TEST roundtrip(const bc1_block* bc1_image, uint32_t width, uint32_t height)
     size_t compressed_buffer_length = bc1_packed_compress(ctx, bc1_image, width, height, compressed_buffer, compressed_buffer_size);
     ASSERT(compressed_buffer_length != 0);
 
-    bc1_block* decompressed_bc1_image = malloc((width/4) * (height/4) * sizeof(bc1_block));
+    bc1_block* decompressed_bc1_image = malloc(num_blocks * sizeof(bc1_block));
     ASSERT(decompressed_bc1_image != NULL);
 
     for(uint32_t i=0; i<BC1_PACKED_NUM_STRIPS; ++i)
@@ -38,7 +39,7 @@ TEST roundtrip(const bc1_block* bc1_image, uint32_t width, uint32_t height)
         ASSERT(bc1_packed_uncompress(ctx, compressed_buffer, compressed_buffer_length, width, height, decompressed_bc1_image, i));
     }
 
-    for(uint32_t i=0; i<width*height; ++i)
+    for(uint32_t i=0; i<num_blocks; ++i)
     {
         ASSERT_EQ(decompressed_bc1_image[i].color[0], bc1_image[i].color[0]);
         ASSERT_EQ(decompressed_bc1_image[i].color[1], bc1_image[i].color[1]);

@@ -448,15 +448,20 @@ static inline void read_stream_align(byte_stream* stream, size_t power_two_align
 //-----------------------------------------------------------------------------------------------------------------------------
 static inline bool save_static_model(const le_model* model, byte_stream* stream)
 {
-    size_t model_size = 2 + model->num_symbols;
+    // a model whose histogram is all zero has no symbols but the stream format can only store a count of 1 to 256,
+    // so we save a single dummy entry. alphabet[0] is always initialized by le_static_model_init and the decoder
+    // never reads it because the encoder never encoded with it.
+    uint32_t num_symbols = (model->num_symbols > 0) ? model->num_symbols : 1;
 
-    if (stream->pos + model_size > stream->length || model->num_symbols == 0)
+    size_t model_size = 2 + num_symbols;
+
+    if (stream->pos + model_size > stream->length)
         return false;
 
-    stream->buffer[stream->pos++] = (uint8_t)(model->num_symbols - 1); // at this point we know num_symbols > 0 and we minus 1 to store 256 symbols count on uint8_t
+    stream->buffer[stream->pos++] = (uint8_t)(num_symbols - 1); // minus 1 to store 256 symbols count on uint8_t
     stream->buffer[stream->pos++] = model->k;
 
-    for(uint32_t i=0; i<model->num_symbols; ++i)
+    for(uint32_t i=0; i<num_symbols; ++i)
         stream->buffer[stream->pos++] = model->alphabet[i];
 
     return true;
