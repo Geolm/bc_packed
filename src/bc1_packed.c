@@ -679,7 +679,7 @@ bool bc1_packed_uncompress(bc1_packed_context* ctx, const void* input, size_t in
     // compute the current strip offset and setup compressed stream
     size_t strip_offset = stream.pos;
     for(uint32_t i=0; i<=strip_index; ++i)
-        strip_offset += strips_offset_array[i];
+        strip_offset += strips_offset_array[i] * sizeof(uint32_t);
 
     le_stream compressed_stream;
     le_init(&compressed_stream, &stream.buffer[strip_offset], stream.length - stream.pos);
@@ -698,7 +698,6 @@ bool bc1_packed_uncompress(bc1_packed_context* ctx, const void* input, size_t in
             {
                 uint8_t reference_red, reference_green, reference_blue;
                 bc1_extract_565(previous.color[j], &reference_red, &reference_green, &reference_blue);
-
 
                 uint8_t delta_green = le_decode_symbol(&compressed_stream, &ctx->green_model);
                 uint8_t delta_red = le_decode_symbol(&compressed_stream, &ctx->red_model);
