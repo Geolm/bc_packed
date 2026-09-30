@@ -639,7 +639,12 @@ size_t bc1_packed_compress(bc1_packed_context* ctx, const void* bc1_image, uint3
             }
         }
 
-        stream.pos += le_end_encode(&compressed_stream);
+        size_t strip_size = le_end_encode(&compressed_stream);
+        if (strip_size >= 262144)   // almost impossible, but better be safe
+            return 0;
+
+        stream.pos += strip_size;
+
         stream_align(&stream, sizeof(uint32_t));
 
         if (compressed_stream.status == LE_BUFFER_OVERRUN)

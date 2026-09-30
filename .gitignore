@@ -77,3 +77,4 @@ _deps
 
 # project specific
 /images
+/logs/*.csv

@@ -205,6 +205,8 @@ TEST variable_resolutions_random(void)
             uint32_t height = heights[h];
             size_t num_blocks = (width / 4) * (height / 4);
 
+            printf("%ux%u\n", width, height);
+
             bc1_block* image = malloc(num_blocks * sizeof(bc1_block));
             if (!image) return GREATEST_TEST_RES_FAIL;
 
