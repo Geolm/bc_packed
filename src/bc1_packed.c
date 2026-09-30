@@ -457,26 +457,26 @@ static inline bool save_static_model(const le_model* model, byte_stream* stream)
 
 
 //-----------------------------------------------------------------------------------------------------------------------------
-// static inline bool load_static_model(le_model* model, const uint8_t* in, size_t length, size_t* pos)
-// {
-//     // mirror of save_static_model
-//     if (*pos + 2 >= length)
-//         return false;
+static inline bool load_static_model(le_model* model, byte_stream* stream)
+{
+    // mirror of save_static_model
+    if (stream->pos + 2 >= stream->length)
+        return false;
 
-//     uint8_t num_symbols = in[(*pos)++] + 1;
-//     uint8_t k = in[(*pos)++];
+    uint8_t num_symbols = stream->buffer[stream->pos++] + 1;
+    uint8_t k = stream->buffer[stream->pos++];
 
-//     if (k >= LE_Q_ESCAPE_SIZE)
-//         k = (uint8_t)(LE_Q_ESCAPE_SIZE - 1); 
+    if (k >= LE_Q_ESCAPE_SIZE)
+        k = (uint8_t)(LE_Q_ESCAPE_SIZE - 1); 
 
-//     if (*pos + num_symbols >= length)
-//         return false;
+    if (stream->pos + num_symbols >= stream->length)
+        return false;
 
-//     le_static_model_load(model, &in[*pos], num_symbols, k);
-//     *pos += num_symbols;
+    le_static_model_load(model, &stream->buffer[stream->pos], num_symbols, k);
+    stream->pos += num_symbols;
 
-//     return true;
-// }
+    return true;
+}
 
 
 //-----------------------------------------------------------------------------------------------------------------------------
@@ -531,10 +531,13 @@ size_t bc1_packed_compress(bc1_packed_context* ctx, const void* bc1_image, uint3
     if (!save_static_model(&ctx->difference_mask_model, &stream)) return 0;
     if (!save_static_model(&ctx->table_difference_model, &stream)) return 0;
 
+    // top-table
     if (stream.pos + ctx->top_table_size + 1 >= stream.length)
         return 0;
 
     stream.buffer[stream.pos++] = (uint8_t) (ctx->top_table_size - 1); // there is no zero toptable, so minus 1 to fit in a uint8_t
+    stream_align(&stream, sizeof(uint32_t));
+
     for(uint32_t i=0; i<ctx->top_table_size; ++i)
         for(uint32_t j=0; j<4; ++j)
             stream.buffer[stream.pos++] = (ctx->top_table[i] >> (j*8)) & 0xff;
@@ -572,7 +575,6 @@ size_t bc1_packed_compress(bc1_packed_context* ctx, const void* bc1_image, uint3
             {
                 // zig-zag pattern delta compression for colors
                 uint32_t zigzag_x = (y&1) ? x : width_blocks - x - 1;
-
                 const bc1_block* current = (const bc1_block*) bc1_image + (y * width_blocks) + zigzag_x;
 
                 for(uint32_t j=0; j<2; ++j)
@@ -620,9 +622,120 @@ size_t bc1_packed_compress(bc1_packed_context* ctx, const void* bc1_image, uint3
 
         stream.pos += le_end_encode(&compressed_stream);
         stream_align(&stream, sizeof(uint32_t));
+
+        if (compressed_stream.status == LE_BUFFER_OVERRUN)
+            return 0;
     }
 
     return stream.pos;
+}
+
+//-----------------------------------------------------------------------------------------------------------------------------
+bool bc1_packed_uncompress(bc1_packed_context* ctx, const void* input, size_t input_length, uint32_t width, uint32_t height, void* output, uint32_t strip_index)
+{
+    if (width < 16 || height < 16 || !input || !ctx || !output || strip_index >= BC1_PACKED_NUM_STRIPS)
+        return 0;
+
+    const uint32_t height_blocks = height / 4;
+    const uint32_t width_blocks = width / 4;
+    const uint32_t strip_width = height_blocks / BC1_PACKED_NUM_STRIPS;
+
+    byte_stream stream = {.buffer = (uint8_t *) input, .length = input_length, .pos = 0};
+
+    if (!load_static_model(&ctx->red_model, &stream)) return false;
+    if (!load_static_model(&ctx->green_model, &stream)) return false;
+    if (!load_static_model(&ctx->blue_model, &stream)) return false;
+    if (!load_static_model(&ctx->table_reference_model, &stream)) return false;
+    if (!load_static_model(&ctx->difference_mask_model, &stream)) return false;
+    if (!load_static_model(&ctx->table_difference_model, &stream)) return false;
+
+    // top-table
+    if (stream.pos >= stream.length)
+        return false;
+
+    ctx->top_table_size = stream.buffer[stream.pos++] + 1;
+    stream_align(&stream, sizeof(uint32_t));
+
+    for(uint32_t i=0; i<ctx->top_table_size; ++i)
+    {
+        ctx->top_table[i] = 0;
+    
+        for(uint32_t j=0; j<4; ++j)
+            ctx->top_table[i] |= stream.buffer[stream.pos++] << (j*8);
+    }
+
+    // strip offsets
+    stream_align(&stream, sizeof(uint16_t));
+    size_t strips_offset_array_size = sizeof(uint16_t) * BC1_PACKED_NUM_STRIPS;
+
+    if (stream.pos + strips_offset_array_size >= stream.length)
+        return false;
+    
+    uint16_t* strips_offset_array = (uint16_t*) &stream.buffer[stream.pos];
+    stream.pos += strips_offset_array_size;
+
+    stream_align(&stream, sizeof(uint32_t));
+
+    // compute the current strip offset and setup compressed stream
+    size_t strip_offset = stream.pos;
+    for(uint32_t i=0; i<=strip_index; ++i)
+        strip_offset += strips_offset_array[i];
+
+    le_stream compressed_stream;
+    le_init(&compressed_stream, &stream.buffer[strip_offset], stream.length - stream.pos);
+    le_begin_decode(&compressed_stream);
+    
+    bc1_block previous = {.color = {bc1_pack_565(8, 16, 8), bc1_pack_565(24, 48, 24)}};
+    uint32_t start_y = strip_index * strip_width;
+    for(uint32_t y = start_y; y < start_y + strip_width; ++y)
+    {
+        for(uint32_t x = 0; x < width_blocks; ++x)
+        {
+            uint32_t zigzag_x = (y&1) ? x : width_blocks - x - 1;
+            bc1_block* current = (bc1_block*) output + (y * width_blocks) + zigzag_x;
+
+            for(uint32_t j=0; j<2; ++j)
+            {
+                uint8_t reference_red, reference_green, reference_blue;
+                bc1_extract_565(previous.color[j], &reference_red, &reference_green, &reference_blue);
+
+
+                uint8_t delta_green = le_decode_symbol(&compressed_stream, &ctx->green_model);
+                uint8_t delta_red = le_decode_symbol(&compressed_stream, &ctx->red_model);
+                uint8_t delta_blue = le_decode_symbol(&compressed_stream, &ctx->blue_model);
+
+                // red and blue delta are based on green delta
+                int dgreen_orig = (int)delta_green - 64;
+                int current_green_value = reference_green + dgreen_orig;
+                int dgreen_halved = dgreen_orig / 2;
+
+                int dred_orig = ((int)delta_red - 64) + dgreen_halved;
+                int dblue_orig = ((int)delta_blue - 64) + dgreen_halved;
+
+                int current_red_value = reference_red + dred_orig;
+                int current_blue_value = reference_blue + dblue_orig;
+
+                current->color[j] = bc1_pack_565((uint8_t)current_red_value, (uint8_t)current_green_value, (uint8_t)current_blue_value);
+            }
+            
+            // indices difference with top table
+            uint32_t reference = le_decode_symbol(&compressed_stream, &ctx->table_reference_model);
+            uint32_t mask = le_decode_symbol(&compressed_stream, &ctx->difference_mask_model);
+
+            uint32_t difference=0;
+            for(uint32_t j=0; j<4; ++j)
+                if (mask & (1 << j))
+                    difference = difference | (le_decode_symbol(&compressed_stream, &ctx->table_difference_model) << (j*8));
+
+            current->indices =  difference ^ ctx->top_table[reference];
+
+            previous = *current;
+        }
+    }
+
+    le_end_decode(&compressed_stream);
+
+    return compressed_stream.status == LE_OK;
 }
 
 //-----------------------------------------------------------------------------------------------------------------------------
