@@ -24,6 +24,13 @@ typedef struct bc1_packed_mem_interface
 
 typedef struct bc1_packed_context bc1_packed_context;
 
+typedef struct bc1_packed_stats
+{
+    uint32_t top_table_size;
+    uint8_t red_k, green_k, blue_k;
+    uint8_t mask_k, reference_k, difference_k;
+} bc1_packed_stats;
+
 
 //----------------------------------------------------------------------------------------------------------------------------
 // Creates a context. Returns NULL if the allocation fails.
@@ -44,6 +51,10 @@ size_t bc1_packed_maxsize(uint32_t width, uint32_t height);
 size_t bc1_packed_compress(bc1_packed_context* ctx, const void* bc1_image, uint32_t width, uint32_t height, uint8_t* output, size_t output_length);
 
 //----------------------------------------------------------------------------------------------------------------------------
+// Extracts statistics after compression
+void bc1_packed_get_stats(bc1_packed_context* ctx, bc1_packed_stats* stats);
+
+//----------------------------------------------------------------------------------------------------------------------------
 // CPU decompression, for unit tests and validation.
 // 
 // Decompress one strip of the image, for a complete image this function should be called BC1_PACKED_NUM_STRIPS times
@@ -53,7 +64,7 @@ size_t bc1_packed_compress(bc1_packed_context* ctx, const void* bc1_image, uint3
 //      [output]        must be big enough to contain a BC1 image of width x height
 //      [strip_index]   index of the strip, must be [0; BC1_PACKED_NUM_STRIPS[
 // Returns false on error otherwise true
-bool bc1_packed_uncompress(bc1_packed_context* ctx, const void* input, size_t input_length, uint32_t width, uint32_t height, void* output, uint32_t strip_index);
+bool bc1_packed_decompress(bc1_packed_context* ctx, const void* input, size_t input_length, uint32_t width, uint32_t height, void* output, uint32_t strip_index);
 
 #endif
 

@@ -73,7 +73,7 @@ TEST test_all_images_in_folder(const char *dir_path)
     uint8_t* decompressed_bc1 = malloc(max_image_size);
     ASSERT(original_bc1 != NULL && decompressed_bc1 != NULL);
 
-    fprintf(stats, "filename,width,height,compression_ratio\n");
+    fprintf(stats, "filename,width,height,compression_ratio, top_table_size, red_k, green_k, blue_k, reference_k, mask_k, difference_k\n");
 
     float global_ratio = 0.f;
     uint32_t num_images = 0;
@@ -113,7 +113,14 @@ TEST test_all_images_in_folder(const char *dir_path)
 
         const size_t image_size = (width/4)*(height/4)*sizeof(bc1_block);
         const float compression_ratio = (float) image_size / (float) compressed_buffer_length;
-        fprintf(stats, "%s,%" PRIu32 ",%" PRIu32 ",%.6f\n", file_path, width, height, compression_ratio);
+        fprintf(stats, "%s,%" PRIu32 ",%" PRIu32 ",%.6f,", file_path, width, height, compression_ratio);
+
+        bc1_packed_stats cmp_stats;
+        bc1_packed_get_stats(ctx, &cmp_stats);
+
+        fprintf(stats, "%" PRIu32 ",%" PRIu32 ", %" PRIu32 ",%" PRIu32 ", %" PRIu32 ",%" PRIu32 ",%" PRIu32 "\n", 
+            cmp_stats.top_table_size, cmp_stats.red_k, cmp_stats.green_k, cmp_stats.blue_k, cmp_stats.reference_k, cmp_stats.mask_k, cmp_stats.difference_k);
+
         fflush(stats);
 
         global_ratio += compression_ratio;
@@ -122,7 +129,7 @@ TEST test_all_images_in_folder(const char *dir_path)
         // roundtrip test
         for(uint32_t i=0; i<BC1_PACKED_NUM_STRIPS; ++i)
         {
-            ASSERT(bc1_packed_uncompress(ctx, compressed_buffer, compressed_buffer_length, width, height, decompressed_bc1, i));
+            ASSERT(bc1_packed_decompress(ctx, compressed_buffer, compressed_buffer_length, width, height, decompressed_bc1, i));
         }
 
         for(uint32_t i=0; i<image_size; ++i)
@@ -132,11 +139,15 @@ TEST test_all_images_in_folder(const char *dir_path)
 
         stbi_image_free(rgba);
     }
+
+    fprintf(stats, "\n\n# %u images, average compression ratio : %2.2f:1\n\n", num_images, global_ratio / (float) num_images);
+
     closedir(dir);
     free(original_bc1);
     free(decompressed_bc1);
     free(compressed_buffer);
     fclose(stats);
+
 
     fprintf(stdout, "\n==> %u images, average compression ratio : %2.2f:1\n\n", num_images, global_ratio / (float) num_images);
 

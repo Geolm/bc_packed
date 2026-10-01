@@ -28,7 +28,7 @@ TEST roundtrip(const bc1_block* bc1_image, uint32_t width, uint32_t height)
 
     for(uint32_t i=0; i<BC1_PACKED_NUM_STRIPS; ++i)
     {
-        ASSERT(bc1_packed_uncompress(ctx, compressed_buffer, compressed_buffer_length, width, height, decompressed_bc1_image, i));
+        ASSERT(bc1_packed_decompress(ctx, compressed_buffer, compressed_buffer_length, width, height, decompressed_bc1_image, i));
     }
 
     for(uint32_t i=0; i<num_blocks; ++i)

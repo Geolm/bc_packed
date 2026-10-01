@@ -9,7 +9,7 @@ The compressor is CPU-side and can use significantly more computation than the d
 ## Design goals
 
 * Lossless.
-* Input is a packed BC1 texture (8 bytes per 4×4 block: two 565 endpoints + one 32-bit index word); output is a standard BC1 texture (16 bytes per block).
+* Input is a packed BC1 texture (8 bytes per 4×4 block: two 565 endpoints + one 32-bit index word); Decompression output is also a standard BC1 texture (8 bytes per block).
 * GPU decompression only requires a compute shader.
 * The texture is split into 64 independent strips, one GPU thread decodes each strip, with no dependency between threads.
 * No CPU-side work is required at runtime.
@@ -157,7 +157,7 @@ All symbols are encoded with Rice-Golomb using one of the six static models.
 
 `bc1_packed_compress` is implemented and the stream matches the format documented above, but the work is still in progress:
 
-* CPU decompression (`bc1_packed_uncompress`) is declared in the header but not implemented yet — the CPU validation loop below is pending on it.
+* CPU decompression (`bc1_packed_decompress`) is declared in the header but not implemented yet — the CPU validation loop below is pending on it.
 * Unit tests are stubs; the future validation suite will use `stb_image.h` and `stb_dxt.h` from `third_party/`, which the library itself does not depend on.
 * The endpoint prediction seed (the "previous block" of the first block of each strip) is a hardcoded mid-gray default; a better default (e.g. an average) is a TODO in the code.
 * Textures whose height in blocks is not a multiple of 64 (i.e. height not a multiple of 256) silently drop the trailing block rows.
@@ -172,7 +172,7 @@ Everything must be validated on CPU, on multiple images
 * Pack it into packed BC1 (8 bytes per 4×4 block)
 * bc1_packed_compress, store the output stream. 
 * Compute the compression ratio against the standard BC1 size
-* bc1_packed_uncompress, compare the output, should be byte-exact with the packed input
+* bc1_packed_decompress, compare the output, should be byte-exact with the packed input
 * Gather total compression ratio
 * Proceed the next image
 

@@ -48,7 +48,7 @@ struct bc1_packed_context
     bc1_packed_mem_interface mem;
 
     le_model red_model, green_model, blue_model;
-    le_model difference_mask_model; // 4 bits
+    le_model mask_model; // 4 bits
     le_model table_reference_model;
     le_model table_difference_model;
 
@@ -425,7 +425,7 @@ void init_static_models(bc1_packed_context* ctx, const void* input, uint32_t wid
     le_static_model_init(&ctx->green_model, hist_green, 1<<COLOR_DELTA_NUM_BITS);
 
     le_static_model_init(&ctx->table_reference_model, hist_reference, TOP_TABLE_SIZE);
-    le_static_model_init(&ctx->difference_mask_model, hist_mask, 16);
+    le_static_model_init(&ctx->mask_model, hist_mask, 16);
     le_static_model_init(&ctx->table_difference_model, hist_difference, LE_ALPHABET_SIZE);
 }
 
@@ -547,7 +547,7 @@ size_t bc1_packed_compress(bc1_packed_context* ctx, const void* bc1_image, uint3
     if (!save_static_model(&ctx->green_model, &stream)) return 0;
     if (!save_static_model(&ctx->blue_model, &stream)) return 0;
     if (!save_static_model(&ctx->table_reference_model, &stream)) return 0;
-    if (!save_static_model(&ctx->difference_mask_model, &stream)) return 0;
+    if (!save_static_model(&ctx->mask_model, &stream)) return 0;
     if (!save_static_model(&ctx->table_difference_model, &stream)) return 0;
 
     // top-table
@@ -629,7 +629,7 @@ size_t bc1_packed_compress(bc1_packed_context* ctx, const void* bc1_image, uint3
                 if ((difference & 0x00FF0000) != 0) mask |= 4;
                 if ((difference & 0xFF000000) != 0) mask |= 8;
 
-                le_encode_symbol(&compressed_stream, &ctx->difference_mask_model, mask);
+                le_encode_symbol(&compressed_stream, &ctx->mask_model, mask);
 
                 for(uint32_t j=0; j<4; ++j)
                     if (mask & (1u << j))
@@ -640,8 +640,7 @@ size_t bc1_packed_compress(bc1_packed_context* ctx, const void* bc1_image, uint3
         }
 
         size_t strip_size = le_end_encode(&compressed_stream);
-        if (strip_size >= 262144)   // almost impossible, but better be safe
-            return 0;
+        assert(strip_size < 262144); // if it happens, there is a problem somewhere else
 
         stream.pos += strip_size;
 
@@ -655,7 +654,7 @@ size_t bc1_packed_compress(bc1_packed_context* ctx, const void* bc1_image, uint3
 }
 
 //-----------------------------------------------------------------------------------------------------------------------------
-bool bc1_packed_uncompress(bc1_packed_context* ctx, const void* input, size_t input_length, uint32_t width, uint32_t height, void* output, uint32_t strip_index)
+bool bc1_packed_decompress(bc1_packed_context* ctx, const void* input, size_t input_length, uint32_t width, uint32_t height, void* output, uint32_t strip_index)
 {
     if (width < 16 || height < 256 || !input || !ctx || !output || strip_index >= BC1_PACKED_NUM_STRIPS)
         return false;
@@ -670,7 +669,7 @@ bool bc1_packed_uncompress(bc1_packed_context* ctx, const void* input, size_t in
     if (!load_static_model(&ctx->green_model, &stream)) return false;
     if (!load_static_model(&ctx->blue_model, &stream)) return false;
     if (!load_static_model(&ctx->table_reference_model, &stream)) return false;
-    if (!load_static_model(&ctx->difference_mask_model, &stream)) return false;
+    if (!load_static_model(&ctx->mask_model, &stream)) return false;
     if (!load_static_model(&ctx->table_difference_model, &stream)) return false;
 
     // top-table
@@ -704,6 +703,8 @@ bool bc1_packed_uncompress(bc1_packed_context* ctx, const void* input, size_t in
     size_t strip_offset = stream.pos;
     for(uint32_t i=0; i<=strip_index; ++i)
         strip_offset += strips_offset_array[i] * sizeof(uint32_t);
+
+    assert(stream.length > strip_offset);
 
     le_stream compressed_stream;
     le_init(&compressed_stream, &stream.buffer[strip_offset], stream.length - strip_offset);
@@ -743,7 +744,7 @@ bool bc1_packed_uncompress(bc1_packed_context* ctx, const void* input, size_t in
             
             // indices difference with top table
             uint32_t reference = le_decode_symbol(&compressed_stream, &ctx->table_reference_model);
-            uint32_t mask = le_decode_symbol(&compressed_stream, &ctx->difference_mask_model);
+            uint32_t mask = le_decode_symbol(&compressed_stream, &ctx->mask_model);
 
             uint32_t difference=0;
             for(uint32_t j=0; j<4; ++j)
@@ -759,6 +760,21 @@ bool bc1_packed_uncompress(bc1_packed_context* ctx, const void* input, size_t in
     le_end_decode(&compressed_stream);
 
     return compressed_stream.status == LE_OK;
+}
+
+//-----------------------------------------------------------------------------------------------------------------------------
+void bc1_packed_get_stats(bc1_packed_context* ctx, bc1_packed_stats* stats)
+{
+    *stats = (bc1_packed_stats)
+    {
+        .blue_k = ctx->blue_model.k,
+        .difference_k = ctx->table_difference_model.k,
+        .green_k = ctx->green_model.k,
+        .red_k = ctx->red_model.k,
+        .mask_k = ctx->mask_model.k,
+        .reference_k = ctx->table_reference_model.k,
+        .top_table_size = ctx->top_table_size
+    };
 }
 
 //-----------------------------------------------------------------------------------------------------------------------------
