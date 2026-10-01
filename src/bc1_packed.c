@@ -263,7 +263,7 @@ void vq_top_table(const void* input, uint32_t num_blocks, uint32_t* output, uint
 
     // fill the table with centroid
     for(uint32_t i=0; i<*num_entries; ++i)
-        if (clusters[i].count > 0)
+        if (clusters[i].count > 1)
             output[num_clusters++] = centroids[i];
 
     // reduce if needed the size of the table to the number of cluster with at least one block
