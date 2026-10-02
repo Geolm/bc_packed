@@ -187,7 +187,72 @@ TEST identical_colors(void)
 }
 
 //-----------------------------------------------------------------------------------------------------------------------------
-// Test 7: Multi-resolution roundtrip testing with SplitMix32 random blocks
+// Test 7: Stats on a constant image, components should match the expected stream content
+TEST stats_constant_image(void)
+{
+    const uint32_t width = TEST_IMAGE_WIDTH;
+    const uint32_t height = TEST_IMAGE_HEIGHT;
+    const uint32_t num_blocks = (width / 4) * (height / 4);
+
+    bc1_block image[TEST_IMAGE_SIZE];
+    for(uint32_t i=0; i<num_blocks; ++i)
+        image[i] = (bc1_block)
+        {
+            .color = {red, cyan},
+            .indices = 0x33333333
+        };
+
+    bc1_packed_context* ctx = bc1_packed_init(NULL);
+    ASSERT(ctx != NULL);
+
+    size_t compressed_buffer_size = bc1_packed_maxsize(width, height);
+    void* compressed_buffer = malloc(compressed_buffer_size);
+    ASSERT(compressed_buffer != NULL);
+
+    size_t stream_size = bc1_packed_compress(ctx, image, width, height, compressed_buffer, compressed_buffer_size);
+    ASSERT(stream_size != 0);
+
+    bc1_packed_stats stats;
+    bc1_packed_get_stats(ctx, &stats);
+
+    // constant indices match the top-table entry exactly -> no residual byte is written
+    ASSERT_EQ(stats.difference_bytes, 0);
+
+    // 6 color delta symbols per block, each at least 1 bit
+    ASSERT(stats.colors_bytes >= (6 * num_blocks) / 8);
+
+    // 1 reference and 1 mask symbol per block, each at least 1 bit
+    ASSERT(stats.reference_bytes >= num_blocks / 8);
+    ASSERT(stats.mask_bytes >= num_blocks / 8);
+
+    // the components fit in the stream
+    const uint64_t payload = stats.colors_bytes + stats.reference_bytes + stats.mask_bytes + stats.difference_bytes;
+    ASSERT(payload <= stream_size);
+
+    // roundtrip
+    bc1_block* decompressed = malloc(num_blocks * sizeof(bc1_block));
+    ASSERT(decompressed != NULL);
+
+    for(uint32_t i=0; i<BC1_PACKED_NUM_STRIPS; ++i)
+    {
+        ASSERT(bc1_packed_decompress(ctx, compressed_buffer, stream_size, width, height, decompressed, i));
+    }
+
+    for(uint32_t i=0; i<num_blocks; ++i)
+    {
+        ASSERT_EQ(decompressed[i].indices, 0x33333333);
+    }
+
+    bc1_packed_terminate(ctx);
+
+    free(compressed_buffer);
+    free(decompressed);
+
+    PASS();
+}
+
+//-----------------------------------------------------------------------------------------------------------------------------
+// Test 8: Multi-resolution roundtrip testing with SplitMix32 random blocks
 TEST variable_resolutions_random(void)
 {
     const uint32_t widths[] = { 32, 64, 128, 256, 512, 1024, 2048, 4096 };
@@ -241,12 +306,14 @@ SUITE(suite_synthetic)
     (void)random_splitmix32;
     (void)color0_le_color1;
     (void)identical_colors;
+    (void)stats_constant_image;
 
-    // RUN_TEST(flat);
-    // RUN_TEST(checkerboard);
-    // RUN_TEST(gradient);
-    // RUN_TEST(random_splitmix32);
-    // RUN_TEST(color0_le_color1);
-    // RUN_TEST(identical_colors);
+    RUN_TEST(flat);
+    RUN_TEST(checkerboard);
+    RUN_TEST(gradient);
+    RUN_TEST(random_splitmix32);
+    RUN_TEST(color0_le_color1);
+    RUN_TEST(identical_colors);
+    RUN_TEST(stats_constant_image);
     RUN_TEST(variable_resolutions_random);
 }

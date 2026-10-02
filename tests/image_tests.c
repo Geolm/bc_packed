@@ -73,7 +73,7 @@ TEST test_all_images_in_folder(const char *dir_path)
     uint8_t* decompressed_bc1 = malloc(max_image_size);
     ASSERT(original_bc1 != NULL && decompressed_bc1 != NULL);
 
-    fprintf(stats, "filename,width,height,compression_ratio, top_table_size, red_k, green_k, blue_k, reference_k, mask_k, difference_k\n");
+    fprintf(stats, "filename,width,height,compression_ratio, top_table_size, red_k, green_k, blue_k, reference_k, mask_k, difference_k, colors_bytes, reference_bytes, mask_bytes, difference_bytes\n");
 
     float global_ratio = 0.f;
     uint32_t num_images = 0;
@@ -118,8 +118,9 @@ TEST test_all_images_in_folder(const char *dir_path)
         bc1_packed_stats cmp_stats;
         bc1_packed_get_stats(ctx, &cmp_stats);
 
-        fprintf(stats, "%" PRIu32 ",%" PRIu32 ", %" PRIu32 ",%" PRIu32 ", %" PRIu32 ",%" PRIu32 ",%" PRIu32 "\n", 
-            cmp_stats.top_table_size, cmp_stats.red_k, cmp_stats.green_k, cmp_stats.blue_k, cmp_stats.reference_k, cmp_stats.mask_k, cmp_stats.difference_k);
+        fprintf(stats, "%" PRIu32 ",%" PRIu32 ", %" PRIu32 ",%" PRIu32 ", %" PRIu32 ",%" PRIu32 ",%" PRIu32 ",%" PRIu32 ",%" PRIu32 ",%" PRIu32 ",%" PRIu32 "\n",
+            cmp_stats.top_table_size, cmp_stats.red_k, cmp_stats.green_k, cmp_stats.blue_k, cmp_stats.reference_k, cmp_stats.mask_k, cmp_stats.difference_k,
+            cmp_stats.colors_bytes, cmp_stats.reference_bytes, cmp_stats.mask_bytes, cmp_stats.difference_bytes);
 
         fflush(stats);
 

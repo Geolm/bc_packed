@@ -29,6 +29,12 @@ typedef struct bc1_packed_stats
     uint32_t top_table_size;
     uint8_t red_k, green_k, blue_k;
     uint8_t mask_k, reference_k, difference_k;
+
+    // size in bytes of each range-coded component, valid after a successful bc1_packed_compress
+    uint32_t colors_bytes;      // 6 color delta symbols per block
+    uint32_t reference_bytes;   // top-table reference symbol per block
+    uint32_t mask_bytes;        // index-residual mask symbol per block
+    uint32_t difference_bytes;  // 0-4 index-residual bytes per block
 } bc1_packed_stats;
 
 
@@ -52,6 +58,8 @@ size_t bc1_packed_compress(bc1_packed_context* ctx, const void* bc1_image, uint3
 
 //----------------------------------------------------------------------------------------------------------------------------
 // Extracts statistics after compression
+// The *_bytes fields are valid after a successful bc1_packed_compress, their sum is the range-coded payload size,
+// the stream additionally contains the static header (models, top-table, strip offsets)
 void bc1_packed_get_stats(bc1_packed_context* ctx, bc1_packed_stats* stats);
 
 //----------------------------------------------------------------------------------------------------------------------------

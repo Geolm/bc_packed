@@ -54,6 +54,9 @@ struct bc1_packed_context
 
     uint32_t top_table[TOP_TABLE_SIZE];
     uint32_t top_table_size;
+
+    // bit counters of the range-coded payload, per component
+    uint64_t colors_bits, reference_bits, mask_bits, difference_bits;
 };
 
 typedef struct bc1_block
@@ -446,6 +449,16 @@ static inline void read_stream_align(byte_stream* stream, size_t power_two_align
 }
 
 //-----------------------------------------------------------------------------------------------------------------------------
+// Adds to [count] the bits written to [stream] since the last call, and updates [bit_pos] to the current bit position.
+// [bit_pos] must be initialized to 0 after le_begin_encode.
+static inline void stream_bits_since(uint64_t* bit_pos, const le_stream* stream, uint64_t* count)
+{
+    const uint64_t pos = (uint64_t)stream->position * 8 + stream->bits_available;
+    *count += pos - *bit_pos;
+    *bit_pos = pos;
+}
+
+//-----------------------------------------------------------------------------------------------------------------------------
 static inline bool save_static_model(const le_model* model, byte_stream* stream)
 {
     // a model whose histogram is all zero has no symbols but the stream format can only store a count of 1 to 256,
@@ -532,6 +545,12 @@ size_t bc1_packed_compress(bc1_packed_context* ctx, const void* bc1_image, uint3
     if (width < 16 || height < 256 || !bc1_image || !ctx || !output)
         return 0;
 
+    // reset stats, they are only valid after a successful compression
+    ctx->colors_bits = 0;
+    ctx->reference_bits = 0;
+    ctx->mask_bits = 0;
+    ctx->difference_bits = 0;
+
     const uint32_t num_blocks = (width*height) / 16;
     const uint32_t height_blocks = height / 4;
     const uint32_t width_blocks = width / 4;
@@ -586,6 +605,8 @@ size_t bc1_packed_compress(bc1_packed_context* ctx, const void* bc1_image, uint3
         strips_offset[strip_index] = (uint16_t)((stream.pos - previous_offset) / sizeof(uint32_t));
         previous_offset = stream.pos;
 
+        uint64_t bit_pos = 0; // current bit position, used to measure the per-component stats
+
         bc1_block previous = {.color = {bc1_pack_565(8, 16, 8), bc1_pack_565(24, 48, 24)}};
         uint32_t start_y = strip_index * strip_width;
         for(uint32_t y = start_y; y < start_y + strip_width; ++y)
@@ -617,10 +638,12 @@ size_t bc1_packed_compress(bc1_packed_context* ctx, const void* bc1_image, uint3
                     le_encode_symbol(&compressed_stream, &ctx->red_model, dred + COLOR_DELTA_OFFSET);
                     le_encode_symbol(&compressed_stream, &ctx->blue_model, dblue + COLOR_DELTA_OFFSET);
                 }
+                stream_bits_since(&bit_pos, &compressed_stream, &ctx->colors_bits);
 
                 uint8_t reference = nearest32(ctx->top_table, ctx->top_table_size, current->indices) & 0xff;
 
                 le_encode_symbol(&compressed_stream, &ctx->table_reference_model, reference);
+                stream_bits_since(&bit_pos, &compressed_stream, &ctx->reference_bits);
 
                 uint32_t difference = current->indices ^ ctx->top_table[reference];
                 uint32_t mask = 0;
@@ -630,10 +653,12 @@ size_t bc1_packed_compress(bc1_packed_context* ctx, const void* bc1_image, uint3
                 if ((difference & 0xFF000000) != 0) mask |= 8;
 
                 le_encode_symbol(&compressed_stream, &ctx->mask_model, mask);
+                stream_bits_since(&bit_pos, &compressed_stream, &ctx->mask_bits);
 
                 for(uint32_t j=0; j<4; ++j)
                     if (mask & (1u << j))
                         le_encode_symbol(&compressed_stream, &ctx->table_difference_model, (difference >> (j*8)) & 0xff);
+                stream_bits_since(&bit_pos, &compressed_stream, &ctx->difference_bits);
 
                 previous = *current;
             }
@@ -773,7 +798,11 @@ void bc1_packed_get_stats(bc1_packed_context* ctx, bc1_packed_stats* stats)
         .red_k = ctx->red_model.k,
         .mask_k = ctx->mask_model.k,
         .reference_k = ctx->table_reference_model.k,
-        .top_table_size = ctx->top_table_size
+        .top_table_size = ctx->top_table_size,
+        .colors_bytes = (uint32_t)((ctx->colors_bits + 7) / 8),
+        .reference_bytes = (uint32_t)((ctx->reference_bits + 7) / 8),
+        .mask_bytes = (uint32_t)((ctx->mask_bits + 7) / 8),
+        .difference_bytes = (uint32_t)((ctx->difference_bits + 7) / 8)
     };
 }
 
