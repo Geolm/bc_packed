@@ -298,6 +298,125 @@ TEST variable_resolutions_random(void)
 }
 
 
+// helper to pack an R5G6B5 color, the test has no access to the library private helpers
+static uint16_t pack_565(uint8_t r5, uint8_t g6, uint8_t b5)
+{
+    return (uint16_t)(((uint16_t)r5 << 11) | ((uint16_t)g6 << 5) | (uint16_t)b5);
+}
+
+//-----------------------------------------------------------------------------------------------------------------------------
+// walks the stream header (6 static models, top-table size byte, padded to a 4-byte boundary) to read the strip seed
+static bool read_header_strip_seed(const uint8_t* stream, size_t length, uint32_t* seed)
+{
+    size_t pos = 0;
+
+    for (uint32_t i = 0; i < 6; ++i)
+    {
+        if (pos + 2 > length) return false;
+        uint32_t num_symbols = stream[pos++] + 1;
+        pos++; // k
+        if (pos + num_symbols > length) return false;
+        pos += num_symbols;
+    }
+
+    if (pos + 1 > length) return false;
+    pos++; // top-table size
+
+    pos = (pos + 3) & ~(size_t)3; // padded to a 4-byte boundary
+
+    if (pos + 4 > length) return false;
+
+    *seed = (uint32_t)stream[pos] | ((uint32_t)stream[pos + 1] << 8) | ((uint32_t)stream[pos + 2] << 16) | ((uint32_t)stream[pos + 3] << 24);
+    return true;
+}
+
+//-----------------------------------------------------------------------------------------------------------------------------
+// Test 9: the strip seed stored in the stream header must be the average of the first block of each strip
+TEST strip_seed_header(void)
+{
+    const uint32_t width = TEST_IMAGE_WIDTH;
+    const uint32_t height = TEST_IMAGE_HEIGHT;
+    const uint32_t num_blocks = (width / 4) * (height / 4);
+    const uint32_t width_blocks = width / 4;
+    const uint32_t strip_width = (height / 4) / BC1_PACKED_NUM_STRIPS;
+
+    bc1_block image[TEST_IMAGE_SIZE];
+
+    uint32_t rng_state = 0x1B2C3D4Eu;
+    uint32_t sums[6] = { 0, 0, 0, 0, 0, 0 }; // r, g, b of color[0] and color[1], one first block per strip
+
+    for (uint32_t strip = 0; strip < BC1_PACKED_NUM_STRIPS; ++strip)
+    {
+        uint32_t r = splitmix32(&rng_state);
+
+        uint16_t c0 = (uint16_t)(r & 0xFFFF);
+        uint16_t c1 = (uint16_t)(r >> 16);
+        uint32_t indices = splitmix32(&rng_state);
+
+        sums[0] += (c0 >> 11) & 0x1F;
+        sums[1] += (c0 >> 5) & 0x3F;
+        sums[2] += c0 & 0x1F;
+        sums[3] += (c1 >> 11) & 0x1F;
+        sums[4] += (c1 >> 5) & 0x3F;
+        sums[5] += c1 & 0x1F;
+
+        uint32_t start_y = strip * strip_width;
+        for (uint32_t y = start_y; y < start_y + strip_width; ++y)
+        {
+            for (uint32_t x = 0; x < width_blocks; ++x)
+            {
+                image[y * width_blocks + x] = (bc1_block)
+                {
+                    .color = { c0, c1 },
+                    .indices = indices
+                };
+            }
+        }
+    }
+
+    bc1_packed_context* ctx = bc1_packed_init(NULL);
+    ASSERT(ctx != NULL);
+
+    size_t compressed_buffer_size = bc1_packed_maxsize(width, height);
+    uint8_t* compressed_buffer = malloc(compressed_buffer_size);
+    ASSERT(compressed_buffer != NULL);
+
+    size_t stream_size = bc1_packed_compress(ctx, image, width, height, compressed_buffer, compressed_buffer_size);
+    ASSERT(stream_size != 0);
+
+    // the seed stored in the header must be the per-channel average of the first block of each strip
+    uint32_t seed = 0;
+    ASSERT(read_header_strip_seed(compressed_buffer, stream_size, &seed));
+
+    uint16_t expected0 = pack_565((uint8_t)(sums[0] / BC1_PACKED_NUM_STRIPS), (uint8_t)(sums[1] / BC1_PACKED_NUM_STRIPS), (uint8_t)(sums[2] / BC1_PACKED_NUM_STRIPS));
+    uint16_t expected1 = pack_565((uint8_t)(sums[3] / BC1_PACKED_NUM_STRIPS), (uint8_t)(sums[4] / BC1_PACKED_NUM_STRIPS), (uint8_t)(sums[5] / BC1_PACKED_NUM_STRIPS));
+    ASSERT_EQ(seed, ((uint32_t)expected1 << 16) | (uint32_t)expected0);
+
+    // roundtrip must stay exact, the decoder must use the same seed from the stream
+    bc1_block* decompressed = malloc(num_blocks * sizeof(bc1_block));
+    ASSERT(decompressed != NULL);
+
+    for (uint32_t i = 0; i < BC1_PACKED_NUM_STRIPS; ++i)
+    {
+        ASSERT(bc1_packed_decompress(ctx, compressed_buffer, stream_size, width, height, decompressed, i));
+    }
+
+    for (uint32_t i = 0; i < num_blocks; ++i)
+    {
+        ASSERT_EQ(decompressed[i].color[0], image[i].color[0]);
+        ASSERT_EQ(decompressed[i].color[1], image[i].color[1]);
+        ASSERT_EQ(decompressed[i].indices, image[i].indices);
+    }
+
+    bc1_packed_terminate(ctx);
+
+    free(compressed_buffer);
+    free(decompressed);
+
+    PASS();
+}
+
+
 SUITE(suite_synthetic)
 {
     (void)flat;
@@ -307,6 +426,7 @@ SUITE(suite_synthetic)
     (void)color0_le_color1;
     (void)identical_colors;
     (void)stats_constant_image;
+    (void)strip_seed_header;
 
     RUN_TEST(flat);
     RUN_TEST(checkerboard);
@@ -315,5 +435,6 @@ SUITE(suite_synthetic)
     RUN_TEST(color0_le_color1);
     RUN_TEST(identical_colors);
     RUN_TEST(stats_constant_image);
+    RUN_TEST(strip_seed_header);
     RUN_TEST(variable_resolutions_random);
 }

@@ -84,7 +84,7 @@ The blocks are traversed in a zigzag order to avoid a discontinuity at the end o
 uint32_t zigzag_x = (y & 1) ? x : width_blocks - x - 1;
 ```
 
-This keeps the prediction direction continuous when moving from one scanline to the next. The first block of each strip is predicted from a hardcoded default color (see Status).
+This keeps the prediction direction continuous when moving from one scanline to the next. There is no previous block at the start of each strip, so the first block of each strip is predicted from the strip seed, a single endpoint color pair stored in the stream header (see Compressed stream).
 
 ### Indices
 
@@ -135,7 +135,9 @@ The output buffer must be at least `bc1_packed_maxsize(width, height)` bytes. Th
 ```text
 * 6 static models, in order: red, green, blue, top-table reference, difference mask, table difference.
   Each is 2 + num_symbols bytes, no padding (max 258 bytes).
-* Top table: one uint8_t (number of entries − 1), then the entries, 4 bytes each (little-endian uint32_t).
+* Top table size: one uint8_t (number of entries − 1), padded to a 4-byte boundary.
+* Strip seed: one uint32_t (little-endian) — the two endpoint colors of the "previous block" used to predict the first block of each strip, averaged over the 64 strips at compression time. Low 16 bits = color[0], high 16 bits = color[1].
+* Top table entries, 4 bytes each (little-endian uint32_t).
 * Padded to a 2-byte boundary.
 * 64 strip offsets (uint16_t each), relative deltas in dword units.
 * Padded to a 4-byte boundary.
@@ -159,7 +161,6 @@ All symbols are encoded with Rice-Golomb using one of the six static models.
 
 * CPU decompression (`bc1_packed_decompress`) is declared in the header but not implemented yet — the CPU validation loop below is pending on it.
 * Unit tests are stubs; the future validation suite will use `stb_image.h` and `stb_dxt.h` from `third_party/`, which the library itself does not depend on.
-* The endpoint prediction seed (the "previous block" of the first block of each strip) is a hardcoded mid-gray default; a better default (e.g. an average) is a TODO in the code.
 * Textures whose height in blocks is not a multiple of 64 (i.e. height not a multiple of 256) silently drop the trailing block rows.
 * GPU decoding: `src/gpu_decoding.h` is a Metal port of the lite-encoding bit reader (device uint32 `le_stream`, `le_model` with `is_static`, `rice_decode`) for the decompression compute shader.
 

@@ -55,6 +55,9 @@ struct bc1_packed_context
     uint32_t top_table[TOP_TABLE_SIZE];
     uint32_t top_table_size;
 
+    // seed "previous block" of every strip: average of the first block of each strip, the two 16-bit 565 colors packed in one uint32
+    uint32_t strip_seed;
+
     // bit counters of the range-coded payload, per component
     uint64_t colors_bits, reference_bits, mask_bits, difference_bits;
 };
@@ -105,6 +108,15 @@ static inline void bc1_extract_565(uint16_t color, uint8_t *r5, uint8_t *g6, uin
 static inline uint16_t bc1_pack_565(uint8_t r5, uint8_t g6, uint8_t b5)
 {
     return (uint16_t)(((uint16_t)r5 << 11) | ((uint16_t)g6 << 5) | (uint16_t)b5);
+}
+
+//----------------------------------------------------------------------------------------------------------------------------
+// Unpacks the strip seed into a "previous" block. The seed packs the two endpoint colors in one uint32, color[0] in the low word.
+static inline void unpack_strip_seed(uint32_t seed, bc1_block* previous)
+{
+    previous->color[0] = (uint16_t)seed;
+    previous->color[1] = (uint16_t)(seed >> 16);
+    previous->indices = 0;
 }
 
 //----------------------------------------------------------------------------------------------------------------------------
@@ -367,9 +379,35 @@ void init_static_models(bc1_packed_context* ctx, const void* input, uint32_t wid
     memset(hist_mask, 0, sizeof(hist_mask));
     memset(hist_difference, 0, sizeof(hist_difference));
 
+    // pre-pass: the average of the first block of each strip becomes the seed "previous" block used to start every strip
+    uint32_t sums[6] = { 0, 0, 0, 0, 0, 0 }; // r, g, b of color[0] and color[1]
+
     for(uint32_t strip_index=0; strip_index<BC1_PACKED_NUM_STRIPS; ++strip_index)
     {
-        bc1_block previous = {.color = {bc1_pack_565(8, 16, 8), bc1_pack_565(24, 48, 24)}}; // TODO : better default previous, average?
+        uint32_t start_y = strip_index * strip_width;
+        uint32_t zigzag_x = (start_y & 1) ? 0 : width_blocks - 1;
+
+        const bc1_block* first = (const bc1_block*) input + (start_y * width_blocks) + zigzag_x;
+
+        for(uint32_t j=0; j<2; ++j)
+        {
+            uint8_t r, g, b;
+            bc1_extract_565(first->color[j], &r, &g, &b);
+
+            sums[j*3 + 0] += r;
+            sums[j*3 + 1] += g;
+            sums[j*3 + 2] += b;
+        }
+    }
+
+    uint16_t average0 = bc1_pack_565((uint8_t)(sums[0] / BC1_PACKED_NUM_STRIPS), (uint8_t)(sums[1] / BC1_PACKED_NUM_STRIPS), (uint8_t)(sums[2] / BC1_PACKED_NUM_STRIPS));
+    uint16_t average1 = bc1_pack_565((uint8_t)(sums[3] / BC1_PACKED_NUM_STRIPS), (uint8_t)(sums[4] / BC1_PACKED_NUM_STRIPS), (uint8_t)(sums[5] / BC1_PACKED_NUM_STRIPS));
+    ctx->strip_seed = ((uint32_t)average1 << 16) | (uint32_t)average0;
+
+    for(uint32_t strip_index=0; strip_index<BC1_PACKED_NUM_STRIPS; ++strip_index)
+    {
+        bc1_block previous;
+        unpack_strip_seed(ctx->strip_seed, &previous);
         uint32_t start_y = strip_index * strip_width;
         for(uint32_t y = start_y; y < start_y + strip_width; ++y)
         {
@@ -569,12 +607,15 @@ size_t bc1_packed_compress(bc1_packed_context* ctx, const void* bc1_image, uint3
     if (!save_static_model(&ctx->mask_model, &stream)) return 0;
     if (!save_static_model(&ctx->table_difference_model, &stream)) return 0;
 
-    // top-table
-    if (stream.pos + ctx->top_table_size + 1 > stream.length)
+    // top-table + strip seed
+    if (stream.pos + 1 + 3 + sizeof(uint32_t) + ctx->top_table_size * sizeof(uint32_t) > stream.length)
         return 0;
 
     stream.buffer[stream.pos++] = (uint8_t) (ctx->top_table_size - 1); // there is no zero toptable, so minus 1 to fit in a uint8_t
     stream_align(&stream, sizeof(uint32_t));
+
+    for(uint32_t j=0; j<4; ++j)
+        stream.buffer[stream.pos++] = (uint8_t) ((ctx->strip_seed >> (j*8)) & 0xff);
 
     for(uint32_t i=0; i<ctx->top_table_size; ++i)
         for(uint32_t j=0; j<4; ++j)
@@ -607,7 +648,8 @@ size_t bc1_packed_compress(bc1_packed_context* ctx, const void* bc1_image, uint3
 
         uint64_t bit_pos = 0; // current bit position, used to measure the per-component stats
 
-        bc1_block previous = {.color = {bc1_pack_565(8, 16, 8), bc1_pack_565(24, 48, 24)}};
+        bc1_block previous;
+        unpack_strip_seed(ctx->strip_seed, &previous);
         uint32_t start_y = strip_index * strip_width;
         for(uint32_t y = start_y; y < start_y + strip_width; ++y)
         {
@@ -704,6 +746,13 @@ bool bc1_packed_decompress(bc1_packed_context* ctx, const void* input, size_t in
     ctx->top_table_size = (uint32_t)stream.buffer[stream.pos++] + 1;
     read_stream_align(&stream, sizeof(uint32_t));
 
+    if (stream.pos + sizeof(uint32_t) > stream.length)
+        return false;
+
+    ctx->strip_seed = 0;
+    for(uint32_t j=0; j<4; ++j)
+        ctx->strip_seed |= (uint32_t)stream.buffer[stream.pos++] << (j*8);
+
     for(uint32_t i=0; i<ctx->top_table_size; ++i)
     {
         ctx->top_table[i] = 0;
@@ -735,7 +784,8 @@ bool bc1_packed_decompress(bc1_packed_context* ctx, const void* input, size_t in
     le_init(&compressed_stream, &stream.buffer[strip_offset], stream.length - strip_offset);
     le_begin_decode(&compressed_stream);
     
-    bc1_block previous = {.color = {bc1_pack_565(8, 16, 8), bc1_pack_565(24, 48, 24)}};
+    bc1_block previous;
+    unpack_strip_seed(ctx->strip_seed, &previous);
     uint32_t start_y = strip_index * strip_width;
     for(uint32_t y = start_y; y < start_y + strip_width; ++y)
     {
