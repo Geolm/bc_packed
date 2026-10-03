@@ -50,3 +50,4 @@
 ## Completion
 
 Before reporting completion, verify: implementation finished, build succeeds, tests pass, rules followed, and no unrelated code changed.
+In case of failure (unit test, not reaching goal, etc...), write the experiment description in failed_experiments.md
