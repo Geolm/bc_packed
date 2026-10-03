@@ -47,7 +47,7 @@ struct bc1_packed_context
     hashmap_entry* hashmap;
     bc1_packed_mem_interface mem;
 
-    le_model red_model, green_model, blue_model;
+    le_model red_model[2], green_model[2], blue_model[2]; // one set of 3 per endpoint
     le_model mask_model; // 4 bits
     le_model table_reference_model;
     le_model table_difference_model;
@@ -365,9 +365,9 @@ void build_top_table(hashmap_entry* hashmap, const void* input, uint32_t num_blo
 //-----------------------------------------------------------------------------------------------------------------------------
 void init_static_models(bc1_packed_context* ctx, const void* input, uint32_t width_blocks, uint32_t strip_width)
 {
-    uint32_t hist_red[1<<COLOR_DELTA_NUM_BITS];
-    uint32_t hist_green[1<<COLOR_DELTA_NUM_BITS];
-    uint32_t hist_blue[1<<COLOR_DELTA_NUM_BITS];
+    uint32_t hist_red[2][1<<COLOR_DELTA_NUM_BITS];
+    uint32_t hist_green[2][1<<COLOR_DELTA_NUM_BITS];
+    uint32_t hist_blue[2][1<<COLOR_DELTA_NUM_BITS];
     uint32_t hist_reference[TOP_TABLE_SIZE];
     uint32_t hist_mask[16];
     uint32_t hist_difference[LE_ALPHABET_SIZE];
@@ -430,14 +430,14 @@ void init_static_models(bc1_packed_context* ctx, const void* input, uint32_t wid
                     int dgreen = current_green - previous_green;
                     int dblue = current_blue - previous_blue;
 
-                    hist_green[dgreen + COLOR_DELTA_OFFSET]++;
+                    hist_green[j][dgreen + COLOR_DELTA_OFFSET]++;
 
                     dgreen /= 2;
                     dred -= dgreen;
                     dblue -= dgreen;
 
-                    hist_red[dred + COLOR_DELTA_OFFSET]++;
-                    hist_blue[dblue + COLOR_DELTA_OFFSET]++;
+                    hist_red[j][dred + COLOR_DELTA_OFFSET]++;
+                    hist_blue[j][dblue + COLOR_DELTA_OFFSET]++;
                 }
 
                 uint8_t reference = nearest32(ctx->top_table, ctx->top_table_size, current->indices) & 0xff;
@@ -461,9 +461,12 @@ void init_static_models(bc1_packed_context* ctx, const void* input, uint32_t wid
         }
     }
 
-    le_static_model_init(&ctx->red_model, hist_red, 1<<COLOR_DELTA_NUM_BITS);
-    le_static_model_init(&ctx->blue_model, hist_blue, 1<<COLOR_DELTA_NUM_BITS);
-    le_static_model_init(&ctx->green_model, hist_green, 1<<COLOR_DELTA_NUM_BITS);
+    for(uint32_t j=0; j<2; ++j)
+    {
+        le_static_model_init(&ctx->red_model[j], hist_red[j], 1<<COLOR_DELTA_NUM_BITS);
+        le_static_model_init(&ctx->blue_model[j], hist_blue[j], 1<<COLOR_DELTA_NUM_BITS);
+        le_static_model_init(&ctx->green_model[j], hist_green[j], 1<<COLOR_DELTA_NUM_BITS);
+    }
 
     le_static_model_init(&ctx->table_reference_model, hist_reference, TOP_TABLE_SIZE);
     le_static_model_init(&ctx->mask_model, hist_mask, 16);
@@ -600,9 +603,12 @@ size_t bc1_packed_compress(bc1_packed_context* ctx, const void* bc1_image, uint3
     byte_stream stream = {.buffer = output, .length = output_length, .pos = 0};
 
     // store models
-    if (!save_static_model(&ctx->red_model, &stream)) return 0;
-    if (!save_static_model(&ctx->green_model, &stream)) return 0;
-    if (!save_static_model(&ctx->blue_model, &stream)) return 0;
+    for(uint32_t j=0; j<2; ++j)
+    {
+        if (!save_static_model(&ctx->red_model[j], &stream)) return 0;
+        if (!save_static_model(&ctx->green_model[j], &stream)) return 0;
+        if (!save_static_model(&ctx->blue_model[j], &stream)) return 0;
+    }
     if (!save_static_model(&ctx->table_reference_model, &stream)) return 0;
     if (!save_static_model(&ctx->mask_model, &stream)) return 0;
     if (!save_static_model(&ctx->table_difference_model, &stream)) return 0;
@@ -671,14 +677,14 @@ size_t bc1_packed_compress(bc1_packed_context* ctx, const void* bc1_image, uint3
                     int dgreen = current_green - previous_green;
                     int dblue = current_blue - previous_blue;
 
-                    le_encode_symbol(&compressed_stream, &ctx->green_model, dgreen + COLOR_DELTA_OFFSET);
+                    le_encode_symbol(&compressed_stream, &ctx->green_model[j], dgreen + COLOR_DELTA_OFFSET);
 
                     dgreen /= 2;
                     dred -= dgreen;
                     dblue -= dgreen;
 
-                    le_encode_symbol(&compressed_stream, &ctx->red_model, dred + COLOR_DELTA_OFFSET);
-                    le_encode_symbol(&compressed_stream, &ctx->blue_model, dblue + COLOR_DELTA_OFFSET);
+                    le_encode_symbol(&compressed_stream, &ctx->red_model[j], dred + COLOR_DELTA_OFFSET);
+                    le_encode_symbol(&compressed_stream, &ctx->blue_model[j], dblue + COLOR_DELTA_OFFSET);
                 }
                 stream_bits_since(&bit_pos, &compressed_stream, &ctx->colors_bits);
 
@@ -732,9 +738,12 @@ bool bc1_packed_decompress(bc1_packed_context* ctx, const void* input, size_t in
 
     byte_stream stream = {.buffer = (uint8_t *) input, .length = input_length, .pos = 0};
 
-    if (!load_static_model(&ctx->red_model, &stream)) return false;
-    if (!load_static_model(&ctx->green_model, &stream)) return false;
-    if (!load_static_model(&ctx->blue_model, &stream)) return false;
+    for(uint32_t j=0; j<2; ++j)
+    {
+        if (!load_static_model(&ctx->red_model[j], &stream)) return false;
+        if (!load_static_model(&ctx->green_model[j], &stream)) return false;
+        if (!load_static_model(&ctx->blue_model[j], &stream)) return false;
+    }
     if (!load_static_model(&ctx->table_reference_model, &stream)) return false;
     if (!load_static_model(&ctx->mask_model, &stream)) return false;
     if (!load_static_model(&ctx->table_difference_model, &stream)) return false;
@@ -799,9 +808,9 @@ bool bc1_packed_decompress(bc1_packed_context* ctx, const void* input, size_t in
                 uint8_t reference_red, reference_green, reference_blue;
                 bc1_extract_565(previous.color[j], &reference_red, &reference_green, &reference_blue);
 
-                uint8_t delta_green = le_decode_symbol(&compressed_stream, &ctx->green_model);
-                uint8_t delta_red = le_decode_symbol(&compressed_stream, &ctx->red_model);
-                uint8_t delta_blue = le_decode_symbol(&compressed_stream, &ctx->blue_model);
+                uint8_t delta_green = le_decode_symbol(&compressed_stream, &ctx->green_model[j]);
+                uint8_t delta_red = le_decode_symbol(&compressed_stream, &ctx->red_model[j]);
+                uint8_t delta_blue = le_decode_symbol(&compressed_stream, &ctx->blue_model[j]);
 
                 // red and blue delta are based on green delta
                 int dgreen_orig = (int)delta_green - COLOR_DELTA_OFFSET;
@@ -842,10 +851,10 @@ void bc1_packed_get_stats(bc1_packed_context* ctx, bc1_packed_stats* stats)
 {
     *stats = (bc1_packed_stats)
     {
-        .blue_k = ctx->blue_model.k,
+        .blue_k = { ctx->blue_model[0].k, ctx->blue_model[1].k },
         .difference_k = ctx->table_difference_model.k,
-        .green_k = ctx->green_model.k,
-        .red_k = ctx->red_model.k,
+        .green_k = { ctx->green_model[0].k, ctx->green_model[1].k },
+        .red_k = { ctx->red_model[0].k, ctx->red_model[1].k },
         .mask_k = ctx->mask_model.k,
         .reference_k = ctx->table_reference_model.k,
         .top_table_size = ctx->top_table_size,

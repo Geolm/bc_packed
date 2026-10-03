@@ -27,7 +27,7 @@ typedef struct bc1_packed_context bc1_packed_context;
 typedef struct bc1_packed_stats
 {
     uint32_t top_table_size;
-    uint8_t red_k, green_k, blue_k;
+    uint8_t red_k[2], green_k[2], blue_k[2]; // one per endpoint: [0] = color[0], [1] = color[1]
     uint8_t mask_k, reference_k, difference_k;
 
     // size in bytes of each range-coded component, valid after a successful bc1_packed_compress

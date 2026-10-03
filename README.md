@@ -23,7 +23,7 @@ The techniques are adapted to make GPU decompression fast and simple:
 * **Static symbol ranking.** Symbols are remapped so that the most frequently used symbols have the lowest indices. The rank table is generated from a histogram during compression.
 * **Parallel decompression.** The texture is divided into 64 independent strips. 64 GPU threads decompress the strips in parallel, with no dependency between threads.
 
-Multiple independent Rice-Golomb models are used for the different data: endpoint color deltas (red, green, blue), top-table references, difference masks, and residual difference bytes.
+Multiple independent Rice-Golomb models are used for the different data: endpoint color deltas (one set of red, green, blue per endpoint), top-table references, difference masks, and residual difference bytes.
 
 ### Rice-Golomb model
 
@@ -59,14 +59,14 @@ As the decompression happens on the GPU we need to decompress in parallel multip
 
 For example for a 1024x1024 texture : each thread will decode 256 blocks (in width) x 4 blocks (in height).
 
-As the models are static, each thread just loads the same six models from the stream (`le_static_model_load`); there is no adaptive state to keep in sync between threads.
+As the models are static, each thread just loads the same nine models from the stream (`le_static_model_load`); there is no adaptive state to keep in sync between threads.
 
 As Rice encoding output is non-fixed, we stored in the stream 64 offsets (uint16_t), each a delta in dword units relative to the previous strip, so each thread knows where to start.
 
 ### Endpoints
 
 BC1 endpoints are predicted from the previous block's endpoints.
-Three independent Rice-Golomb models are used for the R, G, and B components.
+One set of three independent Rice-Golomb models is used per endpoint for the R, G, and B components (six models in total), so each endpoint adapts its own Rice parameter and rank table.
 
 For each endpoint of each block:
 
@@ -133,7 +133,7 @@ Note : the stream does not include width, height or format, only the compressed 
 The output buffer must be at least `bc1_packed_maxsize(width, height)` bytes. This is a very rough bound: `(width/4) * (height/4) * 16`, i.e. the size of the standard raw BC1 texture (2× the packed input). In practice the stream is much smaller.
 
 ```text
-* 6 static models, in order: red, green, blue, top-table reference, difference mask, table difference.
+* 9 static models, in order: endpoint 0 red, endpoint 0 green, endpoint 0 blue, endpoint 1 red, endpoint 1 green, endpoint 1 blue, top-table reference, difference mask, table difference.
   Each is 2 + num_symbols bytes, no padding (max 258 bytes).
 * Top table size: one uint8_t (number of entries − 1), padded to a 4-byte boundary.
 * Strip seed: one uint32_t (little-endian) — the two endpoint colors of the "previous block" used to predict the first block of each strip, averaged over the 64 strips at compression time. Low 16 bits = color[0], high 16 bits = color[1].
@@ -153,7 +153,7 @@ Within a strip, the blocks are traversed in the zigzag row order. For each block
 * One difference byte per set mask bit.
 ```
 
-All symbols are encoded with Rice-Golomb using one of the six static models.
+All symbols are encoded with Rice-Golomb using one of the nine static models.
 
 ## Status
 

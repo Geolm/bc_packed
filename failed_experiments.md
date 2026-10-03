@@ -3,9 +3,15 @@
 Trace of the encoding experiments that were tried and **reverted** because they did not beat the
 baseline. Kept here so we don't re-litigate them.
 
-**Baseline (the bar to beat):** per-endpoint color deltas (3 `le_model`s: red/green/blue), raw
-top-table reference (1 `le_model`), index residual mask + per-byte difference (2 `le_model`s).
-Measured on the `suite_image` set (74 images): **1.41:1** average compression ratio, 10/10 tests pass.
+**Baseline (the bar to beat):** per-endpoint color deltas (6 `le_model`s: one set of red/green/blue
+per endpoint), raw top-table reference (1 `le_model`), index residual mask + per-byte difference
+(2 `le_model`s). Measured on the `suite_image` set (74 images): **1.41:1** average compression
+ratio (1.4102, byte-weighted 1.3688), 11/11 tests pass.
+
+Splitting the 3 shared color models into one set per endpoint (6 models, +3 model headers in the
+stream) beat the 3-model baseline: colors payload −0.41%, total stream −0.105%, average ratio
+1.4087 → 1.4102. The endpoint-1 deltas have a different distribution (often wider), so a dedicated
+Rice `k` and rank table per endpoint fits better. Kept.
 
 ## Summary
 

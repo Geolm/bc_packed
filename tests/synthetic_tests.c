@@ -305,12 +305,12 @@ static uint16_t pack_565(uint8_t r5, uint8_t g6, uint8_t b5)
 }
 
 //-----------------------------------------------------------------------------------------------------------------------------
-// walks the stream header (6 static models, top-table size byte, padded to a 4-byte boundary) to read the strip seed
+// walks the stream header (9 static models, top-table size byte, padded to a 4-byte boundary) to read the strip seed
 static bool read_header_strip_seed(const uint8_t* stream, size_t length, uint32_t* seed)
 {
     size_t pos = 0;
 
-    for (uint32_t i = 0; i < 6; ++i)
+    for (uint32_t i = 0; i < 9; ++i)
     {
         if (pos + 2 > length) return false;
         uint32_t num_symbols = stream[pos++] + 1;
