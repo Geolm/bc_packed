@@ -10,6 +10,7 @@
 // Forward declaration for test suites
 void suite_synthetic(void);
 void suite_image(void);
+void suite_benchmark(void);
 
 
 // Define the test runner's main() and greatest internals.
@@ -25,6 +26,7 @@ int main(int argc, char **argv)
     GREATEST_MAIN_BEGIN();
     RUN_SUITE(suite_synthetic);
     RUN_SUITE(suite_image);
+    RUN_SUITE(suite_benchmark);
     GREATEST_MAIN_END();
     return EXIT_SUCCESS;
 }
