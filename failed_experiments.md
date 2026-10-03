@@ -15,6 +15,7 @@ Measured on the `suite_image` set (74 images): **1.41:1** average compression ra
 | 2 | Reference zigzag-delta, static Rice | round-trips, but slower | 1.39:1 | reverted |
 | 3 | Reference zigzag-delta, dynamic Rice | breaks round-trip | n/a | reverted |
 | 4 | Hit-count-sorted top-table + reference delta | round-trips, `reference_bytes` drops but net slower | 1.39:1 | reverted |
+| 5 | Reference-delta hypothesis, offline entropy study (exp. 2 revisited, no code change) | no near-0 peak, delta near-uniform | n/a (est. +3.0% on reference payload) | not implemented |
 
 ---
 
@@ -84,6 +85,49 @@ Sort the table most-used-first, then reuse the reference delta.
 *frequency* layout, but the underlying *spatial* VQ discontinuities dominate, so the delta
 distribution is still too broad for static Rice to beat the raw reference. No codebook ordering can
 fix that.
+
+---
+
+## 5. Reference-delta hypothesis, offline entropy study
+
+**Idea:** revisit of exp. 2's hypothesis, this time measured without touching the encoder:
+"the reference is spatially coherent for the same reasons as colors — adjacent blocks usually
+cluster on the same or a near centroid, so a zigzag-8 delta from the up-neighbor collapses the
+rank histogram to a near-0 peak (reference_k 5–6 → 0–1, i.e. ~8 bits down to 2–4), with trivial
+decoder state (last reference) and no inter-strip dependency."
+
+**Method:** replicated the full pipeline (stb load → `STB_DXT_HIGHQUAL` → `build_top_table`)
+on the 54-image / 2,834,432-block corpus, computed the per-block reference map, and measured
+the entropy of three symbols: raw reference, zigzag-8 mod-256 delta against the scan-previous
+reference (per-strip seed 0, encoder semantics), and zigzag-8 delta against the *spatially*
+up-neighbor (the literal reading of the hypothesis).
+
+**Result:**
+
+| predictor | bits/block |
+|---|---|
+| raw reference (current) | 7.49 |
+| scan-previous delta | 7.72 (+3.0% on the reference payload) |
+| spatial-up delta | 7.92 |
+
+- Only **7.1%** of deltas are zero (0.3–30% per image); **17.6%** have |Δ| > 127 and wrap in the
+  mod-256 zigzag. The delta histogram is near-*uniform*, not a near-0 peak.
+- The spatial-up variant is *worse* than the scan-previous one — the conclusion holds under
+  either reading of "up-neighbor".
+- Consistent with exp. 2's full-encode result (1.41:1 → 1.39:1): the reference is ~22% of the
+  stream, so +3% on it is ≈ −0.6% overall.
+
+**Why it lost:** the top table is ordered by *frequency rank*, not bitmap similarity. Adjacent
+blocks do have similar index bitmaps — but that similarity is already captured by the
+mask+difference pipeline. A 1–2 bit change in a bitmap moves the nearest centroid to a
+*different rank*, and rank adjacency is uncorrelated with bitmap similarity, so the reference
+*rank* sequence is near-uniform to begin with (7.49 of the 8-bit maximum: ≤0.5 bits of
+redundancy) and differencing it only re-scatters it. Two additional constraints: `reference_k`
+is the model *precision*, not the per-symbol cost (a near-uniform 256-symbol model costs
+≈7.9 bits at any k, so "2–4 bits" was unreachable), and `LE_ALPHABET_SIZE = 256` caps the model
+alphabet, so an exact 9-bit delta is impossible without modifying lite_encoding.
+
+**Outcome:** not implemented; the raw reference stays.
 
 ---
 
