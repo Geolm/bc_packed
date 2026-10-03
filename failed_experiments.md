@@ -24,6 +24,7 @@ Rice `k` and rank table per endpoint fits better. Kept.
 | 5 | Reference-delta hypothesis, offline entropy study (exp. 2 revisited, no code change) | no near-0 peak, delta near-uniform | n/a (est. +3.0% on reference payload) | not implemented |
 | 6 | Four difference models (per fixed byte / per ordinal of the set mask bits) | round-trips, payload −0.2% but 3 extra rank tables in the header | 1.4056:1 (fixed) / 1.4049:1 (ordinal) | reverted |
 | 7 | Cost-aware VQ entry selection + top-table ablation (plan stages 1+2) | round-trips, best +0.9% stream, Rice-k cliffs eat the gain | 1.4230:1 (best of 6 variants) | reverted, target ≥1.50 not reached |
+| 8 | Byte-count-first top-table reference (`find_reference`: min differing bytes, popcount tie-break) | round-trips, difference −1.9% but mask +9.1% / reference +2.3% | 1.4055:1 (−0.33%) | reverted |
 
 ---
 
@@ -200,6 +201,62 @@ Baseline 1.4102. Target ≥ 1.50 (expected 1.52–1.57). Best combo = +0.9%. Per
 **Kept:** (1) the Rice-k cliff is a standing constraint on any future selection experiment: static Rice `k` is a global cliff, so any selection that skews the emitted reference/mask/byte distribution must re-fit the models to the emitted distribution (two-pass init) or accept the cliff; (2) refined centroids ≥ exact patterns, `vq_top_table` stays; (3) the empty-table bug above.
 
 **Outcome:** reverted; the 1.4102 baseline stands. The plan's stages 1–2 are shelved, stage 3 (spatially adaptive codebook, format v2) remains gated pending approval. The incompressible reference (~16% of the 1024-class stream) is still the biggest untapped component, and a better (spatially aware) codebook remains the most promising lever.
+
+---
+
+## 8. Byte-count-first top-table reference
+
+**Idea:** in the histogram and compress passes, replace the `nearest32` (min popcount) selection with
+`find_reference`: traverse all top-table entries and pick the one with the fewest differing **bytes**
+(popcount of the 4-bit mask), tie-broken by popcount, then by the larger entry value, then by the
+lower index (nearest32's final tie-breaks). Rationale: the stream writes one full byte per
+differing byte, so a low-popcount difference spread across 4 bytes (4 mask bits + 4 bytes) is
+pricier than a higher popcount concentrated in 1 byte (1 mask bit + 1 byte). Structurally simpler
+than exp 7: no model cost in the selection, no window, no two-pass init. The decoder is untouched
+(it decodes the reference from the stream), and both encoder passes share one deterministic rule, so
+the static models fit exactly the emitted distribution.
+
+**Result:** 74-image suite, 11/11 round-trip, average ratio **1.4055:1** (baseline 1.4102, **−0.33%**).
+52/74 images regressed > 0.05%, 15 improved, 7 flat. Worst: kodim10 −1.61%, woodplanks2 −1.38%,
+kodim07 −1.33%. Best: wall3 +0.75%, rustywall2 +0.55%, grass1 +0.50%. Decoder throughput unchanged
+(≈2760 → ≈2702 MB/s, run noise). Encoder suite wall time 8.1 → 10.1 s (scalar 256-entry scan;
+immaterial).
+
+Component payloads, whole suite (static header excluded):
+
+| component | baseline | new | Δ | Rice k (mean) |
+|---|---|---|---|---|
+| difference | 6694405 B | 6565684 B | **−1.92%** | 3.88 → 4.81 |
+| mask | 1124320 B | 1226779 B | **+9.11%** | 1.14 → 1.57 |
+| reference | 2721337 B | 2783438 B | **+2.28%** | 5.65 → 5.80 |
+| colors | 5888190 B | 5888190 B | +0.00% | untouched |
+
+**What the hypothesis got right:** the difference component *did* drop, exactly as intended (fewer,
+cheaper differing bytes; `difference_k` rose but the byte count fell more). On texture images
+(grass1, ground, wall3, rustywall2) the difference drop (−2.2 to −3.8%) outweighed the other
+increases and the ratio improved.
+
+**Why it still lost:** the selection also moves the *other two* components, whose Rice cost is
+**value-based**, not structure-based:
+- **Mask +9.1%:** the mask symbol is Rice-coded by its *value* 0..15, not by its popcount. A
+  1-byte difference in the MSB byte is mask 8 — structurally sparse but value-large. The shift to
+  byte-sparse winners flattens the mask value distribution, so `mask_k` rose on most images
+  (e.g. 1→2 on kodim10/09, wall2) and the whole component got pricier *despite* fewer bytes
+  following the mask.
+- **Reference +2.3%:** byte-sparse winners are systematically *rarer* table entries (the table is
+  ordered by frequency rank, which is uncorrelated with byte sparsity), so emitted reference values
+  shifted upward and `reference_k` rose 5→6 on 11 images. Near-uniform 8-bit symbols cost ≈1 bit
+  more per raised `k` (cf. exp 5).
+- On photograph-like images (kodim*, walls, wood) the mask + reference increases (≈165 KB
+  suite-wide) outweigh the difference gain (≈129 KB) → 52/74 regress.
+
+**Kept:** the standing lesson sharpens: a structural proxy for the per-block cost (popcount, byte
+count) is only monotone with the *difference* component. Because the mask and reference costs are
+value-based Rice, any selection rule that is not the actual model cost moves those two
+distributions away from where the popcount rule left them. No free lunch from a single scalar key;
+the model-cost-aware selection of exp 7 remains the only variant that was net-positive.
+
+**Outcome:** reverted; the 1.4102 baseline stands.
 
 ---
 
