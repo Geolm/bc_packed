@@ -16,6 +16,7 @@ Measured on the `suite_image` set (74 images): **1.41:1** average compression ra
 | 3 | Reference zigzag-delta, dynamic Rice | breaks round-trip | n/a | reverted |
 | 4 | Hit-count-sorted top-table + reference delta | round-trips, `reference_bytes` drops but net slower | 1.39:1 | reverted |
 | 5 | Reference-delta hypothesis, offline entropy study (exp. 2 revisited, no code change) | no near-0 peak, delta near-uniform | n/a (est. +3.0% on reference payload) | not implemented |
+| 6 | Four difference models (per fixed byte / per ordinal of the set mask bits) | round-trips, payload −0.2% but 3 extra rank tables in the header | 1.4056:1 (fixed) / 1.4049:1 (ordinal) | reverted |
 
 ---
 
@@ -128,6 +129,38 @@ is the model *precision*, not the per-symbol cost (a near-uniform 256-symbol mod
 alphabet, so an exact 9-bit delta is impossible without modifying lite_encoding.
 
 **Outcome:** not implemented; the raw reference stays.
+
+---
+
+## 6. Four difference models (one per non-zero byte)
+
+**Idea:** replace the single `table_difference_model`, shared by all 4 bytes of the indices residual,
+with 4 static models so each can specialize on a narrower byte distribution (and thus pick a better
+`k`). Two variants were measured:
+- **Fixed position:** model `j` encodes byte `j` of the indices (LSB→MSB).
+- **Ordinal:** model `j` encodes the `(j+1)`-th *non-zero* byte — the first differing byte always
+  uses model 0, the second model 1, etc. (the model index follows the set bits of the mask in
+  LSB→MSB order, on both the histogram and the encode/decode side).
+
+Both variants keep the same stream framing (the header grows from 6 to 9 static models) and
+round-trip byte-exact, all 11 tests pass.
+
+**Result:** loses on both ratio and speed (`suite_image`, 74 images).
+- Fixed position: average ratio 1.4087 → 1.4056 (**−0.22%**); `difference_bytes` −0.27% (smaller on 74/74).
+- Ordinal: average ratio 1.4087 → 1.4049 (**−0.27%**); `difference_bytes` −0.21%; **0/74 images improve**.
+- Decompression (ground.png 1024², 18 threads): ≈2497 → ≈2447 MB/s (**≈−2%**).
+
+**Why it lost:** the four bytes of the residual are near-identical in Rice terms. The single model
+already picks `k=4` on 66/74 images, and the split models land on the same `k` for 59/74 (fixed
+variant: bytes 0/3 are `k=4` on 69/74 each; only bytes 1/2 occasionally drop to `k=3`, one image
+each to `k≤2`). Specialization therefore saves at most ≈0.2% of the `difference` payload, while the
+stream header grows by 3 extra rank tables (`2 + num_symbols` bytes each, up to 258) — ≈+450 B per
+image (ground.png: 397,536 → 397,988 B), which outweighs the gain. Small 512² images suffer most
+(−0.5%): the header is a bigger share of their stream. Decompression loses ≈2% because the hot
+decode loop now selects among 4 models with divergent `k` values, with no bitstream savings to pay
+for it.
+
+**Kept:** nothing. The baseline single `table_difference_model` stays.
 
 ---
 
