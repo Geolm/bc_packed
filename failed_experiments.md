@@ -23,6 +23,7 @@ Rice `k` and rank table per endpoint fits better. Kept.
 | 4 | Hit-count-sorted top-table + reference delta | round-trips, `reference_bytes` drops but net slower | 1.39:1 | reverted |
 | 5 | Reference-delta hypothesis, offline entropy study (exp. 2 revisited, no code change) | no near-0 peak, delta near-uniform | n/a (est. +3.0% on reference payload) | not implemented |
 | 6 | Four difference models (per fixed byte / per ordinal of the set mask bits) | round-trips, payload −0.2% but 3 extra rank tables in the header | 1.4056:1 (fixed) / 1.4049:1 (ordinal) | reverted |
+| 7 | Cost-aware VQ entry selection + top-table ablation (plan stages 1+2) | round-trips, best +0.9% stream, Rice-k cliffs eat the gain | 1.4230:1 (best of 6 variants) | reverted, target ≥1.50 not reached |
 
 ---
 
@@ -167,6 +168,38 @@ decode loop now selects among 4 models with divergent `k` values, with no bitstr
 for it.
 
 **Kept:** nothing. The baseline single `table_difference_model` stays.
+
+---
+
+## 7. Cost-aware VQ entry selection + top-table ablation (plan stages 1+2)
+
+**Idea:** the residual is the whale: difference ~21.2 bits/block, reference ~8.3, incompressible).
+- **Stage 1 (selection):** after the SIMD `nearest32` scan, among the entries within 4 popcount of the nearest, pick the one minimizing the expected coded cost = mask bits + differing-byte bits under the static models; ties broken by fewest differing bytes, then cheapest reference, then lower index. The `init_static_models` pass uses a flat proxy (8 bits/byte, 1 bit per set mask bit) because the models do not exist yet, and the reference/mask/difference histograms get +1 Laplace smoothing so every symbol the compress pass can pick is present in the saved model (zero-count symbols are not stored in the stream).
+- **Stage 2 (table):** ablate the `vq_top_table` refined (chimera) centroids against the exact top-256 patterns, plus a top-256-minus-singletons variant.
+
+**Result:** 74-image suite, six completed variants, 11/11 round-trip on all of them:
+
+| top table | entry selection | avg ratio |
+|---|---|---|
+| vq refined (current) | cost-aware + reference tie-break | 1.3999 |
+| vq refined (current) | cost-aware | 1.3985 |
+| vq refined (current) | cost-aware + two-pass init | **1.4230** |
+| exact top-256 | cost-aware + reference tie-break | 1.3953 |
+| exact top-256 | cost-aware | 1.3931 |
+| exact top-256 | cost-aware + two-pass init | 1.4178 |
+
+Baseline 1.4102. Target ≥ 1.50 (expected 1.52–1.57). Best combo = +0.9%. Per-image guard: 0 of 74 regressed > 1%.
+
+**Why it lost:**
+- The difference payload only dropped ~4% (metal.png: 165961 → 159559 B) vs the plan's expected 21.2 → 16–17 bits/block (−22%): the ±4-popcount window mostly re-orders same-byte-count candidates, and these textures rarely have a byte-sparse neighbor within 4 flips.
+- **Rice-k cliff:** the selection shifts the emitted symbol distributions and flips the globally-minimized `k` (metal.png: reference_k 6→5, mask_k 1→2) → reference +11% (64006 → 71147 B) and mask +8% (23891 → 25800 B), eating the difference gain. A two-pass init (model fitted to the actually-emitted distribution) recovers most of it (1.4230), but the plan's ~10% expectation was built on a difference drop ~5× bigger than what the window can deliver.
+- **Stage 2 has no lever:** the exact table covers more blocks exactly (zero-residual 4.1% → 6.3% suite-wide) but the refined centroids are closer on average for the rest (avg nearest popcount 5.36 → 5.59, difference bytes 86685 → 87851 with two-pass init) — the exact variant is slightly worse in every selection row (−0.3 to −0.5%). The refinement stays as-is, and the plan's "gated" variant is vacuous: a majority-vote centroid move always decreases total Hamming distance by construction.
+
+**Open bug found (not fixed — work stopped here):** the top table can come out **empty**. `vq_top_table` drops clusters with sampled count ≤ 1; on small random images (512 blocks; reproduced on 1 of 20 splitmix32 seeds, e.g. seed `0x296969A4`) no cluster survives → `top_table_size = 0` → compress writes header byte `(uint8_t)(0−1) = 255` ("256 entries") but zero entries, corrupting the stream layout; `bc1_packed_decompress` then asserts (`stream.length > strip_offset`) in test builds and reads past the end of the stream with asserts off. The minus-singletons ablation triggers it deterministically (≥ 256 unique patterns → all top-256 are singletons → all dropped). Needs a 1-entry floor in `build_top_table` plus a regression test.
+
+**Kept:** (1) the Rice-k cliff is a standing constraint on any future selection experiment: static Rice `k` is a global cliff, so any selection that skews the emitted reference/mask/byte distribution must re-fit the models to the emitted distribution (two-pass init) or accept the cliff; (2) refined centroids ≥ exact patterns, `vq_top_table` stays; (3) the empty-table bug above.
+
+**Outcome:** reverted; the 1.4102 baseline stands. The plan's stages 1–2 are shelved, stage 3 (spatially adaptive codebook, format v2) remains gated pending approval. The incompressible reference (~16% of the 1024-class stream) is still the biggest untapped component, and a better (spatially aware) codebook remains the most promising lever.
 
 ---
 
