@@ -183,18 +183,7 @@ TEST benchmark_ground_decompression(void)
     args.width = bench_width;
     args.height = bench_height;
 
-    // unmeasured roundtrip, validates the parallel decompression
     struct sched_task task;
-    scheduler_add(&sched, &task, bench_decompress_task, &args, BC1_PACKED_NUM_STRIPS, 1);
-    scheduler_join(&sched, &task);
-    for (uint32_t i = 0; i < num_threads; ++i)
-    {
-        ASSERT_EQ(failures[i], 0);
-    }
-    for (size_t i = 0; i < image_size; ++i)
-    {
-        ASSERT_EQ(original_bc1[i], decompressed[i]);
-    }
 
     // measured: 1000 full image decompressions
     stm_setup();
@@ -205,6 +194,17 @@ TEST benchmark_ground_decompression(void)
         scheduler_join(&sched, &task);
     }
     const double seconds = stm_sec(stm_now() - start);
+
+    // unmeasured roundtrip, validates the last parallel decompression
+    // [failures] accumulates over all runs, the byte compare checks the result of the last one
+    for (uint32_t i = 0; i < num_threads; ++i)
+    {
+        ASSERT_EQ(failures[i], 0);
+    }
+    for (size_t i = 0; i < image_size; ++i)
+    {
+        ASSERT_EQ(original_bc1[i], decompressed[i]);
+    }
 
     const double megabytes = (double)(image_size * BENCH_DECOMPRESS_RUNS) / (1024.0 * 1024.0);
     const double mb_per_sec = seconds > 0.0 ? megabytes / seconds : 0.0;
