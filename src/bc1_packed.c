@@ -177,13 +177,19 @@ static inline uint32_t hash32(uint32_t x)
 }
 
 //----------------------------------------------------------------------------------------------------------------------------
+// Returns (popcount << 16) | index of the table entry with the smallest XOR popcount against [bitfield].
+// Ties are broken by the fewest differing bytes, then by the largest entry value.
 uint32_t nearest32(const uint32_t* table, uint32_t table_size, uint32_t bitfield)
 {
     uint32_t scores[TOP_TABLE_SIZE];
+    uint32_t masks[TOP_TABLE_SIZE];
     uint32_t i = 0;
 
 #ifdef BC1_PACKED_NEON
+    static const uint8_t byte_weight[16] = { 1, 2, 4, 8, 1, 2, 4, 8, 1, 2, 4, 8, 1, 2, 4, 8 };
     uint32x4_t bf_vec = vdupq_n_u32(bitfield);
+    uint8x16_t one_bytes = vdupq_n_u8(1);
+    uint8x16_t weight_bytes = vld1q_u8(byte_weight);
 
     for (; i + 3 < table_size; i += 4)
     {
@@ -195,11 +201,20 @@ uint32_t nearest32(const uint32_t* table, uint32_t table_size, uint32_t bitfield
         uint32x4_t sum32 = vpaddlq_u16(sum16);
 
         vst1q_u32(&scores[i], sum32);
+
+        // differing-byte mask per entry: 1 per differing byte, weighted {1, 2, 4, 8} inside the entry then summed
+        uint8x16_t nz_bytes = vandq_u8(vcgeq_u8(counts, one_bytes), one_bytes);
+        uint16x8_t half = vpaddlq_u8(vmulq_u8(nz_bytes, weight_bytes));
+        vst1q_u32(&masks[i], vpaddlq_u16(half));
     }
 #else
     const __m128i bf_vec   = _mm_set1_epi32(bitfield);
     const __m128i mask_low = _mm_set1_epi8(0x0F);
     const __m128i lookup   = _mm_setr_epi8(0,1,1,2,1,2,2,3,1,2,2,3,2,3,3,4);
+    const __m128i zero16   = _mm_setzero_si128();
+    const __m128i one8     = _mm_set1_epi8(1);
+    const __m128i weights  = _mm_setr_epi8(1,2,4,8, 1,2,4,8, 1,2,4,8, 1,2,4,8);
+    const __m128i one16    = _mm_set1_epi16(1);
 
     for (; i + 3 < table_size; i += 4) 
     {
@@ -213,31 +228,48 @@ uint32_t nearest32(const uint32_t* table, uint32_t table_size, uint32_t bitfield
         __m128i lo_words = _mm_and_si128(cnt, _mm_set1_epi16(0x00FF));
         __m128i hi_words = _mm_srli_epi16(cnt, 8);
         __m128i sums = _mm_add_epi16(lo_words, hi_words);
-        __m128i final = _mm_madd_epi16(sums, _mm_set1_epi16(1));
+        __m128i final = _mm_madd_epi16(sums, one16);
 
         _mm_storeu_si128((__m128i*)&scores[i], final);
+
+        // differing-byte mask per entry: 1 per differing byte, weighted {1, 2, 4, 8} inside the entry then summed
+        __m128i nz_bytes = _mm_and_si128(_mm_cmpgt_epi8(cnt, zero16), one8);
+        __m128i half = _mm_maddubs_epi16(nz_bytes, weights);
+        _mm_storeu_si128((__m128i*)&masks[i], _mm_madd_epi16(half, one16));
     }
 #endif
 
     // tail (or whole array on x64)
     for (; i < table_size; ++i)
     {
-        uint32_t score = popcount(table[i] ^ bitfield);
+        uint32_t difference = table[i] ^ bitfield;
+        uint32_t score = popcount(difference);
         if (score == 0) 
             return (0 << 16) | (i & 0xffff);
         scores[i] = score;
+
+        uint32_t mask = 0;
+        if ((difference & 0x000000FF) != 0) mask |= 1;
+        if ((difference & 0x0000FF00) != 0) mask |= 2;
+        if ((difference & 0x00FF0000) != 0) mask |= 4;
+        if ((difference & 0xFF000000) != 0) mask |= 8;
+        masks[i] = mask;
     }
 
-    // find best
+    // find best: lowest popcount, then fewest differing bytes, then the largest table value
     uint32_t best_index = 0;
     uint32_t best_score = UINT32_MAX;
+    uint32_t best_mask  = 0;
     for (uint32_t j = 0; j < table_size; ++j)
     {
         uint32_t score = scores[j];
-        if (score < best_score || (score == best_score && table[j] > table[best_index]))
+        int mask_bits = popcount(masks[j]);
+        if (score < best_score ||
+            (score == best_score && (mask_bits < popcount(best_mask) || (mask_bits == popcount(best_mask) && table[j] > table[best_index]))))
         {
             best_score = score;
             best_index = j;
+            best_mask  = masks[j];
         }
     }
     return ((best_score&0xffff)<<16) | (best_index&0xffff);
