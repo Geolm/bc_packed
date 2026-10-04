@@ -26,6 +26,7 @@ Rice `k` and rank table per endpoint fits better. Kept.
 | 7 | Cost-aware VQ entry selection + top-table ablation (plan stages 1+2) | round-trips, best +0.9% stream, Rice-k cliffs eat the gain | 1.4230:1 (best of 6 variants) | reverted, target ≥1.50 not reached |
 | 8 | Byte-count-first top-table reference (`find_reference`: min differing bytes, popcount tie-break) | round-trips, difference −1.9% but mask +9.1% / reference +2.3% | 1.4055:1 (−0.33%) | reverted |
 | 8b | Exp 8 re-run on top of per-strip mask k (the rice-k-cliff enabler) | round-trips, mask increase is *true distribution cost*, not a k cliff — still a loss | 1.4058:1 (−0.31%) | reverted (per-strip mask k kept, it is independently +0.03%) |
+| 9 | Top-block color prediction (vertical predictor after the first scanline) | round-trips, `colors` +5.4% (zigzag-previous is the better predictor for 49/74) | 1.3933:1 (−1.19%) | reverted (format-compatible; kept as a speed lever, see open thread) |
 
 ---
 
@@ -308,9 +309,65 @@ baseline: **1.4106**.
 
 ---
 
+## 9. Top-block color prediction (vertical predictor after the first scanline)
+
+**Idea:** after the first scanline of each strip, predict each block's endpoint colors from the
+spatial block *above* (`y−1`, same `x`) instead of the zigzag-previous block. The first scanline
+keeps the current behavior (zigzag-previous, strip seed at the start). The row above is already
+decoded when a row is processed (rows go top to bottom within a strip), so the change is a
+3-site one-liner (`(y == start_y) ? &previous : block_above` in the histogram, compress, and
+decompress passes): no stream-format change, no header change, no inter-strip dependency.
+
+**Motivation:** with the zigzag-previous predictor, each block depends on the *preceding* block —
+a serial chain of `width_blocks × strip_width` per strip. With the top-block predictor every block
+depends only on the row above, so a whole row decodes in parallel: the per-strip serial depth
+falls from `width×rows` to `rows` (1024 → 4 for a 1024² strip, 256× shallower), a structural win
+for the GPU compute-shader decompression.
+
+**Result:** 74-image suite, 11/11 round-trip, average ratio **1.3933:1** (baseline 1.4102,
+**−1.19%** simple; byte-weighted 1.3688 → 1.3431, **−1.88%**). 49/74 images regressed, 25 improved.
+The `colors` payload is the whole story: **5,888,190 → 6,203,938 B (+5.36%)**; reference/mask/
+difference are untouched. Mean color-model k: green 2.15→2.35 / 2.34→2.53 (slightly wider
+delta shape), red/blue flat.
+
+By image class (ratio, colors_bytes):
+
+| class | n | ratio | Δ | colors Δ |
+|---|---|---|---|---|
+| Wood scans | 20 | 1.4846 → 1.5146 | **+2.0%** | −4.2% |
+| kodim photos | 24 | 1.4191 → 1.3796 | **−2.8%** | +8.8% |
+| other textures | 30 | 1.3534 → 1.3234 | **−2.2%** | +6.0% |
+
+Decompression (ground.png 1024², 18 threads, means of repeated runs): ≈2733 → ≈2765 MiB/s
+(**+1.2%** — the multithreaded CPU path mostly hides the shorter serial chain; the structural
+win is the 256× shallower per-strip dependency, which matters for the GPU shader).
+
+**Why it lost:** for this suite the horizontal-neighbor delta is the better color predictor on
+average. Adjacent 4×4 blocks share more of their 565 endpoint color along the row than along the
+column (kodim photos, walls, roofs: +6–9% colors payload), and only textures whose features run
+*vertically* (the Wood scans) benefit enough to pay it back (−4.2% colors). Colors is ≈22–33% of
+a stream, so a +5.4% payload increase is a net −1.2% ratio — the same distribution-cost logic as
+exp 1: changing the predictor reshapes what the Rice models carry, and here the shape got wider.
+
+**Kept:** nothing in the stream. The change was fully format-compatible and is preserved as a
+patch (`plans/exp9_topblock_predictor.patch`) for re-application if decompression throughput
+becomes the objective (known cost: −1.2% size). See also the open thread on the per-row variant.
+
+**Outcome:** reverted; the 1.4102 baseline stands.
+
+---
+
 ## Open thread (not a failed experiment, just a lead)
 
 The reference is the largest byte component (~22% of a typical image). Since it's a VQ index that is
 not coherent, neither codebook reordering nor delta-coding moves it. The lever that *would* is a
 **better VQ codebook** (more/smarter centroids, or spatially-aware quantization) so the index surface
 is inherently smoother and the residual smaller. Larger change, separate investigation — not started.
+
+A second lead from exp 9: a **per-row color predictor**. For each scanline, emit one flag bit and
+predict from whichever of top-block / zigzag-previous was cheaper for that row (decided in the
+histogram pass by delta energy, so the static models fit the emitted distribution exactly). The
+flag costs 1 bit/row (≈32 B for a 1024² image, one extra 2-symbol model in the header) and could
+keep the Wood-scan gain while restoring zigzag on photo-like images (≈ ratio-neutral or slightly
+positive). Caveat: a row flagged zigzag is a serial chain again, so the GPU row-parallel win only
+applies to the rows flagged top.
