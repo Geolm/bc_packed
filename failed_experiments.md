@@ -25,6 +25,7 @@ Rice `k` and rank table per endpoint fits better. Kept.
 | 6 | Four difference models (per fixed byte / per ordinal of the set mask bits) | round-trips, payload −0.2% but 3 extra rank tables in the header | 1.4056:1 (fixed) / 1.4049:1 (ordinal) | reverted |
 | 7 | Cost-aware VQ entry selection + top-table ablation (plan stages 1+2) | round-trips, best +0.9% stream, Rice-k cliffs eat the gain | 1.4230:1 (best of 6 variants) | reverted, target ≥1.50 not reached |
 | 8 | Byte-count-first top-table reference (`find_reference`: min differing bytes, popcount tie-break) | round-trips, difference −1.9% but mask +9.1% / reference +2.3% | 1.4055:1 (−0.33%) | reverted |
+| 8b | Exp 8 re-run on top of per-strip mask k (the rice-k-cliff enabler) | round-trips, mask increase is *true distribution cost*, not a k cliff — still a loss | 1.4058:1 (−0.31%) | reverted (per-strip mask k kept, it is independently +0.03%) |
 
 ---
 
@@ -254,9 +255,56 @@ increases and the ratio improved.
 count) is only monotone with the *difference* component. Because the mask and reference costs are
 value-based Rice, any selection rule that is not the actual model cost moves those two
 distributions away from where the popcount rule left them. No free lunch from a single scalar key;
-the model-cost-aware selection of exp 7 remains the only variant that was net-positive.
+the model-cost-aware selection of exp 7 remains the only variant that was net-positive. (See 8b:
+the per-strip mask k enabler did not change the verdict.)
 
-**Outcome:** reverted; the 1.4102 baseline stands.
+**Outcome:** reverted; the 1.4102 baseline stood until the per-strip mask k of 8b was kept (1.4106).
+
+---
+
+## 8b. Exp 8 re-run with per-strip mask k
+
+**Context:** between 8 and 8b the stream gained a kept change: a per-strip Rice `k` for the mask
+model (the alphabet stays image-wide; the k is stored RLE'd against the image-level k, 1 B for a
+stationary image; the strip stays 4-aligned). This kills the *k-cliff* failure mode for the mask:
+each strip's k is the exact argmin of its own emitted mask distribution. Measured alone on the
+popcount selection: **1.4102 → 1.4106 (+0.033%)**, mask payload −0.45%, 13 images improved, 0
+regressed. Kept.
+
+**Idea:** re-run exp 8 (byte-sparse `find_reference` selection) on top of that. Exp 8's mask loss
+was +9.11%, partly attributed to the image-wide `mask_k` flipping 1→2; with per-strip k, only the
+strips that genuinely need a different k should pay, so the hope was that the mask increase would
+collapse and the net would flip positive (difference was already −1.92%).
+
+**Result:** 74-image suite, 11/11 round-trip, average ratio **1.4058:1** (−0.31% vs 1.4102).
+51/74 regressed > 0.05%, 15 improved, 8 flat — the same loss profile as exp 8. Components:
+
+| component | exp 8 | 8b | Δ | k (mean, image-level) |
+|---|---|---|---|---|
+| difference | −1.92% | −1.92% | unchanged | 3.88 → 4.81 |
+| mask | +9.11% | **+8.84%** | only −16 KB recovered | 1.14 → 1.57 |
+| reference | +2.28% | +2.28% | unchanged (its k is still image-wide) | 5.65 → 5.80 |
+
+**Why it still lost — the mask increase was never a k cliff:** per-strip k recovered only ~16 KB
+of the ~102 KB mask increase. The Rice bit cost of a *mid-range* mask value is nearly k-invariant
+(value 1: k=1 costs 3 bits, k=2 costs 3; value 8: k=1 costs 5, k=2 costs 4) — the 1→2 flip
+roughly cancels itself. The +8.8% is **true distribution cost**: byte-sparse selection
+systematically scatters the mask *value* distribution (a 1-byte difference in any of the 4 bytes
+is one of values 1/2/4/8, a flatter mid-range shape than the popcount rule produced), and no k
+choice, per image or per strip, prices that shape cheaper. The reference +2.3% (rarer entries →
+larger values) is untouched by mask-only per-strip k, and extending per-strip k to the reference
+could at best recover the small k-cliff slice of it — the arithmetic still nets a loss
+(−129 KB difference gain vs ~+145 KB mask + reference) on any variant of this selection.
+
+**Kept:** (1) the per-strip mask k (independently net-positive, and it remains the right shape for
+any future per-strip model work); (2) the generalization of the exp 8 lesson: a selection rule
+that reshapes a value-based Rice distribution pays for the *shape*, not just the scale — per-strip
+k removes the scale cliff but cannot remove a flatter shape. The selection frontier (exp 7 cost-aware,
+exp 8 byte-sparse, 8b) is now closed for structural keys: only the actual model cost is monotone
+with the actual cost, and that variant (exp 7) was shelved for process reasons, not measured ones.
+
+**Outcome:** the `find_reference` selection is reverted; the per-strip mask k stays. Current
+baseline: **1.4106**.
 
 ---
 

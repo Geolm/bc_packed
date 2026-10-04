@@ -208,7 +208,7 @@ TEST benchmark_ground_decompression(void)
 
     const double megabytes = (double)(image_size * BENCH_DECOMPRESS_RUNS) / (1024.0 * 1024.0);
     const double mb_per_sec = seconds > 0.0 ? megabytes / seconds : 0.0;
-    printf("\n==> benchmark %s %ux%u : %u threads, %u KiB image (%u bytes compressed), %d decompress runs in %.3f s, %.1f MB/s\n\n",
+    printf("\n==> benchmark %s %ux%u : %u threads, %u KiB image (%u bytes compressed), %d decompress runs in %.3f s, %.1f MiB/s\n\n",
            BENCH_IMAGE_PATH, bench_width, bench_height, num_threads, (unsigned)(image_size/1024),
            (unsigned)compressed_size, BENCH_DECOMPRESS_RUNS, seconds, mb_per_sec);
 
