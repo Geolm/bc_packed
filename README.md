@@ -96,6 +96,7 @@ BC1 contains a 32-bit index field for each block.
 * It selects the Top 256 most frequently occurring index patterns to form the top_table.
 * The top table is refined using vector quantization. This algorithm implements Stochastic Bit-Level K-Means Clustering to optimize a BC1 VQ table. It uses Adaptive Jittered Sampling with error-feedback to efficiently assign image blocks to centroids based on Hamming Distance. Centroids are refined via Bitwise Majority Voting, flipping bits that differ in more than 50% of assigned blocks to mathematically minimize total bit-error across iterations.
 * Clusters that end up empty are dropped, so the final table may contain fewer than 256 entries.
+* An empty table (possible on tiny inputs where every cluster is dropped) is replaced by a single entry, the most frequent exact index pattern: the stream stores the table size as `entries − 1` in one byte, so zero entries would read back as 256 and corrupt the format.
 
 #### Block indices
 
@@ -157,12 +158,12 @@ All symbols are encoded with Rice-Golomb using one of the nine static models.
 
 ## Status
 
-`bc1_packed_compress` is implemented and the stream matches the format documented above, but the work is still in progress:
+The stream matches the format documented above, and both `bc1_packed_compress` and `bc1_packed_decompress` are implemented. All nine models are image-wide: one Rice `k` per model, no per-strip model state (a per-strip `k` for the mask model was prototyped and measured +0.03% — not adopted, the gain did not justify the added stream bytes and decoder state).
 
-* CPU decompression (`bc1_packed_decompress`) is declared in the header but not implemented yet — the CPU validation loop below is pending on it.
-* Unit tests are stubs; the future validation suite will use `stb_image.h` and `stb_dxt.h` from `third_party/`, which the library itself does not depend on.
+* CPU decompression (`bc1_packed_decompress`) decodes one strip at a time; the unit tests decompress every strip and compare byte-exact against the input.
+* Unit tests (`tests/`) cover synthetic textures, a real-image roundtrip suite over `images/` (loaded with `stb_image.h`, converted with `stb_dxt.h` from `third_party/`, which the library itself does not depend on), and a multithreaded decompression benchmark.
 * Textures whose height in blocks is not a multiple of 64 (i.e. height not a multiple of 256) silently drop the trailing block rows.
-* GPU decoding: `src/gpu_decoding.h` is a Metal port of the lite-encoding bit reader (device uint32 `le_stream`, `le_model` with `is_static`, `rice_decode`) for the decompression compute shader.
+* GPU decoding is not part of this tree; the compute-shader decoder described in Design goals is the intended consumer of this stream (the static Rice-Golomb models are what keep it cheap to port).
 
 ## Validation 
 

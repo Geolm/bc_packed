@@ -4,6 +4,7 @@
 #define TEST_IMAGE_SIZE (65536)
 #define TEST_IMAGE_WIDTH (256)
 #define TEST_IMAGE_HEIGHT (256)
+#define TINY_IMAGE_BLOCKS (256) // 4 x 64 blocks, the minimum supported image
 
 const uint16_t red   = 0xF800;
 const uint16_t cyan  = 0x07FF;
@@ -417,6 +418,69 @@ TEST strip_seed_header(void)
 }
 
 
+//-----------------------------------------------------------------------------------------------------------------------------
+// Test 10: every byte of every index is an odd-multiplied permutation of the block order, so the indices are
+// unique under every byte mask: no index pattern repeats, an extreme case for the top table. the table must
+// never come out empty (an empty table corrupts the stream, its size is stored as size-1 in a byte, 0 reads
+// back as 256), the 1-entry floor in build_top_table keeps the single most frequent exact pattern
+TEST top_table_empty_floor(void)
+{
+    const uint32_t width = 16;
+    const uint32_t height = 256;
+    const uint32_t num_blocks = TINY_IMAGE_BLOCKS;
+
+    bc1_block image[TINY_IMAGE_BLOCKS];
+    for (uint32_t i = 0; i < num_blocks; ++i)
+    {
+        uint32_t v = i;
+
+        image[i] = (bc1_block)
+        {
+            .color = {red, cyan},
+            .indices = v | (((v * 17u + 3u) & 0xFF) << 8) | (((v * 45u + 7u) & 0xFF) << 16) | (((v * 113u + 19u) & 0xFF) << 24)
+        };
+    }
+
+    bc1_packed_context* ctx = bc1_packed_init(NULL);
+    ASSERT(ctx != NULL);
+
+    size_t compressed_buffer_size = bc1_packed_maxsize(width, height);
+    uint8_t* compressed_buffer = malloc(compressed_buffer_size);
+    ASSERT(compressed_buffer != NULL);
+
+    size_t stream_size = bc1_packed_compress(ctx, image, width, height, compressed_buffer, compressed_buffer_size);
+    ASSERT(stream_size != 0);
+
+    bc1_packed_stats stats;
+    bc1_packed_get_stats(ctx, &stats);
+
+    // the table must never be empty
+    ASSERT(stats.top_table_size >= 1);
+
+    bc1_block* decompressed = malloc(num_blocks * sizeof(bc1_block));
+    ASSERT(decompressed != NULL);
+
+    for (uint32_t i = 0; i < BC1_PACKED_NUM_STRIPS; ++i)
+    {
+        ASSERT(bc1_packed_decompress(ctx, compressed_buffer, stream_size, width, height, decompressed, i));
+    }
+
+    for (uint32_t i = 0; i < num_blocks; ++i)
+    {
+        ASSERT_EQ(decompressed[i].color[0], image[i].color[0]);
+        ASSERT_EQ(decompressed[i].color[1], image[i].color[1]);
+        ASSERT_EQ(decompressed[i].indices, image[i].indices);
+    }
+
+    bc1_packed_terminate(ctx);
+
+    free(compressed_buffer);
+    free(decompressed);
+
+    PASS();
+}
+
+
 SUITE(suite_synthetic)
 {
     (void)flat;
@@ -427,6 +491,7 @@ SUITE(suite_synthetic)
     (void)identical_colors;
     (void)stats_constant_image;
     (void)strip_seed_header;
+    (void)top_table_empty_floor;
 
     RUN_TEST(flat);
     RUN_TEST(checkerboard);
@@ -437,4 +502,5 @@ SUITE(suite_synthetic)
     RUN_TEST(stats_constant_image);
     RUN_TEST(strip_seed_header);
     RUN_TEST(variable_resolutions_random);
+    RUN_TEST(top_table_empty_floor);
 }

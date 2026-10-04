@@ -25,8 +25,9 @@ Rice `k` and rank table per endpoint fits better. Kept.
 | 6 | Four difference models (per fixed byte / per ordinal of the set mask bits) | round-trips, payload −0.2% but 3 extra rank tables in the header | 1.4056:1 (fixed) / 1.4049:1 (ordinal) | reverted |
 | 7 | Cost-aware VQ entry selection + top-table ablation (plan stages 1+2) | round-trips, best +0.9% stream, Rice-k cliffs eat the gain | 1.4230:1 (best of 6 variants) | reverted, target ≥1.50 not reached |
 | 8 | Byte-count-first top-table reference (`find_reference`: min differing bytes, popcount tie-break) | round-trips, difference −1.9% but mask +9.1% / reference +2.3% | 1.4055:1 (−0.33%) | reverted |
-| 8b | Exp 8 re-run on top of per-strip mask k (the rice-k-cliff enabler) | round-trips, mask increase is *true distribution cost*, not a k cliff — still a loss | 1.4058:1 (−0.31%) | reverted (per-strip mask k kept, it is independently +0.03%) |
+| 8b | Exp 8 re-run on top of per-strip mask k (the rice-k-cliff enabler) | round-trips, mask increase is *true distribution cost*, not a k cliff — still a loss | 1.4058:1 (−0.31%) | reverted (per-strip mask k not committed, the +0.03% did not justify the code) |
 | 9 | Top-block color prediction (vertical predictor after the first scanline) | round-trips, `colors` +5.4% (zigzag-previous is the better predictor for 49/74) | 1.3933:1 (−1.19%) | reverted (format-compatible; kept as a speed lever, see open thread) |
+| 10 | Cascading masked top-table, VQ removed (exact ≥ n → 1-byte → 2-byte rounds, mode-resolved) | round-trips; n 2..8 byte-identical; difference +2.15% | 1.4025:1 (−0.54%) | reverted (1-entry floor + regression test kept — fixes the open bug) |
 
 ---
 
@@ -198,7 +199,7 @@ Baseline 1.4102. Target ≥ 1.50 (expected 1.52–1.57). Best combo = +0.9%. Per
 - **Rice-k cliff:** the selection shifts the emitted symbol distributions and flips the globally-minimized `k` (metal.png: reference_k 6→5, mask_k 1→2) → reference +11% (64006 → 71147 B) and mask +8% (23891 → 25800 B), eating the difference gain. A two-pass init (model fitted to the actually-emitted distribution) recovers most of it (1.4230), but the plan's ~10% expectation was built on a difference drop ~5× bigger than what the window can deliver.
 - **Stage 2 has no lever:** the exact table covers more blocks exactly (zero-residual 4.1% → 6.3% suite-wide) but the refined centroids are closer on average for the rest (avg nearest popcount 5.36 → 5.59, difference bytes 86685 → 87851 with two-pass init) — the exact variant is slightly worse in every selection row (−0.3 to −0.5%). The refinement stays as-is, and the plan's "gated" variant is vacuous: a majority-vote centroid move always decreases total Hamming distance by construction.
 
-**Open bug found (not fixed — work stopped here):** the top table can come out **empty**. `vq_top_table` drops clusters with sampled count ≤ 1; on small random images (512 blocks; reproduced on 1 of 20 splitmix32 seeds, e.g. seed `0x296969A4`) no cluster survives → `top_table_size = 0` → compress writes header byte `(uint8_t)(0−1) = 255` ("256 entries") but zero entries, corrupting the stream layout; `bc1_packed_decompress` then asserts (`stream.length > strip_offset`) in test builds and reads past the end of the stream with asserts off. The minus-singletons ablation triggers it deterministically (≥ 256 unique patterns → all top-256 are singletons → all dropped). Needs a 1-entry floor in `build_top_table` plus a regression test.
+**Open bug found (fixed in the exp 10 cleanup — see below):** the top table can come out **empty**. `vq_top_table` drops clusters with sampled count ≤ 1; on small random images (512 blocks; reproduced on 1 of 20 splitmix32 seeds, e.g. seed `0x296969A4`) no cluster survives → `top_table_size = 0` → compress writes header byte `(uint8_t)(0−1) = 255` ("256 entries") but zero entries, corrupting the stream layout; `bc1_packed_decompress` then asserts (`stream.length > strip_offset`) in test builds and reads past the end of the stream with asserts off. The minus-singletons ablation triggers it deterministically (≥ 256 unique patterns → all top-256 are singletons → all dropped). Fixed: a 1-entry floor in `build_top_table` plus the `top_table_empty_floor` regression test (kept from exp 10).
 
 **Kept:** (1) the Rice-k cliff is a standing constraint on any future selection experiment: static Rice `k` is a global cliff, so any selection that skews the emitted reference/mask/byte distribution must re-fit the models to the emitted distribution (two-pass init) or accept the cliff; (2) refined centroids ≥ exact patterns, `vq_top_table` stays; (3) the empty-table bug above.
 
@@ -265,7 +266,7 @@ the per-strip mask k enabler did not change the verdict.)
 
 ## 8b. Exp 8 re-run with per-strip mask k
 
-**Context:** between 8 and 8b the stream gained a kept change: a per-strip Rice `k` for the mask
+**Context:** between 8 and 8b the stream gained a change, later **not committed** (the +0.03% gain did not justify the code): a per-strip Rice `k` for the mask
 model (the alphabet stays image-wide; the k is stored RLE'd against the image-level k, 1 B for a
 stationary image; the strip stays 4-aligned). This kills the *k-cliff* failure mode for the mask:
 each strip's k is the exact argmin of its own emitted mask distribution. Measured alone on the
@@ -297,15 +298,15 @@ larger values) is untouched by mask-only per-strip k, and extending per-strip k 
 could at best recover the small k-cliff slice of it — the arithmetic still nets a loss
 (−129 KB difference gain vs ~+145 KB mask + reference) on any variant of this selection.
 
-**Kept:** (1) the per-strip mask k (independently net-positive, and it remains the right shape for
-any future per-strip model work); (2) the generalization of the exp 8 lesson: a selection rule
+**Kept:** (1) the per-strip mask k was measured net-positive (+0.033%) but was **not committed** — the gain
+did not justify the added stream format + decoder state; (2) the generalization of the exp 8 lesson: a selection rule
 that reshapes a value-based Rice distribution pays for the *shape*, not just the scale — per-strip
 k removes the scale cliff but cannot remove a flatter shape. The selection frontier (exp 7 cost-aware,
 exp 8 byte-sparse, 8b) is now closed for structural keys: only the actual model cost is monotone
 with the actual cost, and that variant (exp 7) was shelved for process reasons, not measured ones.
 
-**Outcome:** the `find_reference` selection is reverted; the per-strip mask k stays. Current
-baseline: **1.4106**.
+**Outcome:** the `find_reference` selection is reverted; the per-strip mask k was not committed. Current
+baseline: **1.4102**.
 
 ---
 
@@ -354,6 +355,70 @@ patch (`plans/exp9_topblock_predictor.patch`) for re-application if decompressio
 becomes the objective (known cost: −1.2% size). See also the open thread on the per-row variant.
 
 **Outcome:** reverted; the 1.4102 baseline stands.
+
+---
+
+## 10. Cascading masked top-table (VQ pass removed)
+
+**Idea (yours):** drop the `vq_top_table` refinement pass (it doesn't bring anything) and instead fill the
+top table with a cascading series of hashmap rounds, each keeping only patterns used at least n times
+(n an encoder-only knob, tested 2..8):
+1. **Exact round:** hash all block indices, keep the most frequent full patterns with count ≥ n (top 256 by count).
+2. **If the table is not full** (likely for sparse textures): 4 rounds with one byte masked off of the
+   hash key (`0x00FFFFFF`, `0xFF00FFFF`, `0xFFFF00FF`, `0xFFFFFF00`), same threshold, most frequent first.
+3. **If still not full:** 6 rounds with two bytes masked off (all byte-pair combinations, `0x00FF00FF`-style).
+   The cascade stops as soon as the table is full; a table with fewer than 256 entries is valid.
+Each masked pattern is resolved to its **most frequent concrete index** (per-pattern mode, via a second
+rehash of the same hashmap: the mode's blocks get a zero residual instead of one differing byte; tie-break
+by the higher value, same convention as `nearest32`), and candidates are deduped against the current
+table. Rounds are factored into one `collect_top_table_round` function. A **1-entry floor** (the single
+most frequent exact pattern) guards the documented empty-table corruption. Histogram and decompression
+passes untouched; stream format and `bc1_packed_maxsize` unchanged.
+
+**n sweep (2..8):** all values produced **byte-identical streams** on the 74-image suite (the pattern
+histograms are heavy-tailed enough that the top-256 selection is stable for any threshold below the
+256th pattern's count) — n has no measurable effect on this suite, only small/sparse images would feel it.
+Default shipped at n = 2 (closest to the old "top 256 whatever the count" behavior).
+
+**Result:** 74-image suite, 13/13 round-trip, average ratio **1.4025:1** (baseline 1.4102, **−0.54%**).
+70/74 images regressed, 4 improved (Wood_03 +4.95%, Wood_04 +4.21%, sky +0.07%, kodim07 +0.05%), 0 flat.
+Worst: wall2 −4.56%, bigsand −2.94%, Wood_15 −2.86%, Wood_14 −2.85%, roof_tiles −2.68%.
+
+Component payloads, whole suite (static header excluded):
+
+| component | baseline | new | Δ | Rice k (mean) |
+|---|---|---|---|---|
+| colors | 5888190 B | 5888190 B | +0.00% | untouched |
+| reference | 2721337 B | 2703547 B | −0.65% | 5.65 → 5.62 |
+| mask | 1124320 B | 1100670 B | −2.10% | 1.14 → 1.04 |
+| difference | 6694405 B | 6838463 B | **+2.15%** | 3.88 → 3.96 |
+
+Top table: mean size 226 → 255 (VQ used to prune clusters; the cascade fills to 256 almost always).
+Ground.png stream: 397616 → 399092 B. Decoder throughput ≈2767 → ≈2650 MiB/s (run noise; the decode
+path is untouched). Encoder: slower, as expected (up to 11 masked hashmap passes + 10 mode-resolution
+passes over the blocks, vs the VQ's 4 jittered-sampled nearest32 rounds).
+
+**Why it lost:** the same mechanism exp 7's stage-2 ablation measured: the VQ majority-vote centroids are
+*strictly closer* than the exact patterns to the blocks that don't match a pattern exactly (average
+nearest popcount 5.36 refined vs 5.59 exact). The cascade's entries are real, existing patterns: the
+blocks that equal one get a zero residual, but that population is already well served by the current
+top-256, and the *residual* population — the majority of blocks, `difference` ≈ 40% of the payload — is
+systematically farther from a real pattern than from a bit-majority centroid. The +2.15% difference
+increase (≈ +144 KB suite-wide) outweighs the mask −2.10% (−24 KB) and reference −0.65% (−18 KB)
+improvements. The coarse-fill slots (mean table 226 → 255) also replace VQ's chimeras, which were the
+closer match for exactly those blocks. One implementation note: the survivors bubble (carried over from
+the old top-table code) packs entries at the *back* of the array; the first implementation read them from
+the front, so every cascade round silently produced 0 survivors and the table collapsed to the floor —
+caught by the `top_table_masked_patterns` regression test, fixed with a full array reversal.
+
+**Kept:** the 1-entry floor + the `top_table_empty_floor` regression test — this is the fix for the open
+empty-table bug from exp 7 (independent of the cascade), re-applied to the reverted `build_top_table`.
+The `top_table_masked_patterns` test went with the cascade.
+
+**Outcome:** reverted; the 1.4102 baseline (VQ top table + 1-entry floor) stands. The 3-byte-off round
+was never shipped (left out on purpose, per the doubt raised before implementing). The open "better
+codebook" thread stands unchanged: this experiment rules out *coarser exact patterns* as the lever; the
+measured lever remains smarter (spatially aware) centroids.
 
 ---
 

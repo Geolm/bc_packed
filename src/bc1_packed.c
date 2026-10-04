@@ -360,6 +360,29 @@ void build_top_table(hashmap_entry* hashmap, const void* input, uint32_t num_blo
     }
 
     vq_top_table(input, num_blocks, output, num_entries);
+
+    // an empty top table corrupts the stream (the size is stored as size-1 in a byte, 0 reads back as 256 entries),
+    // fall back to the single most frequent exact pattern, the hashmap still holds the exact pattern counts
+    if (*num_entries == 0)
+    {
+        uint32_t best_key = 0;
+        uint32_t best_count = 0;
+
+        for (uint32_t i = 0; i < HASHMAP_SIZE; ++i)
+        {
+            if (hashmap[i].count == 0)
+                continue;
+
+            if ((hashmap[i].count > best_count) || ((hashmap[i].count == best_count) && (hashmap[i].key > best_key)))
+            {
+                best_count = hashmap[i].count;
+                best_key = hashmap[i].key;
+            }
+        }
+
+        output[0] = best_key;
+        *num_entries = 1;
+    }
 }
 
 //-----------------------------------------------------------------------------------------------------------------------------
