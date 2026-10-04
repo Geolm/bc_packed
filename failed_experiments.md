@@ -4,9 +4,10 @@ Trace of the encoding experiments that were tried and **reverted** because they 
 baseline. Kept here so we don't re-litigate them.
 
 **Baseline (the bar to beat):** per-endpoint color deltas (6 `le_model`s: one set of red/green/blue
-per endpoint), raw top-table reference (1 `le_model`), index residual mask + per-byte difference
-(2 `le_model`s). Measured on the `suite_image` set (74 images): **1.41:1** average compression
-ratio (1.4102, byte-weighted 1.3688), 11/11 tests pass.
+per endpoint), per-strip color predictor selection (exp 11, 8 header bytes), raw top-table reference
+(1 `le_model`), index residual mask + per-byte difference (2 `le_model`s). Measured on the
+`suite_image` set (74 images): **1.43:1** average compression ratio (1.4323, byte-weighted 1.3822),
+13/13 tests pass. (Before exp 11 the baseline was 1.4102 / 1.3688.)
 
 Splitting the 3 shared color models into one set per endpoint (6 models, +3 model headers in the
 stream) beat the 3-model baseline: colors payload −0.41%, total stream −0.105%, average ratio
@@ -28,6 +29,7 @@ Rice `k` and rank table per endpoint fits better. Kept.
 | 8b | Exp 8 re-run on top of per-strip mask k (the rice-k-cliff enabler) | round-trips, mask increase is *true distribution cost*, not a k cliff — still a loss | 1.4058:1 (−0.31%) | reverted (per-strip mask k not committed, the +0.03% did not justify the code) |
 | 9 | Top-block color prediction (vertical predictor after the first scanline) | round-trips, `colors` +5.4% (zigzag-previous is the better predictor for 49/74) | 1.3933:1 (−1.19%) | reverted (format-compatible; kept as a speed lever, see open thread) |
 | 10 | Cascading masked top-table, VQ removed (exact ≥ n → 1-byte → 2-byte rounds, mode-resolved) | round-trips; n 2..8 byte-identical; difference +2.15% | 1.4025:1 (−0.54%) | reverted (1-entry floor + regression test kept — fixes the open bug) |
+| 11 | Per-strip color predictor: row-above (same zigzag position) vs zigzag-previous, 1 bit/strip in the header, decided by delta energy | round-trips; colors −2.72%; 58/74 improved, worst −0.05% | **1.4323:1** (+1.57%) | **kept — this is the new baseline** |
 
 ---
 
@@ -354,7 +356,20 @@ exp 1: changing the predictor reshapes what the Rice models carry, and here the 
 patch (`plans/exp9_topblock_predictor.patch`) for re-application if decompression throughput
 becomes the objective (known cost: −1.2% size). See also the open thread on the per-row variant.
 
-**Outcome:** reverted; the 1.4102 baseline stands.
+**Correction (2026-10-04, found while implementing exp 11):** the "spatial block above (y−1, same x)"
+in this experiment was actually the block of the row above at the **same zigzag position** — visually,
+the horizontally *mirrored* column of the previous row — not the directly-above block. The patch was
+never committed (the `plans/` folder was cleaned up), so this was proven by measurement instead: with
+the documented class partition (20 `Wood_0x` scans) the same-zigzag-position reference reproduces the
+documented **−4.2%** wood class delta exactly (−4.21%), and the class baselines (1.4846 / 1.4191 /
+1.3534 / 1.4102) and the 5,888,190-byte colors payload all match the current tree. The truly
+spatial directly-above reference is *far* worse on this suite (all-top: kodim +45.7%, wood +7.6%,
++20.7% overall) — it is the zigzag-column reference that is cheap on the plank scans, because the
+grain follows the zigzag columns. Consequence: exp 9's "−1.2% size" price tag applies to the
+zigzag-column reference, not to the spatially-vertical one.
+
+**Outcome:** reverted as an *all-or-nothing* predictor; its reference (same zigzag position) is the
+winner of the per-strip decision of exp 11, which is kept.
 
 ---
 
@@ -422,6 +437,52 @@ measured lever remains smarter (spatially aware) centroids.
 
 ---
 
+## 11. Per-strip color predictor (row-above at the same zigzag position)
+
+**Idea (yours, the per-strip refinement of exp 9 / the open thread):** in the pre-histogram pass, per
+strip, decide which color predictor is cheaper — zigzag-previous (the baseline) or the block of the row
+above at the **same zigzag position** after the first scanline (the reference exp 9 actually used, see
+its correction note) — and store **one bit per strip** (8 bytes, little-endian, in the header after the
+strip seed). Histogram, compress, and decompress all use the chosen predictor per strip. The first
+scanline of every strip is always predicted from the strip seed via the zigzag chain (identical for both
+predictors, it cancels in the comparison).
+
+**Decision rule:** total absolute magnitude of the six color deltas each predictor would emit for the
+strip (decorrelated green/red/blue, both endpoints) — the `color_delta_energy` helper. A branchless
+`abs32` here shipped with a signed/unsigned shift bug (`u >> 31` on a `uint32_t` is a *logical* shift;
+the trick needs the all-ones mask, so it was rewritten with an arithmetic shift) that wrapped every
+negative delta to ~2³² and made the decision garbage (measured 1.34:1, k-cliffs everywhere) before the
+fix. With correct magnitudes the rule is a good proxy for the exact Rice cost: the fixed-point optimum
+(per-strip argmin under the fitted mixture model, iterated) lands within 0.01% of the energy rule on the
+suite, so the cheap rule is what ships.
+
+**Result:** 74-image suite, 13/13 round-trip, average ratio **1.4323:1** (baseline 1.4102, **+1.57%**;
+byte-weighted 1.3688 → 1.3822, total stream bytes −0.96%). Colors payload **5,888,190 → 5,728,137 B
+(−2.72%)**; reference/mask/difference untouched. Per image: **58 improved, 15 flat, 1 regressed**
+(worst: kodim14 −0.052% — the 8-byte header overhead on a stream where no strip switches; best:
+Wood_05 +6.93%). Wood scans +2.7…+6.9% each, kodim photos mostly +0.1…+2%, roof_tiles +4.6%, metal
++1.5%, wall2 +2.3%. Decompression throughput unchanged (≈2730 → ≈2729 MiB/s, run noise); encoder
+gains one extra pre-pass over the blocks.
+
+**Why it won where exp 9 lost:** exp 9 applied the zigzag-column reference to *every* strip; here only
+the strips where it is actually cheaper pay for it. The gain comes almost entirely from the plank/wood
+textures, whose grain follows the zigzag columns (the same-zigzag-position row-above is an exact or near
+exact match there); photo-like images keep zigzag-previous on (nearly) every strip, so their distribution
+— and the fitted Rice `k` — barely moves (no exp-8b-style shape cost). A model fitted to the mixture
+still fits the *emitted* distribution exactly, the standing lesson of exp 7/8b, so there is no k cliff.
+
+**Also measured, same machinery:** the truly spatial *directly-above* reference (parity-remapped) has
+≈zero per-strip value on this suite — its per-strip best-of under the mixture model is ratio-neutral
+(wood +7.6% all-top; the decision only ever flips a handful of strips, e.g. wall2 −0.18%). The
+zigzag-column reference is the one that carries the gain.
+
+**Kept:** this is the **new baseline** (1.4323). Stream format: 8 extra header bytes after the strip
+seed, nothing else. Decoder: flagged strips decode row-parallel (no serial zigzag chain) — the exp 9
+GPU motivation, now paid for only on the strips that benefit. Regression test: `strip_predictor`
+(two synthetic patterns that force the all-ones and the all-zeros flag words, byte-exact round-trip).
+
+---
+
 ## Open thread (not a failed experiment, just a lead)
 
 The reference is the largest byte component (~22% of a typical image). Since it's a VQ index that is
@@ -430,9 +491,10 @@ not coherent, neither codebook reordering nor delta-coding moves it. The lever t
 is inherently smoother and the residual smaller. Larger change, separate investigation — not started.
 
 A second lead from exp 9: a **per-row color predictor**. For each scanline, emit one flag bit and
-predict from whichever of top-block / zigzag-previous was cheaper for that row (decided in the
+predict from whichever of row-above / zigzag-previous was cheaper for that row (decided in the
 histogram pass by delta energy, so the static models fit the emitted distribution exactly). The
-flag costs 1 bit/row (≈32 B for a 1024² image, one extra 2-symbol model in the header) and could
-keep the Wood-scan gain while restoring zigzag on photo-like images (≈ ratio-neutral or slightly
-positive). Caveat: a row flagged zigzag is a serial chain again, so the GPU row-parallel win only
-applies to the rows flagged top.
+flag costs 1 bit/row (≈32 B for a 1024² image) and could subdivide the per-strip choice of exp 11
+(a strip is only height/64 rows: 4 rows for a 1024² texture, so per-row can split a strip exp 11
+assigned to a single predictor). Caveat: a row flagged zigzag is a serial chain again, so the GPU
+row-parallel win only applies to the rows flagged row-above. (Exp 11 implemented the per-*strip*
+coarsening of this lead and kept it.)

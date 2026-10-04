@@ -58,6 +58,12 @@ struct bc1_packed_context
     // seed "previous block" of every strip: average of the first block of each strip, the two 16-bit 565 colors packed in one uint32
     uint32_t strip_seed;
 
+    // per-strip color predictor: bit s = 1 → strip s predicts endpoint colors from the block of the row above,
+    // same zigzag position (visually: the horizontally mirrored column of the previous row), after its first
+    // scanline; 0 → zigzag-previous block. the first scanline of every strip is always predicted from the
+    // strip seed via the zigzag chain, as there is no previous row within the strip
+    uint64_t strip_predictor;
+
     // bit counters of the range-coded payload, per component
     uint64_t colors_bits, reference_bits, mask_bits, difference_bits;
 };
@@ -117,6 +123,46 @@ static inline void unpack_strip_seed(uint32_t seed, bc1_block* previous)
     previous->color[0] = (uint16_t)seed;
     previous->color[1] = (uint16_t)(seed >> 16);
     previous->indices = 0;
+}
+
+//----------------------------------------------------------------------------------------------------------------------------
+// branchless absolute value (arithmetic shift: mask is -1 for a negative, 0 otherwise)
+static inline uint32_t abs32(int v)
+{
+    int32_t mask = v >> 31;
+    return (uint32_t)((v + mask) ^ mask);
+}
+
+//----------------------------------------------------------------------------------------------------------------------------
+// total absolute magnitude of the color deltas [current] would emit against [reference]: both endpoints,
+// the decorrelated green / red / blue magnitudes, i.e. the six symbols the encoder writes per block.
+// used to pick the cheaper per-strip predictor (top block vs zigzag-previous)
+static inline uint32_t color_delta_energy(const bc1_block* current, const bc1_block* reference)
+{
+    uint32_t energy = 0;
+
+    for(uint32_t j=0; j<2; ++j)
+    {
+        uint8_t current_red, current_green, current_blue;
+        uint8_t reference_red, reference_green, reference_blue;
+
+        bc1_extract_565(current->color[j], &current_red, &current_green, &current_blue);
+        bc1_extract_565(reference->color[j], &reference_red, &reference_green, &reference_blue);
+
+        int dred = current_red - reference_red;
+        int dgreen = current_green - reference_green;
+        int dblue = current_blue - reference_blue;
+
+        energy += abs32(dgreen);
+
+        dgreen /= 2;
+        dred -= dgreen;
+        dblue -= dgreen;
+
+        energy += abs32(dred) + abs32(dblue);
+    }
+
+    return energy;
 }
 
 //----------------------------------------------------------------------------------------------------------------------------
@@ -427,10 +473,45 @@ void init_static_models(bc1_packed_context* ctx, const void* input, uint32_t wid
     uint16_t average1 = bc1_pack_565((uint8_t)(sums[3] / BC1_PACKED_NUM_STRIPS), (uint8_t)(sums[4] / BC1_PACKED_NUM_STRIPS), (uint8_t)(sums[5] / BC1_PACKED_NUM_STRIPS));
     ctx->strip_seed = ((uint32_t)average1 << 16) | (uint32_t)average0;
 
+    // pre-pass: per strip, pick the cheaper color predictor, zigzag-previous vs the row above (same zigzag
+    // position) after the first scanline, by the total absolute magnitude of the color deltas each would emit
+    ctx->strip_predictor = 0;
+    for(uint32_t strip_index=0; strip_index<BC1_PACKED_NUM_STRIPS; ++strip_index)
+    {
+        uint64_t energy_previous = 0;
+        uint64_t energy_top = 0;
+
+        bc1_block previous;
+        unpack_strip_seed(ctx->strip_seed, &previous);
+
+        uint32_t start_y = strip_index * strip_width;
+        for(uint32_t y = start_y; y < start_y + strip_width; ++y)
+        {
+            for(uint32_t x = 0; x < width_blocks; ++x)
+            {
+                uint32_t zigzag_x = (y&1) ? x : width_blocks - x - 1;
+                const bc1_block* current = (const bc1_block*) input + (y * width_blocks) + zigzag_x;
+
+                const bc1_block* top = &previous;
+                if (y > start_y)
+                    top = (const bc1_block*) input + (y - 1) * width_blocks + zigzag_x; // same zigzag position, row above
+
+                energy_previous += color_delta_energy(current, &previous);
+                energy_top += color_delta_energy(current, top);
+
+                previous = *current;
+            }
+        }
+
+        if (energy_top < energy_previous)
+            ctx->strip_predictor |= (uint64_t)1 << strip_index;
+    }
+
     for(uint32_t strip_index=0; strip_index<BC1_PACKED_NUM_STRIPS; ++strip_index)
     {
         bc1_block previous;
         unpack_strip_seed(ctx->strip_seed, &previous);
+        const bool use_top = ((ctx->strip_predictor >> strip_index) & 1) != 0;
         uint32_t start_y = strip_index * strip_width;
         for(uint32_t y = start_y; y < start_y + strip_width; ++y)
         {
@@ -441,17 +522,23 @@ void init_static_models(bc1_packed_context* ctx, const void* input, uint32_t wid
 
                 const bc1_block* current = (const bc1_block*) input + (y * width_blocks) + zigzag_x;
 
+                // first scanline of a strip is always predicted from the seed via the zigzag-previous chain,
+                // after that a top-flagged strip is predicted from the row above, same zigzag position
+                const bc1_block* color_reference = &previous;
+                if (use_top && y > start_y)
+                    color_reference = (const bc1_block*) input + (y - 1) * width_blocks + zigzag_x;
+
                 for(uint32_t j=0; j<2; ++j)
                 {
                     uint8_t current_red, current_green, current_blue;
-                    uint8_t previous_red, previous_green, previous_blue;
+                    uint8_t reference_red, reference_green, reference_blue;
 
                     bc1_extract_565(current->color[j], &current_red, &current_green, &current_blue);
-                    bc1_extract_565(previous.color[j], &previous_red, &previous_green, &previous_blue);
+                    bc1_extract_565(color_reference->color[j], &reference_red, &reference_green, &reference_blue);
 
-                    int dred = current_red - previous_red;
-                    int dgreen = current_green - previous_green;
-                    int dblue = current_blue - previous_blue;
+                    int dred = current_red - reference_red;
+                    int dgreen = current_green - reference_green;
+                    int dblue = current_blue - reference_blue;
 
                     hist_green[j][dgreen + COLOR_DELTA_OFFSET]++;
 
@@ -636,8 +723,8 @@ size_t bc1_packed_compress(bc1_packed_context* ctx, const void* bc1_image, uint3
     if (!save_static_model(&ctx->mask_model, &stream)) return 0;
     if (!save_static_model(&ctx->table_difference_model, &stream)) return 0;
 
-    // top-table + strip seed
-    if (stream.pos + 1 + 3 + sizeof(uint32_t) + ctx->top_table_size * sizeof(uint32_t) > stream.length)
+    // top-table + strip seed + predictor flags
+    if (stream.pos + 1 + 3 + sizeof(uint32_t) + 8 + ctx->top_table_size * sizeof(uint32_t) > stream.length)
         return 0;
 
     stream.buffer[stream.pos++] = (uint8_t) (ctx->top_table_size - 1); // there is no zero toptable, so minus 1 to fit in a uint8_t
@@ -645,6 +732,9 @@ size_t bc1_packed_compress(bc1_packed_context* ctx, const void* bc1_image, uint3
 
     for(uint32_t j=0; j<4; ++j)
         stream.buffer[stream.pos++] = (uint8_t) ((ctx->strip_seed >> (j*8)) & 0xff);
+
+    for(uint32_t j=0; j<8; ++j)
+        stream.buffer[stream.pos++] = (uint8_t) ((ctx->strip_predictor >> (j*8)) & 0xff);
 
     for(uint32_t i=0; i<ctx->top_table_size; ++i)
         for(uint32_t j=0; j<4; ++j)
@@ -679,6 +769,7 @@ size_t bc1_packed_compress(bc1_packed_context* ctx, const void* bc1_image, uint3
 
         bc1_block previous;
         unpack_strip_seed(ctx->strip_seed, &previous);
+        const bool use_top = ((ctx->strip_predictor >> strip_index) & 1) != 0;
         uint32_t start_y = strip_index * strip_width;
         for(uint32_t y = start_y; y < start_y + strip_width; ++y)
         {
@@ -688,17 +779,23 @@ size_t bc1_packed_compress(bc1_packed_context* ctx, const void* bc1_image, uint3
                 uint32_t zigzag_x = (y&1) ? x : width_blocks - x - 1;
                 const bc1_block* current = (const bc1_block*) bc1_image + (y * width_blocks) + zigzag_x;
 
+                // first scanline of a strip is always predicted from the seed via the zigzag-previous chain,
+                // after that a top-flagged strip is predicted from the row above, same zigzag position
+                const bc1_block* color_reference = &previous;
+                if (use_top && y > start_y)
+                    color_reference = (const bc1_block*) bc1_image + (y - 1) * width_blocks + zigzag_x;
+
                 for(uint32_t j=0; j<2; ++j)
                 {
                     uint8_t current_red, current_green, current_blue;
-                    uint8_t previous_red, previous_green, previous_blue;
+                    uint8_t reference_red, reference_green, reference_blue;
 
                     bc1_extract_565(current->color[j], &current_red, &current_green, &current_blue);
-                    bc1_extract_565(previous.color[j], &previous_red, &previous_green, &previous_blue);
+                    bc1_extract_565(color_reference->color[j], &reference_red, &reference_green, &reference_blue);
 
-                    int dred = current_red - previous_red;
-                    int dgreen = current_green - previous_green;
-                    int dblue = current_blue - previous_blue;
+                    int dred = current_red - reference_red;
+                    int dgreen = current_green - reference_green;
+                    int dblue = current_blue - reference_blue;
 
                     le_encode_symbol(&compressed_stream, &ctx->green_model[j], dgreen + COLOR_DELTA_OFFSET);
 
@@ -778,12 +875,16 @@ bool bc1_packed_decompress(bc1_packed_context* ctx, const void* input, size_t in
     ctx->top_table_size = (uint32_t)stream.buffer[stream.pos++] + 1;
     read_stream_align(&stream, sizeof(uint32_t));
 
-    if (stream.pos + sizeof(uint32_t) > stream.length)
+    if (stream.pos + sizeof(uint32_t) + 8 > stream.length)
         return false;
 
     ctx->strip_seed = 0;
     for(uint32_t j=0; j<4; ++j)
         ctx->strip_seed |= (uint32_t)stream.buffer[stream.pos++] << (j*8);
+
+    ctx->strip_predictor = 0;
+    for(uint32_t j=0; j<8; ++j)
+        ctx->strip_predictor |= (uint64_t)stream.buffer[stream.pos++] << (j*8);
 
     for(uint32_t i=0; i<ctx->top_table_size; ++i)
     {
@@ -818,6 +919,7 @@ bool bc1_packed_decompress(bc1_packed_context* ctx, const void* input, size_t in
     
     bc1_block previous;
     unpack_strip_seed(ctx->strip_seed, &previous);
+    const bool use_top = ((ctx->strip_predictor >> strip_index) & 1) != 0;
     uint32_t start_y = strip_index * strip_width;
     for(uint32_t y = start_y; y < start_y + strip_width; ++y)
     {
@@ -826,10 +928,16 @@ bool bc1_packed_decompress(bc1_packed_context* ctx, const void* input, size_t in
             uint32_t zigzag_x = (y&1) ? x : width_blocks - x - 1;
             bc1_block* current = (bc1_block*) output + (y * width_blocks) + zigzag_x;
 
+            // first scanline of a strip is always predicted from the seed via the zigzag-previous chain,
+            // after that a top-flagged strip is predicted from the row above, same zigzag position
+            const bc1_block* color_reference = &previous;
+            if (use_top && y > start_y)
+                color_reference = (const bc1_block*) output + (y - 1) * width_blocks + zigzag_x;
+
             for(uint32_t j=0; j<2; ++j)
             {
                 uint8_t reference_red, reference_green, reference_blue;
-                bc1_extract_565(previous.color[j], &reference_red, &reference_green, &reference_blue);
+                bc1_extract_565(color_reference->color[j], &reference_red, &reference_green, &reference_blue);
 
                 uint8_t delta_green = le_decode_symbol(&compressed_stream, &ctx->green_model[j]);
                 uint8_t delta_red = le_decode_symbol(&compressed_stream, &ctx->red_model[j]);

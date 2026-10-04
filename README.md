@@ -86,6 +86,17 @@ uint32_t zigzag_x = (y & 1) ? x : width_blocks - x - 1;
 
 This keeps the prediction direction continuous when moving from one scanline to the next. There is no previous block at the start of each strip, so the first block of each strip is predicted from the strip seed, a single endpoint color pair stored in the stream header (see Compressed stream).
 
+### Per-strip predictor
+
+Two predictors are available for the endpoint colors:
+
+* **zigzag-previous** (the default): the previous block of the zigzag chain, the in-row spatial neighbor.
+* **row-above**: the block of the row above at the *same zigzag position* — visually, the horizontally mirrored column of the previous row.
+
+The compressor runs a pre-pass before the histogram and, for each strip, sums the absolute magnitude of the color deltas each predictor would emit (the first scanline is identical for both, the strip seed chain): the cheaper one wins and one bit per strip is stored in the stream header (see Compressed stream). The histogram and the encoder then use the chosen predictor per strip, so the static color models always fit the distribution that is actually emitted.
+
+Textures whose features follow the zigzag columns (e.g. plank scans) make the row-above predictor much cheaper, while most other textures keep the zigzag-previous one. On the 74-image test suite this moves the average ratio 1.41 → 1.43 (colors payload −2.7%), with 58/74 images improving and the worst single image at −0.01% (the 8-byte header overhead on an image where no strip switches). For GPU decompression the row-above predictor also removes the serial zigzag chain: every block after the first scanline depends only on the row above, so a whole row decodes in parallel.
+
 ### Indices
 
 BC1 contains a 32-bit index field for each block.
@@ -138,6 +149,7 @@ The output buffer must be at least `bc1_packed_maxsize(width, height)` bytes. Th
   Each is 2 + num_symbols bytes, no padding (max 258 bytes).
 * Top table size: one uint8_t (number of entries − 1), padded to a 4-byte boundary.
 * Strip seed: one uint32_t (little-endian) — the two endpoint colors of the "previous block" used to predict the first block of each strip, averaged over the 64 strips at compression time. Low 16 bits = color[0], high 16 bits = color[1].
+* Strip predictor flags: 8 bytes (little-endian uint64_t) — one bit per strip: 1 → endpoint colors of that strip are predicted from the row above (same zigzag position) after the first scanline, 0 → zigzag-previous block. See Per-strip predictor.
 * Top table entries, 4 bytes each (little-endian uint32_t).
 * Padded to a 2-byte boundary.
 * 64 strip offsets (uint16_t each), relative deltas in dword units.
@@ -158,7 +170,7 @@ All symbols are encoded with Rice-Golomb using one of the nine static models.
 
 ## Status
 
-The stream matches the format documented above, and both `bc1_packed_compress` and `bc1_packed_decompress` are implemented. All nine models are image-wide: one Rice `k` per model, no per-strip model state (a per-strip `k` for the mask model was prototyped and measured +0.03% — not adopted, the gain did not justify the added stream bytes and decoder state).
+The stream matches the format documented above, and both `bc1_packed_compress` and `bc1_packed_decompress` are implemented. All nine models are image-wide: one Rice `k` per model, no per-strip model state (a per-strip `k` for the mask model was prototyped and measured +0.03% — not adopted, the gain did not justify the added stream bytes and decoder state). The only per-strip state is the color predictor flag (8 bytes in the header, see Per-strip predictor): it selects between two predictors, it does not change any model.
 
 * CPU decompression (`bc1_packed_decompress`) decodes one strip at a time; the unit tests decompress every strip and compare byte-exact against the input.
 * Unit tests (`tests/`) cover synthetic textures, a real-image roundtrip suite over `images/` (loaded with `stb_image.h`, converted with `stb_dxt.h` from `third_party/`, which the library itself does not depend on), and a multithreaded decompression benchmark.

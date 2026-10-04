@@ -306,28 +306,54 @@ static uint16_t pack_565(uint8_t r5, uint8_t g6, uint8_t b5)
 }
 
 //-----------------------------------------------------------------------------------------------------------------------------
-// walks the stream header (9 static models, top-table size byte, padded to a 4-byte boundary) to read the strip seed
-static bool read_header_strip_seed(const uint8_t* stream, size_t length, uint32_t* seed)
+// walks the 9 static models, the top-table size byte, and the 4-byte padding of the stream header, returning the
+// offset of the strip seed, or (size_t)-1 if the header is truncated
+static size_t header_after_models(const uint8_t* stream, size_t length)
 {
     size_t pos = 0;
 
     for (uint32_t i = 0; i < 9; ++i)
     {
-        if (pos + 2 > length) return false;
+        if (pos + 2 > length) return (size_t)-1;
         uint32_t num_symbols = stream[pos++] + 1;
         pos++; // k
-        if (pos + num_symbols > length) return false;
+        if (pos + num_symbols > length) return (size_t)-1;
         pos += num_symbols;
     }
 
-    if (pos + 1 > length) return false;
+    if (pos + 1 > length) return (size_t)-1;
     pos++; // top-table size
 
-    pos = (pos + 3) & ~(size_t)3; // padded to a 4-byte boundary
+    return (pos + 3) & ~(size_t)3; // padded to a 4-byte boundary
+}
+
+//-----------------------------------------------------------------------------------------------------------------------------
+// reads the strip seed from the stream header
+static bool read_header_strip_seed(const uint8_t* stream, size_t length, uint32_t* seed)
+{
+    size_t pos = header_after_models(stream, length);
+    if (pos == (size_t)-1) return false;
 
     if (pos + 4 > length) return false;
 
     *seed = (uint32_t)stream[pos] | ((uint32_t)stream[pos + 1] << 8) | ((uint32_t)stream[pos + 2] << 16) | ((uint32_t)stream[pos + 3] << 24);
+    return true;
+}
+
+//-----------------------------------------------------------------------------------------------------------------------------
+// reads the 8 bytes of per-strip color predictor flags from the stream header, they follow the strip seed
+// (bit s = 1 → strip s predicts its endpoint colors from the block above after its first scanline)
+static bool read_header_predictor(const uint8_t* stream, size_t length, uint64_t* predictor)
+{
+    size_t pos = header_after_models(stream, length);
+    if (pos == (size_t)-1) return false;
+
+    if (pos + 4 + 8 > length) return false;
+    pos += 4; // strip seed
+
+    *predictor = 0;
+    for (uint32_t j = 0; j < 8; ++j)
+        *predictor |= (uint64_t)stream[pos + j] << (j * 8);
     return true;
 }
 
@@ -481,6 +507,108 @@ TEST top_table_empty_floor(void)
 }
 
 
+//---------------------------------------------------------------------------------------------------------------
+// Test 11: per-strip color predictor. colors constant along the zigzag columns (varying with the array
+// index) make the row-above reference an exact match while the zigzag-previous pays a delta for every
+// block, so every strip must pick the row-above predictor (the all-ones flag word in the header). the
+// mirrored pattern, constant along the rows, must keep the zigzag-previous predictor (all zeros).
+// both must round-trip byte-exact
+TEST strip_predictor(void)
+{
+    const uint32_t width = 256;
+    const uint32_t height = 512;
+    const uint32_t width_blocks = width / 4;
+    const uint32_t height_blocks = height / 4;
+    const uint32_t num_blocks = width_blocks * height_blocks;
+
+    ASSERT(height_blocks == BC1_PACKED_NUM_STRIPS * 2); // two scanlines per strip, so the top predictor is reachable
+
+    bc1_block image[TEST_IMAGE_SIZE];
+
+    // colors vary with the array index, so they are constant along the zigzag columns: the row-above
+    // reference (same zigzag position) is an exact match for every block after the first scanline
+    for (uint32_t y = 0; y < height_blocks; ++y)
+    {
+        for (uint32_t p = 0; p < width_blocks; ++p)
+        {
+            image[y * width_blocks + p] = (bc1_block)
+            {
+                .color = { pack_565((uint8_t)(p & 0x1F), (uint8_t)((p << 1) & 0x3F), (uint8_t)(p & 0x1F)), 0x0000 },
+                .indices = 0
+            };
+        }
+    }
+
+    bc1_packed_context* ctx = bc1_packed_init(NULL);
+    ASSERT(ctx != NULL);
+
+    size_t compressed_buffer_size = bc1_packed_maxsize(width, height);
+    uint8_t* compressed_buffer = malloc(compressed_buffer_size);
+    ASSERT(compressed_buffer != NULL);
+
+    size_t stream_size = bc1_packed_compress(ctx, image, width, height, compressed_buffer, compressed_buffer_size);
+    ASSERT(stream_size != 0);
+
+    uint64_t predictor = 0;
+    ASSERT(read_header_predictor(compressed_buffer, stream_size, &predictor));
+    ASSERT_EQ(predictor, (uint64_t)-1); // every strip predicts from the block above
+
+    bc1_block* decompressed = malloc(num_blocks * sizeof(bc1_block));
+    ASSERT(decompressed != NULL);
+
+    for (uint32_t i = 0; i < BC1_PACKED_NUM_STRIPS; ++i)
+    {
+        ASSERT(bc1_packed_decompress(ctx, compressed_buffer, stream_size, width, height, decompressed, i));
+    }
+
+    for (uint32_t i = 0; i < num_blocks; ++i)
+    {
+        ASSERT_EQ(decompressed[i].color[0], image[i].color[0]);
+        ASSERT_EQ(decompressed[i].color[1], image[i].color[1]);
+        ASSERT_EQ(decompressed[i].indices, image[i].indices);
+    }
+
+    // the mirrored pattern is constant along the rows: the zigzag-previous (in-row neighbor) is an exact
+    // match for every block, so the row-above predictor must never be picked
+    for (uint32_t y = 0; y < height_blocks; ++y)
+    {
+        for (uint32_t p = 0; p < width_blocks; ++p)
+        {
+            image[y * width_blocks + p] = (bc1_block)
+            {
+                .color = { pack_565((uint8_t)(y & 0x1F), (uint8_t)((y << 1) & 0x3F), (uint8_t)(y & 0x1F)), 0x0000 },
+                .indices = 0
+            };
+        }
+    }
+
+    stream_size = bc1_packed_compress(ctx, image, width, height, compressed_buffer, compressed_buffer_size);
+    ASSERT(stream_size != 0);
+
+    ASSERT(read_header_predictor(compressed_buffer, stream_size, &predictor));
+    ASSERT_EQ(predictor, (uint64_t)0); // no strip uses the top predictor
+
+    for (uint32_t i = 0; i < BC1_PACKED_NUM_STRIPS; ++i)
+    {
+        ASSERT(bc1_packed_decompress(ctx, compressed_buffer, stream_size, width, height, decompressed, i));
+    }
+
+    for (uint32_t i = 0; i < num_blocks; ++i)
+    {
+        ASSERT_EQ(decompressed[i].color[0], image[i].color[0]);
+        ASSERT_EQ(decompressed[i].color[1], image[i].color[1]);
+        ASSERT_EQ(decompressed[i].indices, image[i].indices);
+    }
+
+    bc1_packed_terminate(ctx);
+
+    free(compressed_buffer);
+    free(decompressed);
+
+    PASS();
+}
+
+
 SUITE(suite_synthetic)
 {
     (void)flat;
@@ -492,6 +620,7 @@ SUITE(suite_synthetic)
     (void)stats_constant_image;
     (void)strip_seed_header;
     (void)top_table_empty_floor;
+    (void)strip_predictor;
 
     RUN_TEST(flat);
     RUN_TEST(checkerboard);
@@ -503,4 +632,5 @@ SUITE(suite_synthetic)
     RUN_TEST(strip_seed_header);
     RUN_TEST(variable_resolutions_random);
     RUN_TEST(top_table_empty_floor);
+    RUN_TEST(strip_predictor);
 }
