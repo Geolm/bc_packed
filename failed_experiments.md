@@ -30,6 +30,7 @@ Rice `k` and rank table per endpoint fits better. Kept.
 | 9 | Top-block color prediction (vertical predictor after the first scanline) | round-trips, `colors` +5.4% (zigzag-previous is the better predictor for 49/74) | 1.3933:1 (−1.19%) | reverted (format-compatible; kept as a speed lever, see open thread) |
 | 10 | Cascading masked top-table, VQ removed (exact ≥ n → 1-byte → 2-byte rounds, mode-resolved) | round-trips; n 2..8 byte-identical; difference +2.15% | 1.4025:1 (−0.54%) | reverted (1-entry floor + regression test kept — fixes the open bug) |
 | 11 | Per-strip color predictor: row-above (same zigzag position) vs zigzag-previous, 1 bit/strip in the header, decided by delta energy | round-trips; colors −2.72%; 58/74 improved, worst −0.05% | **1.4323:1** (+1.57%) | **kept — this is the new baseline** |
+| 12 | YCoCg-R color encoding (color-space / delta-space / 565-upscaled), measured offline (exp 5 style) | round-trips exact; loses on 71-74/74 images | 1.5298 / 1.5421 / 1.5449 vs 1.5784 baseline | not adopted — the current ΔG/2 decorrelation *is* YCoCg-R depth-matched for 565 |
 
 ---
 
@@ -480,6 +481,57 @@ zigzag-column reference is the one that carries the gain.
 seed, nothing else. Decoder: flagged strips decode row-parallel (no serial zigzag chain) — the exp 9
 GPU motivation, now paid for only on the strips that benefit. Regression test: `strip_predictor`
 (two synthetic patterns that force the all-ones and the all-zeros flag words, byte-exact round-trip).
+
+---
+
+## 12. YCoCg-R color encoding
+
+**Idea (yours):** encode the endpoint colors in reversible YCoCg-R —
+`Co = R−B; tmp = B + Co/2; Cg = G − tmp; Y = tmp + Cg/2` (inverse: `tmp = Y − Cg/2; B = tmp − Co/2;`
+`G = Cg + tmp; R = B + Co`) — and delta the YCoCg components against the reference block, since the
+transform "already" decorrelates green from red/blue, making the current explicit decorrelation
+(`ΔR − ΔG/2`, `ΔB − ΔG/2`) redundant.
+
+**Why the premise is wrong for 565:** YCoCg-R is the decorrelated basis for *equal-depth* channels.
+In 565, green has twice the precision of red/blue, so a pure luminance step is
+`(ΔR, ΔG, ΔB) = (x, 2x, x)`, and:
+- current scheme: `(ΔG, ΔR − ΔG/2, ΔB − ΔG/2) = (2x, 0, 0)` — luminance in **one** 6-bit component
+- YCoCg-R: `(Y, Co, Cg) = (1.5x, 0, x)` — luminance in **two** components: `Cg = ΔG − (ΔR+ΔB)/2 =
+  2x − x = x ≠ 0`, and `Y` carries 1.5x on top. The "green↔blue/red" correlation is only removed in
+  the 8-8-8 sense; on the 565 grid the 5-bit channels move at half green's rate, so `G − (R+B)/2` does
+  **not** collapse under a brightness change. The current ΔG/2 decorrelation is precisely YCoCg-R with
+  the one depth correction the 565 grid needs; standard YCoCg-R undoes it.
+
+**Method:** offline cost study (exp 5 style, no code change): real stb_image → stb_dxt(HIGHQUAL) →
+packed BC1 on the 74-image suite, real `le_static_model_init` models, exact Rice bit cost per symbol,
+4-byte strip alignment and the full header mirrored. A replica of the shipped scheme (v0) reproduced
+the real `bc1_packed_compress` stream **byte-exact on 74/74 images** (200k fuzz round-trips of both
+transforms, 0 decode mismatches, 0 out-of-alphabet symbols). Three variants measured, each with its
+best-case per-strip predictor flag:
+
+| variant | symbols | avg ratio | wins/74 | worst | colors payload |
+|---|---|---|---|---|---|
+| baseline (current) | (ΔG, ΔR−ΔG/2, ΔB−ΔG/2), 7-bit | **1.5784** / 1.5201 bw | — | — | 4182 KB |
+| ycocg_abs (the literal proposal) | (Y, Co, Cg) of the color, deltaed, 8/7/8-bit | 1.5298 / 1.4692 bw (−3.17%) | **0** | −7.95% (drygrass) | +12.0% |
+| ycocg_dlt | YCoCg of the delta, 8/7/8-bit | 1.5421 / 1.4806 bw (−2.39%) | 3 (≤ +0.40%) | −7.45% | +9.3% |
+| ycocg_565 (depth-correct: upscale R,B to the 6-bit grid first) | (Y, Co, Cg), 8/8/8-bit | 1.5449 / 1.4869 bw (−2.15%) | **0** | −4.84% | +7.8% |
+
+(baseline measured on the current code: 1.5784 avg / 1.5201 byte-weighted; the 1.4323 logged at the
+top of this file predates later code/suite changes — the A/B comparison is same-code, same-suite.)
+
+**Why it lost:** the luminance leak above. Two of the three YCoCg components carry the same luminance
+signal, and the independent 1-D static Rice models cannot exploit their correlation — luminance-
+dominant content (i.e. all of it) pays for it, worst on high-frequency grass (−8%). Even the
+depth-correct 565-upscaled form — which for a luminance step emits exactly the same `(2x, 0, 0)`
+structure as the current scheme — still loses on 74/74: for chroma it is a rotation of the same
+information to a *wider* integer scale (`Co = 2(ΔR−ΔB)` is 2× wider than the current chroma symbols,
+and the 8-bit symbols widen the rank tables). The 3 ycocg_dlt wins (Wood_03, wall3, rustywall3, all
+≤ +0.40%) are within the predictor-flag re-selection noise. Note also that adopting any variant is a
+stream format change (7→8-bit color symbols, 128→256 rank alphabets) requiring a GPU decoder update —
+a cost the loss already rules out.
+
+**Outcome:** not adopted. The current `(ΔG, ΔR − ΔG/2, ΔB − ΔG/2)` basis stands: it is YCoCg-R done
+for 565, and its equal-depth cousin loses by 2-3% on this suite. Do not re-litigate.
 
 ---
 
