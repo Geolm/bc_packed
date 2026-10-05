@@ -662,13 +662,14 @@ static inline bool save_static_model(const le_model* model, byte_stream* stream)
     // never reads it because the encoder never encoded with it.
     uint32_t num_symbols = (model->num_symbols > 0) ? model->num_symbols : 1;
 
-    size_t model_size = 2 + num_symbols;
+    size_t model_size = 3 + num_symbols;
 
     if (stream->pos + model_size > stream->length)
         return false;
 
     stream->buffer[stream->pos++] = (uint8_t)(num_symbols - 1); // minus 1 to store 256 symbols count on uint8_t
     stream->buffer[stream->pos++] = model->k;
+    stream->buffer[stream->pos++] = model->q_escape;
 
     for(uint32_t i=0; i<num_symbols; ++i)
         stream->buffer[stream->pos++] = model->alphabet[i];
@@ -680,11 +681,12 @@ static inline bool save_static_model(const le_model* model, byte_stream* stream)
 static inline bool load_static_model(le_model* model, byte_stream* stream)
 {
     // mirror of save_static_model
-    if (stream->pos + 2 > stream->length)
+    if (stream->pos + 3 > stream->length)
         return false;
 
     uint32_t num_symbols = stream->buffer[stream->pos++] + 1;
     uint8_t k = stream->buffer[stream->pos++];
+    uint8_t q_escape = stream->buffer[stream->pos++];
 
     if (k >= LE_Q_ESCAPE_SIZE)
         k = (uint8_t)(LE_Q_ESCAPE_SIZE - 1); 
@@ -692,7 +694,7 @@ static inline bool load_static_model(le_model* model, byte_stream* stream)
     if (stream->pos + num_symbols > stream->length)
         return false;
 
-    le_static_model_load(model, &stream->buffer[stream->pos], num_symbols, k);
+    le_static_model_load(model, &stream->buffer[stream->pos], num_symbols, k, q_escape);
     stream->pos += num_symbols;
 
     return true;

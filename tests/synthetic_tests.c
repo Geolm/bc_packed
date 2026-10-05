@@ -314,9 +314,10 @@ static size_t header_after_models(const uint8_t* stream, size_t length)
 
     for (uint32_t i = 0; i < 9; ++i)
     {
-        if (pos + 2 > length) return (size_t)-1;
+        if (pos + 3 > length) return (size_t)-1;
         uint32_t num_symbols = stream[pos++] + 1;
         pos++; // k
+        pos++; // q_escape
         if (pos + num_symbols > length) return (size_t)-1;
         pos += num_symbols;
     }

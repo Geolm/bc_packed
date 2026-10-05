@@ -329,29 +329,54 @@ static inline void le_static_model_init(le_model *model, const uint32_t* histogr
         model->index[sym] = (uint8_t)i;
     }
 
+    // search the best (k, q_escape) pair: with q_escape = Q, every rank with q = rank >> k >= Q is written
+    // as Q unary bits + 1 zero bit + 1 raw byte (Q + 9 bits), the others use normal rice (q + 1 + k bits)
     uint8_t best_k = 2;
+    uint8_t best_q_escape = q_escape_for_k[2];
     uint64_t min_total_bits = UINT64_MAX;
+
+    uint64_t q_count[LE_ALPHABET_SIZE]; // rank counts bucketed by q = rank >> k
 
     for (uint8_t candidate_k = 0; candidate_k < 8; ++candidate_k)
     {
-        uint64_t total_bits = 0;
-        uint32_t q_limit = q_escape_for_k[candidate_k];
+        uint32_t max_q = 0;
+        uint64_t suffix = 0; // count of the ranks with q >= current Q
 
+        memset(q_count, 0, sizeof(q_count));
         for (uint32_t index = 0; index < LE_ALPHABET_SIZE; ++index)
         {
             uint32_t count = freq_table[index].count;
             if (count == 0) continue;
 
             uint32_t q = index >> candidate_k;
-            uint32_t bits = (q >= q_limit) ? (q_limit + 1 + 8) : (q + 1 + candidate_k);
-
-            total_bits += (uint64_t)count * bits;
+            q_count[q] += count;
+            suffix += count;
+            if (q > max_q)
+                max_q = q;
         }
 
-        if (total_bits < min_total_bits)
+        // beyond the largest q that occurs the escape never fires, so Q = max_q + 1 costs the same as any
+        // larger Q. the decoder refills its 64-bit reservoir only below 32 bits, so every read must stay
+        // under 32 bits: Q + 1 for the escape flag, q + 1 + k for the rice value
+        uint32_t max_q_escape = max_q + 1;
+        if (max_q_escape > 31)
+            max_q_escape = 31;
+        if (max_q_escape > 32 - candidate_k)
+            max_q_escape = 32 - candidate_k;
+
+        uint64_t prefix = 0; // bits of the ranks with q < current Q, written with normal rice
+        for (uint32_t q = 1; q <= max_q_escape; ++q)
         {
-            min_total_bits = total_bits;
-            best_k = candidate_k;
+            suffix -= q_count[q - 1];
+            prefix += q_count[q - 1] * (q + candidate_k); // a rank with q' = q - 1 costs q' + 1 + k = q + k bits
+
+            uint64_t total_bits = suffix * (q + 9) + prefix;
+            if (total_bits < min_total_bits)
+            {
+                min_total_bits = total_bits;
+                best_k = candidate_k;
+                best_q_escape = (uint8_t)q;
+            }
         }
     }
 
@@ -362,6 +387,7 @@ static inline void le_static_model_init(le_model *model, const uint32_t* histogr
     
     model->num_symbols = (uint16_t)i;
     model->k = best_k;
+    model->q_escape = best_q_escape;
     model->k_trend = 0;
     model->is_static = true;
 }
@@ -407,7 +433,7 @@ static inline uint8_t rice_decode(le_stream *s, uint8_t k, uint8_t q_escape)
         le_refill(s);
 
     uint32_t q = le_ctz64(~s->bit_reservoir | (1ULL << 63));
-    uint32_t q_limit = q_escape_for_k[k];
+    uint32_t q_limit = q_escape;
 
     if (q >= q_limit)
     {
@@ -500,7 +526,6 @@ static inline void le_encode_symbol(le_stream *s, le_model *model, uint8_t value
 static inline uint8_t le_decode_symbol(le_stream *restrict s, le_model *restrict model) 
 {
     uint8_t index;
-    uint8_t value = model->alphabet[index];
 
     if (model->is_static)
     {
@@ -509,6 +534,13 @@ static inline uint8_t le_decode_symbol(le_stream *restrict s, le_model *restrict
     else
     {
         index = rice_decode(s, model->k, q_escape_for_k[model->k]);
+    }
+
+    // the symbol must be read before the promotion, which shifts the alphabet entries
+    uint8_t value = model->alphabet[index];
+
+    if (!model->is_static)
+    {
         le_model_promote(model, index);
         le_model_update_k(model, (uint8_t)index);
     }
