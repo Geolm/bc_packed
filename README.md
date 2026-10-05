@@ -27,30 +27,36 @@ Multiple independent Rice-Golomb models are used for the different data: endpoin
 
 ### Rice-Golomb model
 
-Each model contains a symbol count, a Rice parameter, and a rank table:
+Each model contains a symbol count, a Rice parameter, a raw-byte escape threshold, and a rank table:
 
 | Offset |  Size (bytes) | Description                |
 | -----: | ------------: | -------------------------- |
 |      0 |             1 | Number of symbols − 1      |
 |      1 |             1 | Rice `k` value             |
-|      2 | `num_symbols` | Sorted rank table          |
+|      2 |             1 | Raw-byte escape `q_escape` |
+|      3 | `num_symbols` | Sorted rank table          |
 
 The rank table contains only symbols that occur in the stream. Symbols are sorted by frequency, with the most frequently used symbols receiving the lowest indices (ties are broken by the lower symbol first).
 
 The maximum model size is therefore:
 
 ```text
-1 + 1 + 256 = 258 bytes
+1 + 1 + 1 + 256 = 259 bytes
 ```
 
 In practice, most models are smaller because symbols with a zero histogram count are discarded. No padding is written between models.
 
-The rank table and the best `k` are generated during the first compression pass from the symbol histogram.
+Each rank is written as `q = rank >> k` unary bits, a zero, then `k` remainder bits; a rank whose `q` reaches `q_escape` is written
+as `q_escape` unary bits, a zero, then the full 8-bit rank as a raw byte. The escape caps the cost of the heavy tail of the
+distribution, and the compressor searches `(k, q_escape)` jointly against the histogram to minimize the model's total bit count.
+When the histogram has no heavy tail, the chosen `q_escape` sits beyond the largest rank that occurs and the escape never fires.
+
+The rank table, the best `k`, and the best `q_escape` are generated during the first compression pass from the symbol histogram.
 
 ### Two passes
 
 As we use static models, we need two passes to compress the texture :
-* first pass builds the top table, then collects histograms for all models, sorts the rank tables and chooses the best `k`
+* first pass builds the top table, then collects histograms for all models, sorts the rank tables and chooses the best `k` and `q_escape`
 * second pass encodes the texture in the stream
 
 ### Multiple streams
@@ -146,7 +152,7 @@ The output buffer must be at least `bc1_packed_maxsize(width, height)` bytes. Th
 
 ```text
 * 9 static models, in order: endpoint 0 red, endpoint 0 green, endpoint 0 blue, endpoint 1 red, endpoint 1 green, endpoint 1 blue, top-table reference, difference mask, table difference.
-  Each is 2 + num_symbols bytes, no padding (max 258 bytes).
+  Each is 3 + num_symbols bytes, no padding (max 259 bytes).
 * Top table size: one uint8_t (number of entries − 1), padded to a 4-byte boundary.
 * Strip seed: one uint32_t (little-endian) — the two endpoint colors of the "previous block" used to predict the first block of each strip, averaged over the 64 strips at compression time. Low 16 bits = color[0], high 16 bits = color[1].
 * Strip predictor flags: 8 bytes (little-endian uint64_t) — one bit per strip: 1 → endpoint colors of that strip are predicted from the row above (same zigzag position) after the first scanline, 0 → zigzag-previous block. See Per-strip predictor.
@@ -170,7 +176,7 @@ All symbols are encoded with Rice-Golomb using one of the nine static models.
 
 ## Status
 
-The stream matches the format documented above, and both `bc1_packed_compress` and `bc1_packed_decompress` are implemented. All nine models are image-wide: one Rice `k` per model, no per-strip model state (a per-strip `k` for the mask model was prototyped and measured +0.03% — not adopted, the gain did not justify the added stream bytes and decoder state). The only per-strip state is the color predictor flag (8 bytes in the header, see Per-strip predictor): it selects between two predictors, it does not change any model.
+The stream matches the format documented above, and both `bc1_packed_compress` and `bc1_packed_decompress` are implemented. All nine models are image-wide: one Rice `k` and one `q_escape` per model, no per-strip model state (a per-strip `k` for the mask model was prototyped and measured +0.03% — not adopted, the gain did not justify the added stream bytes and decoder state). The only per-strip state is the color predictor flag (8 bytes in the header, see Per-strip predictor): it selects between two predictors, it does not change any model.
 
 * CPU decompression (`bc1_packed_decompress`) decodes one strip at a time; the unit tests decompress every strip and compare byte-exact against the input.
 * Unit tests (`tests/`) cover synthetic textures, a real-image roundtrip suite over `images/` (loaded with `stb_image.h`, converted with `stb_dxt.h` from `third_party/`, which the library itself does not depend on), and a multithreaded decompression benchmark.
