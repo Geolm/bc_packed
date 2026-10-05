@@ -609,6 +609,71 @@ TEST strip_predictor(void)
 }
 
 
+//---------------------------------------------------------------------------------------------------------------
+// Test 12: a rare exact pattern (2 of 256 blocks) must survive the VQ refinement. the rare pattern
+// differs from the common one by 4 bits, so every block matches a table entry exactly (score 0) and
+// the refinement never moves a centroid: only the final count filter decides. in the old jittered
+// sampled final round the rare pattern's blocks can go unvisited and its entry gets dropped; the
+// full-assignment final rounds (exp 15) visit every block, so the table must keep both entries
+TEST top_table_full_refine(void)
+{
+    const uint32_t width = 16;
+    const uint32_t height = 256;
+    const uint32_t num_blocks = TINY_IMAGE_BLOCKS;
+
+    const uint32_t common = 0x12345678u;
+    const uint32_t rare = common ^ 0x0F0F0F0F; // 4 differing bits
+
+    bc1_block image[TINY_IMAGE_BLOCKS];
+    for (uint32_t i = 0; i < num_blocks; ++i)
+    {
+        image[i] = (bc1_block)
+        {
+            .color = {red, cyan},
+            .indices = (i < 2) ? rare : common
+        };
+    }
+
+    bc1_packed_context* ctx = bc1_packed_init(NULL);
+    ASSERT(ctx != NULL);
+
+    size_t compressed_buffer_size = bc1_packed_maxsize(width, height);
+    uint8_t* compressed_buffer = malloc(compressed_buffer_size);
+    ASSERT(compressed_buffer != NULL);
+
+    size_t stream_size = bc1_packed_compress(ctx, image, width, height, compressed_buffer, compressed_buffer_size);
+    ASSERT(stream_size != 0);
+
+    bc1_packed_stats stats;
+    bc1_packed_get_stats(ctx, &stats);
+
+    // both exact patterns are used by the image and the full-assignment final rounds keep the rare one
+    ASSERT_EQ(stats.top_table_size, 2);
+
+    bc1_block* decompressed = malloc(num_blocks * sizeof(bc1_block));
+    ASSERT(decompressed != NULL);
+
+    for (uint32_t i = 0; i < BC1_PACKED_NUM_STRIPS; ++i)
+    {
+        ASSERT(bc1_packed_decompress(ctx, compressed_buffer, stream_size, width, height, decompressed, i));
+    }
+
+    for (uint32_t i = 0; i < num_blocks; ++i)
+    {
+        ASSERT_EQ(decompressed[i].color[0], image[i].color[0]);
+        ASSERT_EQ(decompressed[i].color[1], image[i].color[1]);
+        ASSERT_EQ(decompressed[i].indices, image[i].indices);
+    }
+
+    bc1_packed_terminate(ctx);
+
+    free(compressed_buffer);
+    free(decompressed);
+
+    PASS();
+}
+
+
 SUITE(suite_synthetic)
 {
     (void)flat;
@@ -621,6 +686,7 @@ SUITE(suite_synthetic)
     (void)strip_seed_header;
     (void)top_table_empty_floor;
     (void)strip_predictor;
+    (void)top_table_full_refine;
 
     RUN_TEST(flat);
     RUN_TEST(checkerboard);
@@ -633,4 +699,5 @@ SUITE(suite_synthetic)
     RUN_TEST(variable_resolutions_random);
     RUN_TEST(top_table_empty_floor);
     RUN_TEST(strip_predictor);
+    RUN_TEST(top_table_full_refine);
 }

@@ -5,9 +5,10 @@ baseline. Kept here so we don't re-litigate them.
 
 **Baseline (the bar to beat):** per-endpoint color deltas (6 `le_model`s: one set of red/green/blue
 per endpoint), per-strip color predictor selection (exp 11, 8 header bytes), raw top-table reference
-(1 `le_model`), index residual mask + per-byte difference (2 `le_model`s). Measured on the
-`suite_image` set (74 images): **1.43:1** average compression ratio (1.4323, byte-weighted 1.3822),
-13/13 tests pass. (Before exp 11 the baseline was 1.4102 / 1.3688.)
+(1 `le_model`), index residual mask + per-byte difference (2 `le_model`s), top-table VQ refinement
+with two full-assignment Lloyd rounds (exp 15). Measured on the `suite_image` set (74 images):
+**1.44:1** average compression ratio (1.4363, byte-weighted 1.3840), 14/14 tests pass. (Before
+exp 15 the baseline was 1.4341 / 1.3830 on this suite; before exp 11 it was 1.4102 / 1.3688.)
 
 Splitting the 3 shared color models into one set per endpoint (6 models, +3 model headers in the
 stream) beat the 3-model baseline: colors payload −0.41%, total stream −0.105%, average ratio
@@ -32,6 +33,10 @@ Rice `k` and rank table per endpoint fits better. Kept.
 | 11 | Per-strip color predictor: row-above (same zigzag position) vs zigzag-previous, 1 bit/strip in the header, decided by delta energy | round-trips; colors −2.72%; 58/74 improved, worst −0.05% | **1.4323:1** (+1.57%) | **kept — this is the new baseline** |
 | 12 | YCoCg-R color encoding (color-space / delta-space / 565-upscaled), measured offline (exp 5 style) | round-trips exact; loses on 71-74/74 images | 1.5298 / 1.5421 / 1.5449 vs 1.5784 baseline | not adopted — the current ΔG/2 decorrelation *is* YCoCg-R depth-matched for 565 |
 | 13 | Spatially-smooth VQ codebook + zigzag reference delta (the open-thread "better codebook") | offline study; reference +0.33 bits/block, 85.7% of index transitions are genuinely-different centroids | 1.43 → 1.42 (−0.7%), 73/74 images regress | not adopted — the index surface is inherently wide; lever closed |
+| 14 | Sub-byte index-residual structure (nibble split / per-texel mask+values / no-mask 16×2-bit / nibble mask) | offline study; every variant is **more** expensive than the shipped byte mask + per-byte model | n/a (index residual +2.3…+30%, 0/74 win) | not adopted — the byte residual is at its floor; lever closed |
+| 15 | Two full-assignment Lloyd rounds appended to the `vq_top_table` refinement (round-count saturates at 2; pure-full is a +0.58% loss, so the 4 adaptive rounds are kept) | round-trips; difference −0.68%, reference +0.70%; 55/74 improved, worst −0.33% | **1.4363:1** (+0.15%) | **kept — this is the new baseline** |
+| 16 | 512-entry top table (9-bit raw-Rice reference, format v2) | offline study; difference −6.86% but reference + mask + doubled header net out to +1.41% on the index payload | n/a (est. ≈+0.9% stream, 2/74 win) | not adopted — more centroids buy nothing; lever closed |
+| 17 | Per-row color predictor (1 bit/row, the open-thread lead of exp 9/11) | offline study; same color symbols as per-strip, only the flag word differs — a loss on 74/74 | n/a (+0.16…+0.70%, 0/74 win) | not adopted — per-strip (exp 11) is already optimal; lead closed |
 
 ---
 
@@ -614,18 +619,182 @@ This resolves the first lead of the open thread below.
 
 ---
 
+## 14. Sub-byte index-residual structure
+
+**Idea:** `difference` is the whale (~40% of the payload) and currently pays **one full byte per
+differing byte**, but the differing bits are sparse (1.90 differing bits per set byte on the
+suite): maybe sub-byte structures price cheaper. Four variants, all still 8-bit-model-friendly
+(format-v2 candidates of the exp 16 class, each re-fitting its own best `k` and rank tables):
+- **v1 nibble split:** each differing byte as low/high nibbles (two 16-symbol models).
+- **v2 per-texel:** a 256-symbol mask of *which texels'* 2-bit indices differ, + the 4-symbol
+  values of the differing texels.
+- **v3 no mask:** 16 models with one 4-symbol value per texel (all 16 texels, no mask at all).
+- **v4 nibble mask:** a 4-symbol mask of which nibbles of each byte differ + 16-symbol nibble values.
+
+**Method:** offline cost study (exp 5/12 style, no code change): the shipped pipeline (stb → DXT
+HIGHQUAL → `build_top_table` → `nearest32`), the residual component repriced per variant.
+
+**Result:** 74-image suite, v0 = the shipped 4-bit byte mask + one 8-bit model per differing byte:
+
+| variant | index-residual payload | Δ |
+|---|---|---|
+| v0 shipped | 6405.1 KB | — |
+| v1 nibble split | 6553.7 KB | **+2.32%** |
+| v2 texel mask + values | 6793.4 KB | **+6.06%** |
+| v3 16 × 2-bit texel values, no mask | 8331.7 KB | **+29.9%** |
+| v4 nibble mask + values | 6591.3 KB | **+2.91%** |
+
+**0/74 images win on any variant.**
+
+**Why it lost:** the shipped byte residual is already essentially at its entropy floor (the
+entropy-floor study measured the difference-byte model at 103% of its entropy), and every split
+pays for itself: a sub-byte symbol that *is* set is less concentrated near zero than the whole
+byte (a sparse byte like `0x0F` prices ~1+q at k=4 in one symbol, but its low nibble `0xF` is a
+mid-range value of a flatter 16-symbol distribution, and the split adds a second symbol plus a
+second rank table). Per-texel is the same argument with a 256-symbol near-uniform mask on top.
+The byte mask + per-byte model *is* the structure; below it there is nothing left.
+
+**Kept:** nothing. The 16-symbol mask + 8-bit byte model stays.
+
+---
+
+## 15. Full-assignment Lloyd rounds in the VQ refinement (the keep)
+
+**Idea (measured follow-up of the exp 13 closed "smarter centroids" lead):** the shipped
+`vq_top_table` runs 4 Lloyd rounds of which only the first is a full assignment; rounds 2–4 are
+jittered-sampled (steps 5/11/17 with the error-feedback bucket). A majority vote taken over 1/step
+of the blocks is a *sampled* majority: centroids of moderately populated clusters stop moving
+before they reach the Hamming optimum of the **full** population. Append **two full-assignment
+Lloyd rounds** (step 1, all blocks) after the four adaptive rounds — the same `vq_refine_round`
+body, same bitwise-majority update, same final `count > 1` filter — so the centroids converge on
+every block. No format, decoder, or model change; the `vq_refine_round` helper is the only new
+abstraction.
+
+**Method:** offline cost study on the 74-image suite first (exp 5/12 style: byte-exact pipeline
+replica, reference + mask + difference repriced under the shipped 8-bit models), round-count and
+ordering sweep, then implemented and re-measured on the real stream.
+
+Study (index payload, 74-image suite):
+
+| variant | byte-weighted | mean per image | profile |
+|---|---|---|---|
+| shipped (1 full + 3 sampled rounds) | — | — | — |
+| vq + 2 full (**the ship**) | **−0.16%** | −0.31% | 71 improved, 3 flat, 0 regressed; best Wood_04 −2.21% |
+| vq + 3 full | −0.17% | −0.04% | — |
+| vq + 6 full | −0.18% | −0.30% | the knee is at 2, more rounds buy ≈ nothing |
+| 6 full, then vq (full rounds first) | −0.03% | 0.00% | order matters: the jitter must come first |
+| pure full (4/6/8 rounds, jitter removed) | +0.58% | +0.87% | the jittered sampling *explores* a better local optimum — keep it |
+
+**Result (implemented, 74-image suite, 14/14 tests pass, deterministic streams):**
+- average ratio **1.4341 → 1.4363 (+0.15%)**, byte-weighted 1.3830 → 1.3840 (+0.08%);
+  **55 improved, 6 flat, 13 regressed** (best Wood_04 +2.17%, worst Wood_13 −0.33%).
+- components: difference 6590730 → 6546166 B (**−0.68%**), reference 2755657 → 2774947 B
+  (+0.70%), mask 1181235 → 1185116 B (+0.33%), colors untouched (up to −13% difference on the
+  wood-plank scans — the study's per-image profile, reproduced on the real stream).
+- top table: a full final round assigns every block, so (nearly) every centroid holds ≥ 2 blocks
+  and the `count > 1` filter stops pruning: total table size 17170 → 18940 entries across the
+  suite (+1770 B of stream header — the whole story of the 13 regressions, all in the 512² class
+  where that header is a bigger share of a smaller stream, and where the reference `k` cliff of
+  5→6 on some images compounds it).
+- decompression throughput unchanged (the decode path is untouched); the compressor pays two extra
+  full `nearest32` passes, which the README's "compression can be slower" clause covers.
+- regression test `top_table_full_refine`: a rare exact pattern (2 of 256 blocks, 4 bits off the
+  common one) must survive — the old sampled final round never visits its blocks and dropped the
+  entry (verified: old code returns a 1-entry table on that image), the full rounds keep it (2).
+
+**Why it wins:** the sampled majority vote is a biased estimator — over 1/17 of the population a
+bit-flip vote has enough noise to leave centroids short of the population's Hamming optimum, and
+the `count > 1` filter then pruned exactly those weakly-sampled centroids. The full rounds finish
+the job: the difference component drops suite-wide (the study's −0.16% on the index payload, of
+which difference is the whole swing), and the centroid refinement is what the exp 7/10 ablations
+already proved *closer* than the exact patterns to every non-exact block.
+
+**Why the study said 0 regressions and the real stream has 13:** the study prices only the three
+index components; the real stream also carries the top-table header, which grows as the filter
+stops pruning, plus the standing reference k-cliff cost of exp 7/8b (moving centroids re-shapes
+the reference distribution; on a few 512² images the fitted `k` flips 5→6 and costs ~1 bit on a
+near-uniform 8-bit symbol, more than the difference gain there). The study is a *predictor*;
+the real stream is the verdict (cf. exp 13's caution, and the same lesson as exp 8b).
+
+**Kept:** this is the **new baseline** (1.4363 / 1.3840). Stream format, decoder, and
+`bc1_packed_stats` are unchanged.
+
+---
+
+## 16. 512-entry top table (9-bit reference, format v2)
+
+**Idea:** double the table to 512 entries (top-512 exact patterns + the exp 15 full-assignment
+Lloyd recipe) so more, closer centroids shrink the residual; the reference becomes a 9-bit
+raw-Rice symbol (`LE_ALPHABET_SIZE = 256` caps the rank models, so a 512-symbol reference must
+leave the rank coding — exp 5's constraint; a format-v2 candidate).
+
+**Method:** offline study on a copy of `bc1_packed.c` with `TOP_TABLE_SIZE = 512` (all internals
+scale; `vq_top_table`/`nearest32` byte-identical to the repo's, verified by diff), 74-image
+suite, reference repriced as 9-bit raw Rice with its own best `k`, everything else shipped.
+
+**Result:** suite totals on the index payload: **difference −6.86%** (the extra centroids are
+closer, ≈ −4.3% of the index payload) but reference + mask + the doubled table header net to
+**+1.41%** (10256.4 → 10400.5 KB, ≈ +0.9% stream). **2/74 images win** (Wood_03 −3.20%,
+Wood_04 −4.48% — exactly the images exp 15 improved most), worst +3.43% (woodplanks2).
+
+**Why it lost:** the same mechanism exp 7's stage 2 and exp 10 measured, scaled: the extra 256
+slots are filled with *rare* patterns (counts below the 256th most frequent), so the reference
+distribution flattens across 512 values — a near-uniform 512-symbol raw-Rice symbol costs ~1 bit
+more than the 256-symbol one (cf. exp 5) — and the table header doubles on a per-image basis that
+hurts the 512² class most. The −6.86% difference gain is outweighed roughly 2:1. Combined with
+exp 7/10/13, the codebook-size frontier is closed: *more* centroids trade a small residual gain
+for a flatter reference + a bigger header, *smarter* centroids are already Hamming-optimal (exp
+13) and the exp 15 full rounds already take them. The only structural lever left is contextual
+(joint) coding, i.e. format v2 — see the open thread.
+
+**Kept:** nothing. The 256-entry table stays.
+
+---
+
+## 17. Per-row color predictor (the open-thread lead)
+
+**Idea (the second open-thread lead, the per-row refinement of exp 9/11):** subdivide the
+per-strip color-predictor choice of exp 11 per scanline: one flag bit per row (`64 × strip_width`
+bits: 16–32 B on the suite, vs the 8-byte per-strip word), decided by the same
+`color_delta_energy` rule applied per row, so the static models fit the emitted distribution
+exactly (no k cliff, the exp 7/8b standing lesson).
+
+**Method:** offline cost study (exp 12 style, no code change): the 6 color models fitted and
+repriced under the shipped per-strip flags and under per-row flags, 74-image suite, including the
+flag-header and rank-table bytes (the study charges one byte per row flag, the worst case — packed
+1-bit flags would cost 8× less).
+
+**Result:** the per-row re-decision produces the **same color symbols** as per-strip on every
+image — the six models' rank-table headers are byte-identical under both flag schemes (the set of
+emitted symbols does not change) and the colors payload matches to 0.1 KB on every image: the
+strip-level energy rule and the row-level one agree on essentially every row, because the strip
+decision averages 4–16 rows of the same texture and row-level noise does not flip the aggregate
+winner. The only real difference is the flag word. Per-image delta (payload + flags + rank
+headers): **+0.16% (grass) to +0.70% (kodim09) — 0/74 win**, the worst exactly where the flag
+word is biggest relative to the stream. Even at packed 1-bit flags the payload gain is zero, so
+the flags can only cost.
+
+**Kept:** nothing. The per-strip predictor of exp 11 stays, and it is now measured **optimal**
+at its own grain: the decision is invariant to subdividing the strip. Do not re-litigate.
+
+---
+
 ## Open thread (not a failed experiment, just a lead)
 
-The better-VQ-codebook lead is **resolved by exp. 13 and closed**: the reference surface is 85.7%
-genuinely-different-centroid transitions, so neither a spatially-smooth codebook order + delta nor
-smarter centroids can move it, and the format-v2 per-region table is gated behind the same wall. Do
-not re-litigate.
+The better-VQ-codebook lead is **resolved and closed**: exp. 13 measured the spatially-smooth
+order + delta dead (85.7% genuinely-different-centroid transitions) and exp. 15 took the only
+real lever in that family (the full-assignment rounds, kept). Do not re-litigate.
 
-A second lead from exp 9: a **per-row color predictor**. For each scanline, emit one flag bit and
-predict from whichever of row-above / zigzag-previous was cheaper for that row (decided in the
-histogram pass by delta energy, so the static models fit the emitted distribution exactly). The
-flag costs 1 bit/row (≈32 B for a 1024² image) and could subdivide the per-strip choice of exp 11
-(a strip is only height/64 rows: 4 rows for a 1024² texture, so per-row can split a strip exp 11
-assigned to a single predictor). Caveat: a row flagged zigzag is a serial chain again, so the GPU
-row-parallel win only applies to the rows flagged row-above. (Exp 11 implemented the per-*strip*
-coarsening of this lead and kept it.)
+The per-row color-predictor lead is **resolved by exp. 17 and closed**: per-row measures zero
+payload gain over per-strip (exp. 11) plus a flag-word cost, 0/74 win. Do not re-litigate.
+
+One lead remains, and it is the only one that can move the remaining headroom: **contextual /
+joint coding (format v2)**. The entropy-floor study (offline, 74-image suite) prices the shipped
+coded payload against per-component entropy: **colors 117% of its floor, reference 103%, mask
+105%, difference bytes 103% — ≈6.7% of total headroom, almost all of it in the *joint*
+correlation between the six per-block color symbols**, which the independent static Rice models
+structurally cannot touch (cf. exp 12: any gain there requires a format change — contextual or
+joint models — plus the GPU decoder rework that note flagged). Gated on explicit approval; the
+smallest credible entry is a context on the six color symbols only (no stream-framing change
+beyond the model headers), with the exp 12 caution that independent *rotations* of the same
+information lose: a context model must be strictly more expressive, not a different basis.

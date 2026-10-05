@@ -105,8 +105,8 @@ BC1 contains a 32-bit index field for each block.
 
 * The compressor first scans the entire texture and builds a histogram of every unique 32-bit index pattern found.
 * It selects the Top 256 most frequently occurring index patterns to form the top_table.
-* The top table is refined using vector quantization. This algorithm implements Stochastic Bit-Level K-Means Clustering to optimize a BC1 VQ table. It uses Adaptive Jittered Sampling with error-feedback to efficiently assign image blocks to centroids based on Hamming Distance. Centroids are refined via Bitwise Majority Voting, flipping bits that differ in more than 50% of assigned blocks to mathematically minimize total bit-error across iterations.
-* Clusters that end up empty are dropped, so the final table may contain fewer than 256 entries.
+* The top table is refined using vector quantization. This algorithm implements Stochastic Bit-Level K-Means Clustering to optimize a BC1 VQ table. It uses Adaptive Jittered Sampling with error-feedback to efficiently assign image blocks to centroids based on Hamming Distance. Centroids are refined via Bitwise Majority Voting, flipping bits that differ in more than 50% of assigned blocks to mathematically minimize total bit-error across iterations; the first round and the two final rounds are full assignments over every block, the jittered middle rounds exploring a better local optimum and the full rounds converging the centroids on the whole image (see `failed_experiments.md`, exp. 15).
+* Clusters holding at most one block in the final round are dropped, so the final table may contain fewer than 256 entries.
 * An empty table (possible on tiny inputs where every cluster is dropped) is replaced by a single entry, the most frequent exact index pattern: the stream stores the table size as `entries − 1` in one byte, so zero entries would read back as 256 and corrupt the format.
 
 #### Block indices

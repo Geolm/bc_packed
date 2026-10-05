@@ -81,6 +81,12 @@ typedef struct byte_stream
     size_t pos;
 } byte_stream;
 
+typedef struct vq_cluster
+{
+    uint32_t bit_diff_count[32];
+    uint32_t count;
+} vq_cluster;
+
 
 //-----------------------------------------------------------------------------------------------------------------------------
 // Private functions
@@ -276,81 +282,88 @@ uint32_t nearest32(const uint32_t* table, uint32_t table_size, uint32_t bitfield
 }
 
 //----------------------------------------------------------------------------------------------------------------------------
+// One Lloyd refinement round of the top table: assigns every sampled block to its nearest centroid,
+// accumulates the XOR difference bit by bit per centroid, and moves each centroid to the bitwise
+// majority of its assigned blocks.
+//
+// [sample_step] of 1 assigns every block (a full round), a larger step samples one block in
+// [sample_step] to keep the round cheap, and [start_offset] de-aliases consecutive rounds.
+// The bucket feedback drops the skip while the accumulated popcount error is high, so a round
+// adapts between the two: with [sample_step] 1 both branches advance by one block.
+static void vq_refine_round(const void* input, uint32_t num_blocks, uint32_t* centroids, uint32_t num_centroids,
+                            vq_cluster* clusters, uint32_t sample_step, uint32_t start_offset)
+{
+    for(uint32_t i=0; i<num_centroids; ++i)
+    {
+        for(uint32_t j=0; j<32; ++j)
+            clusters[i].bit_diff_count[j] = 0;
+
+        clusters[i].count = 0;
+    }
+
+    uint32_t bucket = 0;
+    const uint32_t threshold = 16;
+
+    // find the best cluster for each sampled block, jittering the first block
+    for(uint32_t block_index=start_offset; block_index<num_blocks;)
+    {
+        const bc1_block* b = (const bc1_block*) input + block_index;
+
+        uint32_t result = nearest32(centroids, num_centroids, b->indices);
+        uint32_t score = (result >> 16);
+        uint32_t best_entry = result & 0xffff;
+        uint32_t diff = b->indices ^ centroids[best_entry];
+
+        for(uint32_t i=0; i<32; ++i)
+            clusters[best_entry].bit_diff_count[i] += (diff >> i) & 1;
+
+        clusters[best_entry].count++;
+        bucket += score;
+
+        if (bucket >= threshold) 
+        {
+            // if error is high, we only move 1 block
+            block_index++;
+            bucket -= threshold; 
+        } else 
+        {
+            // normal skip
+            block_index += sample_step;
+        }
+    }
+
+    // move centroid to the bitwise majority of its assigned blocks
+    for(uint32_t i=0; i<num_centroids; ++i)
+    {
+        if (clusters[i].count>0)
+        {
+            for(uint32_t bit=0; bit<32; ++bit)
+                if (clusters[i].bit_diff_count[bit] > (clusters[i].count/2))
+                    centroids[i] ^= (1u << bit);
+
+        }
+    }
+}
+
+//----------------------------------------------------------------------------------------------------------------------------
 void vq_top_table(const void* input, uint32_t num_blocks, uint32_t* output, uint32_t* num_entries)
 {
     // static array of odd steps to avoid aliasing and branches
-    // first iteration is always 1 to ensure 100% initial coverage.
-    static const uint32_t steps[4] = { 1, 5, 11, 17 };
+    // first iteration is always 1 to ensure 100% initial coverage, and the two final full-assignment
+    // rounds (step 1) converge the centroids on every block: the jittered sampling of the middle
+    // rounds explores a better local optimum, the full rounds settle it (exp 15 in failed_experiments.md)
+    static const uint32_t steps[6] = { 1, 5, 11, 17, 1, 1 };
 
     uint32_t centroids[TOP_TABLE_SIZE];
-    struct 
-    {
-        uint32_t bit_diff_count[32];
-        uint32_t count;
-    } clusters[TOP_TABLE_SIZE];
+    vq_cluster clusters[TOP_TABLE_SIZE];
 
     // use the top table entries as candidate for the cluster
     for(uint32_t i=0; i<*num_entries; ++i)
         centroids[i] = output[i];
 
-    // multiple iteration to stabilize cluster
-    for(uint32_t iteration=0; iteration<4; ++iteration)
-    {
-        // clear cluster counters
-        for(uint32_t i=0; i<*num_entries; ++i)
-        {
-            for(uint32_t j=0; j<32; ++j)
-                clusters[i].bit_diff_count[j] = 0;
-
-            clusters[i].count = 0;
-        }
-
-        const uint32_t sample_step = steps[iteration];
-
-        uint32_t bucket = 0;
-        const uint32_t threshold = 16;
-
-        // find the best cluster for each block, jittering the first block
-        for(uint32_t block_index=(iteration % sample_step); block_index<num_blocks;)
-        {
-            const bc1_block* b = (const bc1_block*) input + block_index;
-
-            uint32_t result = nearest32(centroids, *num_entries, b->indices);
-            uint32_t score = (result >> 16);
-            uint32_t best_entry = result & 0xffff;
-            uint32_t diff = b->indices ^ centroids[best_entry];
-
-            for(uint32_t i=0; i<32; ++i)
-                clusters[best_entry].bit_diff_count[i] += (diff >> i) & 1;
-
-            clusters[best_entry].count++;
-            bucket += score;
-
-            if (bucket >= threshold) 
-            {
-                // if error is high, we only move 1 block
-                block_index++;
-                bucket -= threshold; 
-            } else 
-            {
-                // normal skip
-                block_index += sample_step;
-            }
-        }
-
-        // move centroid
-        for(uint32_t i=0; i<*num_entries; ++i)
-        {
-            if (clusters[i].count>0)
-            {
-                for(uint32_t bit=0; bit<32; ++bit)
-                    if (clusters[i].bit_diff_count[bit] > (clusters[i].count/2))
-                        centroids[i] ^= (1u << bit);
-
-            }
-            
-        }
-    }
+    // multiple iterations to stabilize the clusters
+    for(uint32_t iteration=0; iteration<6; ++iteration)
+        vq_refine_round(input, num_blocks, centroids, *num_entries, clusters, steps[iteration], iteration % steps[iteration]);
 
     uint32_t num_clusters = 0;
 
