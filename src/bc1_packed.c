@@ -1,7 +1,7 @@
 #include "bc1_packed.h"
-#include "../third_party/lite_encoding.h"
 #include <stdlib.h>
 #include <assert.h>
+#include <string.h>
 
 
 #if defined(__aarch64__) || defined(_M_ARM64) || defined(__ARM_NEON)
@@ -22,6 +22,375 @@
     #define popcount64(x) __builtin_popcountll(x)
     #define popcount(x) __builtin_popcount(x)
 #endif
+
+
+//-----------------------------------------------------------------------------------------------------------------------------
+// Static Rice-Golomb entropy coder, inlined from the lite_encoding library.
+//
+// Every model is static: the rank table, the Rice parameter k, and the raw-byte escape
+// q_escape are derived from a histogram before encoding and never adapt during the stream.
+// Only the static encode/decode path is kept: there is no move-to-front, no k trend, and
+// no literal/delta helpers, because the compressor only ever encodes pre-ranked symbols.
+//
+// Bitstream: a 64-bit reservoir buffers bits to keep I/O at byte granularity.
+// Each symbol is written as q = rank >> k unary ones, a zero, then k remainder bits; a rank
+// whose q reaches q_escape is written as q_escape unary bits, a zero, then the raw rank byte.
+//-----------------------------------------------------------------------------------------------------------------------------
+
+#define LE_ALPHABET_SIZE (256U)
+#define LE_MAX_K (8)
+
+#ifdef _MSC_VER
+    #pragma intrinsic(_BitScanForward64)
+    static inline uint32_t le_ctz64(uint64_t mask)
+    {
+        unsigned long index;
+        _BitScanForward64(&index, mask);
+        return (uint32_t)index;
+    }
+#else
+    #define le_ctz64(mask) (uint32_t)__builtin_ctzll(mask)
+#endif
+
+typedef enum le_status
+{
+    LE_OK = 0,
+    LE_BUFFER_OVERRUN = -1
+} le_status;
+
+typedef struct le_stream
+{
+    uint8_t* buffer;
+    size_t position;
+    size_t size;
+
+    uint64_t bit_reservoir;
+    uint32_t bits_available;
+
+    le_status status;
+} le_stream;
+
+typedef struct le_model
+{
+    uint8_t alphabet[LE_ALPHABET_SIZE];
+    uint8_t index[LE_ALPHABET_SIZE];
+    uint8_t k;          // rice k-value
+    uint8_t q_escape;
+    uint16_t num_symbols;
+} le_model;
+
+//-----------------------------------------------------------------------------------------------------------------------------
+// pull bytes into the reservoir until it's full enough for any standard read
+static inline void le_refill(le_stream* s)
+{
+    while (s->bits_available <= 56 && s->position < s->size)
+    {
+        s->bit_reservoir |= ((uint64_t)s->buffer[s->position]) << s->bits_available;
+        s->bits_available += 8;
+        s->position++;
+    }
+}
+
+//-----------------------------------------------------------------------------------------------------------------------------
+static inline void le_flush(le_stream* s)
+{
+    while (s->bits_available >= 8)
+    {
+        if (s->position >= s->size)
+        {
+            s->status = LE_BUFFER_OVERRUN;
+            return;
+        }
+        s->buffer[s->position] = (uint8_t)(s->bit_reservoir & 0xFF);
+        s->bit_reservoir >>= 8;
+        s->bits_available -= 8;
+        s->position++;
+    }
+}
+
+//-----------------------------------------------------------------------------------------------------------------------------
+static inline void le_init(le_stream *s, void* buffer, size_t size)
+{
+    s->buffer = (uint8_t*)buffer;
+    s->size = size;
+    s->position = 0;
+    s->bit_reservoir = 0;
+    s->bits_available = 0;
+    s->status = LE_OK;
+}
+
+//-----------------------------------------------------------------------------------------------------------------------------
+static inline void le_begin_encode(le_stream* s)
+{
+    s->position = 0;
+    s->bit_reservoir = 0;
+    s->bits_available = 0;
+    s->status = LE_OK;
+}
+
+//-----------------------------------------------------------------------------------------------------------------------------
+static inline size_t le_end_encode(le_stream* s)
+{
+    if (s->status != LE_OK) 
+        return 0;
+
+    size_t bytes_to_write = (s->bits_available + 7) / 8;
+    if (s->position + bytes_to_write > s->size)
+    {
+        s->status = LE_BUFFER_OVERRUN;
+        return 0;
+    }
+
+    while (s->bits_available > 0)
+    {
+        s->buffer[s->position] = (uint8_t)(s->bit_reservoir & 0xFF);
+        s->bit_reservoir >>= 8;
+        s->position++;
+        
+        if (s->bits_available > 8)
+            s->bits_available -= 8;
+        else
+            s->bits_available = 0;
+    }
+
+    return s->position;
+}
+
+//-----------------------------------------------------------------------------------------------------------------------------
+static inline void le_begin_decode(le_stream* s)
+{
+    s->position = 0;
+    s->bit_reservoir = 0;
+    s->bits_available = 0;
+    s->status = LE_OK;
+    le_refill(s);
+}
+
+//-----------------------------------------------------------------------------------------------------------------------------
+static inline void le_write_bits(le_stream* s, uint64_t data, uint8_t num_bits)
+{
+    s->bit_reservoir |= (data & ((1ULL << num_bits) - 1ULL)) << s->bits_available;
+    s->bits_available += num_bits;
+    if (s->bits_available >= 32)
+        le_flush(s);
+}
+
+//-----------------------------------------------------------------------------------------------------------------------------
+static inline void le_write_byte(le_stream* s, uint8_t value)
+{
+    s->bit_reservoir |= ((uint64_t)value << s->bits_available);
+    s->bits_available += 8;
+    if (s->bits_available >= 32)
+        le_flush(s);
+}
+
+//-----------------------------------------------------------------------------------------------------------------------------
+static inline uint8_t le_read_byte(le_stream* s)
+{
+    if (s->bits_available < 8)
+        le_refill(s);
+
+    if (s->bits_available < 8) 
+    {
+        s->status = LE_BUFFER_OVERRUN;
+        return 0; 
+    }
+
+    uint8_t value = (uint8_t)(s->bit_reservoir & 0xFF);
+    s->bit_reservoir >>= 8;
+    s->bits_available -= 8;
+    return value;
+}
+
+//-----------------------------------------------------------------------------------------------------------------------------
+// Builds a static model from a histogram: sorts symbols by frequency (most frequent first,
+// ties broken by the lower symbol), then searches (k, q_escape) jointly to minimize the
+// model's total bit count. With q_escape = Q, every rank with q = rank >> k >= Q is written
+// as Q unary bits + a zero + a raw byte (Q + 9 bits); the others use normal rice (q + 1 + k bits).
+static inline void le_static_model_init(le_model *model, const uint32_t* histogram, uint32_t num_symbols)
+{
+    assert(num_symbols && num_symbols <= LE_ALPHABET_SIZE);
+
+    typedef struct 
+    {
+        uint8_t symbol;
+        uint32_t count;
+    } le_sym_freq;
+
+    le_sym_freq freq_table[LE_ALPHABET_SIZE];
+    for (uint32_t i = 0; i < LE_ALPHABET_SIZE; ++i)
+    {
+        freq_table[i].symbol = (uint8_t)i;
+        freq_table[i].count = (i < num_symbols && histogram) ? histogram[i] : 0;
+    }
+
+    for (uint32_t i = 1; i < LE_ALPHABET_SIZE; ++i)
+    {
+        le_sym_freq key = freq_table[i];
+        int32_t j = (int32_t)i - 1;
+
+        while (j >= 0 && (freq_table[j].count < key.count || 
+              (freq_table[j].count == key.count && freq_table[j].symbol > key.symbol)))
+        {
+            freq_table[j + 1] = freq_table[j];
+            j--;
+        }
+        freq_table[j + 1] = key;
+    }
+
+    for (uint32_t i = 0; i < LE_ALPHABET_SIZE; ++i)
+    {
+        uint8_t sym = freq_table[i].symbol;
+        model->alphabet[i] = sym;
+        model->index[sym] = (uint8_t)i;
+    }
+
+    uint8_t best_k = 2;
+    uint8_t best_q_escape = 4;
+    uint64_t min_total_bits = UINT64_MAX;
+
+    uint64_t q_count[LE_ALPHABET_SIZE]; // rank counts bucketed by q = rank >> k
+
+    for (uint8_t candidate_k = 0; candidate_k < 8; ++candidate_k)
+    {
+        uint32_t max_q = 0;
+        uint64_t suffix = 0; // count of the ranks with q >= current Q
+
+        memset(q_count, 0, sizeof(q_count));
+        for (uint32_t index = 0; index < LE_ALPHABET_SIZE; ++index)
+        {
+            uint32_t count = freq_table[index].count;
+            if (count == 0) continue;
+
+            uint32_t q = index >> candidate_k;
+            q_count[q] += count;
+            suffix += count;
+            if (q > max_q)
+                max_q = q;
+        }
+
+        // beyond the largest q that occurs the escape never fires, so Q = max_q + 1 costs the same as any
+        // larger Q. the decoder refills its 64-bit reservoir only below 32 bits, so every read must stay
+        // under 32 bits: Q + 1 for the escape flag, q + 1 + k for the rice value
+        uint32_t max_q_escape = max_q + 1;
+        if (max_q_escape > 31)
+            max_q_escape = 31;
+        if (max_q_escape > 32 - candidate_k)
+            max_q_escape = 32 - candidate_k;
+
+        uint64_t prefix = 0; // bits of the ranks with q < current Q, written with normal rice
+        for (uint32_t q = 1; q <= max_q_escape; ++q)
+        {
+            suffix -= q_count[q - 1];
+            prefix += q_count[q - 1] * (q + candidate_k); // a rank with q' = q - 1 costs q' + 1 + k = q + k bits
+
+            uint64_t total_bits = suffix * (q + 9) + prefix;
+            if (total_bits < min_total_bits)
+            {
+                min_total_bits = total_bits;
+                best_k = candidate_k;
+                best_q_escape = (uint8_t)q;
+            }
+        }
+    }
+
+    // compute the actual number of symbols as it could be lower if some symbols are not in stream
+    uint32_t i=0;
+    while (i<num_symbols && freq_table[i].count > 0)
+        i++;
+    
+    model->num_symbols = (uint16_t)i;
+    model->k = best_k;
+    model->q_escape = best_q_escape;
+}
+
+//-----------------------------------------------------------------------------------------------------------------------------
+// Restores a model from the stream: rebuilds the rank table and the symbol-to-rank index.
+static inline void le_static_model_load(le_model *model, const uint8_t* alphabet, uint32_t num_symbols, uint8_t k, uint8_t q_escape)
+{
+    *model = (le_model) {0};
+    memcpy(model->alphabet, alphabet, num_symbols);
+    model->k = k;
+    model->q_escape = q_escape;
+    model->num_symbols = (uint16_t)num_symbols;
+
+    for (uint32_t i = 0; i < num_symbols; ++i)
+        model->index[model->alphabet[i]] = (uint8_t)i;
+}
+
+//-----------------------------------------------------------------------------------------------------------------------------
+static inline void rice_encode(le_stream *s, uint32_t value, uint8_t k, uint8_t q_escape) 
+{
+    uint32_t q = value >> k;
+    uint32_t q_limit = q_escape;
+    uint32_t r = value & ((1U << k) - 1U);
+
+    // checks if raw value is cheaper
+    q = (q >= q_limit) ? q_limit : q;
+
+    // unary prefix: q ones followed by a zero
+    le_write_bits(s, (1ULL << q) - 1ULL, (uint8_t)(q + 1));
+
+    // remainder or rawbyte
+    if (q == q_limit)
+        le_write_byte(s, value);
+    else if (k > 0) 
+        le_write_bits(s, (uint8_t)r, k);
+}
+
+//-----------------------------------------------------------------------------------------------------------------------------
+static inline uint8_t rice_decode(le_stream *s, uint8_t k, uint8_t q_escape) 
+{
+    if (s->bits_available < 32) 
+        le_refill(s);
+
+    uint32_t q = le_ctz64(~s->bit_reservoir | (1ULL << 63));
+    uint32_t q_limit = q_escape;
+
+    if (q >= q_limit)
+    {
+        if (s->bits_available < (q_limit + 1)) 
+        {
+            s->status = LE_BUFFER_OVERRUN;
+            return 0;
+        }
+        s->bit_reservoir >>= (q_limit + 1);
+        s->bits_available -= (q_limit + 1);
+        return le_read_byte(s);
+    }
+
+    uint32_t total_bits = q + 1 + k;
+    if (s->bits_available < total_bits) 
+    {
+        s->status = LE_BUFFER_OVERRUN;
+        return 0;
+    }
+
+    uint32_t val = s->bit_reservoir;
+    
+    s->bit_reservoir >>= total_bits;
+    s->bits_available -= total_bits;
+
+    uint32_t r = (val >> (q + 1)) & ((1U << k) - 1);
+    return (uint8_t)((q << k) | r);
+}
+
+//-----------------------------------------------------------------------------------------------------------------------------
+// Encodes [value] by its rank in the model: a static model never changes, so the rank is the symbol.
+static inline void le_encode_symbol(le_stream *s, le_model *model, uint8_t value)
+{
+    uint32_t index = model->index[value];
+    rice_encode(s, index, model->k, model->q_escape);
+}
+
+//-----------------------------------------------------------------------------------------------------------------------------
+// Decodes one symbol: read the rank, then map it back through the rank table.
+static inline uint8_t le_decode_symbol(le_stream *restrict s, le_model *restrict model) 
+{
+    uint8_t index = rice_decode(s, model->k, model->q_escape);
+    return model->alphabet[index];
+}
+
 
 //-----------------------------------------------------------------------------------------------------------------------------
 // Constants
@@ -96,7 +465,7 @@ static inline void* malloc_wrapper(size_t size, void* user) {(void)user; return 
 static inline void* realloc_wrapper(void* old_ptr, size_t old_size, size_t new_size, void* user){(void)user;(void)old_size;return realloc(old_ptr, new_size);}
 static inline void free_wrapper(void* ptr, void* user) {(void)user; free(ptr);}
 
-//-----------------------------------------------------------------------------------------------------------------------------
+//----------------------------------------------------------------------------------------------------------------------------
 static inline bc1_packed_mem_interface default_allocator(void) 
 {
     return (bc1_packed_mem_interface) 
@@ -688,8 +1057,8 @@ static inline bool load_static_model(le_model* model, byte_stream* stream)
     uint8_t k = stream->buffer[stream->pos++];
     uint8_t q_escape = stream->buffer[stream->pos++];
 
-    if (k >= LE_Q_ESCAPE_SIZE)
-        k = (uint8_t)(LE_Q_ESCAPE_SIZE - 1); 
+    if (k > LE_MAX_K)
+        k = LE_MAX_K; 
 
     if (stream->pos + num_symbols > stream->length)
         return false;
@@ -1021,8 +1390,6 @@ bool bc1_packed_decompress(bc1_packed_context* ctx, const void* input, size_t in
             previous = *current;
         }
     }
-
-    le_end_decode(&compressed_stream);
 
     return compressed_stream.status == LE_OK;
 }
