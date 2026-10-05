@@ -788,7 +788,7 @@ size_t bc1_packed_compress(bc1_packed_context* ctx, const void* bc1_image, uint3
             stream.buffer[stream.pos++] = (ctx->top_table[i] >> (j*8)) & 0xff;
 
     stream_align(&stream, sizeof(uint16_t));
-    size_t strips_offset_array_size = sizeof(uint16_t) * BC1_PACKED_NUM_STRIPS;
+    size_t strips_offset_array_size = sizeof(uint16_t) * (BC1_PACKED_NUM_STRIPS - 1);
 
     // check if we have enough space
     if (stream.pos + strips_offset_array_size >= stream.length)
@@ -808,8 +808,10 @@ size_t bc1_packed_compress(bc1_packed_context* ctx, const void* bc1_image, uint3
         le_init(&compressed_stream, &stream.buffer[stream.pos], stream.length - stream.pos);
         le_begin_encode(&compressed_stream);
 
-        // strip offset is counted in dword, based on the previous one (delta compression)
-        strips_offset[strip_index] = (uint16_t)((stream.pos - previous_offset) / sizeof(uint32_t));
+        // strip offset is counted in dword, based on the previous one (delta compression);
+        // strip 0 always starts the strip data so its offset is zero and not stored
+        if (strip_index > 0)
+            strips_offset[strip_index - 1] = (uint16_t)((stream.pos - previous_offset) / sizeof(uint32_t));
         previous_offset = stream.pos;
 
         uint64_t bit_pos = 0; // current bit position, used to measure the per-component stats
@@ -943,7 +945,7 @@ bool bc1_packed_decompress(bc1_packed_context* ctx, const void* input, size_t in
 
     // strip offsets
     read_stream_align(&stream, sizeof(uint16_t));
-    size_t strips_offset_array_size = sizeof(uint16_t) * BC1_PACKED_NUM_STRIPS;
+    size_t strips_offset_array_size = sizeof(uint16_t) * (BC1_PACKED_NUM_STRIPS - 1);
 
     if (stream.pos + strips_offset_array_size >= stream.length)
         return false;
@@ -953,9 +955,10 @@ bool bc1_packed_decompress(bc1_packed_context* ctx, const void* input, size_t in
 
     read_stream_align(&stream, sizeof(uint32_t));
 
-    // compute the current strip offset and setup compressed stream
+    // compute the current strip offset and setup compressed stream; strip 0's offset is always zero
+    // (it starts the strip data) so it is not stored, the stored deltas cover strips 1..N-1
     size_t strip_offset = stream.pos;
-    for(uint32_t i=0; i<=strip_index; ++i)
+    for(uint32_t i=0; i<strip_index; ++i)
         strip_offset += strips_offset_array[i] * sizeof(uint32_t);
 
     assert(stream.length > strip_offset);

@@ -158,7 +158,7 @@ The output buffer must be at least `bc1_packed_maxsize(width, height)` bytes. Th
 * Strip predictor flags: 8 bytes (little-endian uint64_t) — one bit per strip: 1 → endpoint colors of that strip are predicted from the row above (same zigzag position) after the first scanline, 0 → zigzag-previous block. See Per-strip predictor.
 * Top table entries, 4 bytes each (little-endian uint32_t).
 * Padded to a 2-byte boundary.
-* 64 strip offsets (uint16_t each), relative deltas in dword units.
+* 63 strip offsets (uint16_t each), relative deltas in dword units. Strip 0 always starts the strip data so its offset is zero and not stored; the k-th stored offset (k = 1..63) is the delta from strip k-1 to strip k in dword units.
 * Padded to a 4-byte boundary.
 * 64 strip bitstreams, each 4-byte aligned, each flushed independently.
 ```
