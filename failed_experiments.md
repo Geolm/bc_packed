@@ -6,9 +6,11 @@ baseline. Kept here so we don't re-litigate them.
 **Baseline (the bar to beat):** per-endpoint color deltas (6 `le_model`s: one set of red/green/blue
 per endpoint), per-strip color predictor selection (exp 11, 8 header bytes), raw top-table reference
 (1 `le_model`), index residual mask + per-byte difference (2 `le_model`s), top-table VQ refinement
-with two full-assignment Lloyd rounds (exp 15). Measured on the `suite_image` set (74 images):
-**1.44:1** average compression ratio (1.4363, byte-weighted 1.3840), 14/14 tests pass. (Before
-exp 15 the baseline was 1.4341 / 1.3830 on this suite; before exp 11 it was 1.4102 / 1.3688.)
+with two full-assignment Lloyd rounds (exp 15), per-model raw-byte `q_escape` fitted jointly with
+the Rice `k` (exp 18, one header byte per model). Measured on the `suite_image` set (74 images):
+**1.44:1** average compression ratio (1.4438, byte-weighted 1.3900), 14/14 tests pass. (Before
+exp 18 the baseline was 1.4363 / 1.3840 on this suite; before exp 15 it was 1.4341 / 1.3830;
+before exp 11 it was 1.4102 / 1.3688.)
 
 Splitting the 3 shared color models into one set per endpoint (6 models, +3 model headers in the
 stream) beat the 3-model baseline: colors payload −0.41%, total stream −0.105%, average ratio
@@ -37,6 +39,7 @@ Rice `k` and rank table per endpoint fits better. Kept.
 | 15 | Two full-assignment Lloyd rounds appended to the `vq_top_table` refinement (round-count saturates at 2; pure-full is a +0.58% loss, so the 4 adaptive rounds are kept) | round-trips; difference −0.68%, reference +0.70%; 55/74 improved, worst −0.33% | **1.4363:1** (+0.15%) | **kept — this is the new baseline** |
 | 16 | 512-entry top table (9-bit raw-Rice reference, format v2) | offline study; difference −6.86% but reference + mask + doubled header net out to +1.41% on the index payload | n/a (est. ≈+0.9% stream, 2/74 win) | not adopted — more centroids buy nothing; lever closed |
 | 17 | Per-row color predictor (1 bit/row, the open-thread lead of exp 9/11) | offline study; same color symbols as per-strip, only the flag word differs — a loss on 74/74 | n/a (+0.16…+0.70%, 0/74 win) | not adopted — per-strip (exp 11) is already optimal; lead closed |
+| 18 | Per-model raw-byte `q_escape` for static models, searched jointly with the Rice `k` against the histogram (replaces the fixed per-k escape table; one header byte per model) | round-trips; colors −1.19%, 74/74 improved, worst +0.01% | **1.4438:1** (+0.52%) | **kept — this is the new baseline** |
 
 ---
 
@@ -776,6 +779,45 @@ the flags can only cost.
 
 **Kept:** nothing. The per-strip predictor of exp 11 stays, and it is now measured **optimal**
 at its own grain: the decision is invariant to subdividing the strip. Do not re-litigate.
+
+---
+
+## 18. Per-model raw-byte `q_escape` (the keep)
+
+**Idea:** the static models' rice escape used a *fixed per-k* table shared by all nine models
+(the decoder's 64-bit reservoir refills only below 32 bits, so no threshold above ~16 was ever
+legal, and the table's high-k entries were 255 = no escape). An escape threshold is only useful
+where it sits at the *knee* of the histogram: too low and ranks that would have fit rice pay
+the Q + 9-bit raw-byte escape, too high and the tail pays q + 1 + k bits unbounded. The nine
+models have very different shapes (peaked color deltas, near-uniform references, 16-symbol
+masks), so one table per k mis-prices most of them. Give each static model its own `q_escape`
+in the stream and search (k, q_escape) jointly against the histogram: the ranks are bucketed by
+q = rank >> k and every legal Q is scored in one pass (suffix/prefix sums of the buckets), the
+pair minimizing the exact bit count wins, and the legal range stays under the 32-bit invariant
+(Q ≤ 31, q + 1 + k ≤ 32). When a histogram has no heavy tail the optimum is Q = max_q + 1 —
+beyond the largest rank that occurs — and the escape never fires, so peaked models lose nothing.
+The dynamic models keep the fixed table.
+
+**Result:** 74-image suite, 14/14 round-trip, deterministic streams:
+- average ratio **1.4363 → 1.4438 (+0.52%)**, byte-weighted 1.3840 → 1.3900 (+0.43%);
+  **74/74 improved, 0 regressed, 0 flat** (best kodim24 +1.42%, kodim07 +1.27%, Wood_08
+  +1.26%; worst wall3 +0.01% — even the smallest win clears the +9 B of model headers).
+- components: colors 5,728,137 → 5,660,105 B (**−1.19%**, the whole story), difference
+  6,546,166 → 6,543,442 B (−0.04%); reference and mask are byte-identical (their q's stay
+  below the fitted no-escape boundary, so neither the escape nor the k moves).
+- the joint search re-picks `k` where the fixed table had mis-priced the escape — the exp 7
+  k-cliff, now working *in the models' favor*: green0 3→2 on 14 images, green1 3→2 on 14,
+  plus smaller 1→2 / 4→3 flips (green0 20/74, green1 24/74, blue 4/74, difference 6/74 — all
+  downward). Example: kodim07 green0 (39 symbols, k = 0) fits Q 16 → 31: ranks 16..30 drop
+  from the 25-bit escape to 17..31 rice bits, only the 8 tail ranks pay the 40-bit escape.
+
+**Kept:** this is the **new baseline** (1.4438 / 1.3900). Stream format: the model header grows
+2 → 3 bytes (count − 1, k, q_escape), the rank table starts at offset 3 (max model size 258 →
+259 B) — the one change the GPU decoder must adopt: use the per-model `q_escape` on the static
+decode path. Decoder throughput is unchanged (the static decode path is byte-identical in shape,
+only the threshold differs). The round-trip suite covers it: the escape path is exercised by the
+peaked color models on the image suite, and the `synthetic_tests` header helpers parse the new
+layout.
 
 ---
 
