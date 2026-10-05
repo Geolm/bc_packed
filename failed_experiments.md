@@ -31,6 +31,7 @@ Rice `k` and rank table per endpoint fits better. Kept.
 | 10 | Cascading masked top-table, VQ removed (exact ≥ n → 1-byte → 2-byte rounds, mode-resolved) | round-trips; n 2..8 byte-identical; difference +2.15% | 1.4025:1 (−0.54%) | reverted (1-entry floor + regression test kept — fixes the open bug) |
 | 11 | Per-strip color predictor: row-above (same zigzag position) vs zigzag-previous, 1 bit/strip in the header, decided by delta energy | round-trips; colors −2.72%; 58/74 improved, worst −0.05% | **1.4323:1** (+1.57%) | **kept — this is the new baseline** |
 | 12 | YCoCg-R color encoding (color-space / delta-space / 565-upscaled), measured offline (exp 5 style) | round-trips exact; loses on 71-74/74 images | 1.5298 / 1.5421 / 1.5449 vs 1.5784 baseline | not adopted — the current ΔG/2 decorrelation *is* YCoCg-R depth-matched for 565 |
+| 13 | Spatially-smooth VQ codebook + zigzag reference delta (the open-thread "better codebook") | offline study; reference +0.33 bits/block, 85.7% of index transitions are genuinely-different centroids | 1.43 → 1.42 (−0.7%), 73/74 images regress | not adopted — the index surface is inherently wide; lever closed |
 
 ---
 
@@ -535,12 +536,90 @@ for 565, and its equal-depth cousin loses by 2-3% on this suite. Do not re-litig
 
 ---
 
+## 13. Spatially-smooth VQ codebook + zigzag reference delta (the open thread)
+
+**Idea (the open thread, now measured):** the reference is the largest byte component and stays
+near-8-bit incompressible because it is a VQ code index that is not spatially coherent, and neither
+codebook reordering nor delta-coding moves it (exp. 2/4/5). The lever that *would* is a **better VQ
+codebook** — more/smarter centroids, or spatially-aware quantization — so the index surface is
+inherently smoother and the residual smaller. Two halves:
+
+1. **Spatially-aware codebook order:** search the permutation of the 256 table slots that minimizes
+   the expected zigzag adjacency of the reference bitmaps — greedy construction plus steepest-ascent
+   swap local search on Σ W·|posdiff| (W = joint block-pair frequency) — then zigzag-delta the
+   reference under that order. This is the *maximum* smoothness any ordering of the current centroids
+   can buy: if best-order + delta does not beat raw, no ordering can.
+2. **Smarter centroids (the residual half):** covered by the already-measured exp. 7 (stage 2) and
+   10 ablations of the `vq_top_table` refinement (see below).
+
+**Method:** faithful offline cost study (exp. 5/12 style, no code change). The scratch tool
+`#include "bc1_packed.c"` and mirrors the unit-test pipeline exactly (stb_image → stb_dxt
+HIGHQUAL → `extract_4x4_rgba_block` at pixel coords `x*4, y*4` → `build_top_table` → `nearest32`
+selection), then prices the reference component with the real `le_static_model_init` models. The
+replica reproduces the unit test byte-exact (metal.png 1.405311, stream 373,076 B, table 256) and
+its simple-average baseline 1.4341 matches the current suite stats (the 1.4323 logged at the top of
+this file predates the later suite changes, cf. exp. 12's note) before any number is trusted.
+
+**Result:** 74-image suite. The reference under candidate codebooks/orders (bits/block):
+
+| reference encoding | bits/block |
+|---|---|
+| raw (current) | 7.778 |
+| zigzag-delta, no reorder | 8.353 |
+| zigzag-delta + best spatial reorder | 8.107 |
+
+**Transition census** of the reference map over all adjacent zigzag block pairs: **85.7%** of
+transitions are between *genuinely different* centroids (> 8-bit Hamming in the 32-bit index);
+only **2.4%** are the same centroid and **2.8%** are brittle flips (≤ 4 bits).
+
+Per-image new ratio (delta + best reorder replaces the raw reference; all other components
+identical): **1 improved** (Wood_16 +0.24%), **73 regressed** (all > 0.5%; worst Wood_03
+−2.88%). Simple average **1.4341 → 1.4239 (−0.72%)**, byte-weighted 1.3830 → 1.3732. Suite-wide
+reference payload 2,755,618 → 2,872,383 B (**+4.24%** on the 16.8%-of-stream component ≈ −0.7%
+overall).
+
+**Why it lost:** the index surface is **inherently wide**, so the lever's premise fails at its root.
+Adjacent DXT 4×4 blocks mostly have genuinely different index bitmaps — 85.7% of neighbor pairs jump
+between centroids that differ in more than 8 of 16 texel indices. The incoherence exp. 2/4/5 measured
+is **content, not codebook**: no permutation of the table can co-locate centroids that the content
+genuinely jumps between, so even the *best* reorder + delta (8.107) sits +0.33 bits/block **above**
+raw (7.778) — the same sign and magnitude class as exp. 2's un-reordered delta, and the 2.8% brittle
+flips are the only part a smarter codebook could smooth (≈3% of the surface). The smarter-centroid
+half is likewise closed by the measurements exp. 13 was supposed to refine: exp. 7 (stage 2) and
+10 showed the VQ majority-vote centroids are *strictly closer* than the exact patterns to the
+non-exact blocks (avg nearest popcount 5.36 refined vs 5.59 exact) — a bitwise majority vote over
+the sample *is* the Hamming-optimal centroid for each cluster, so "smarter centroids" cannot beat
+it, and the residual is at the Hamming limit of a 256-entry table for this content.
+
+The one untested variant is a **spatially adaptive codebook** (multiple per-region tables, format
+v2): it would let *different* regions use different centroid sets, but the same 85.7% wall applies
+*within* each region's surface, and it adds per-block table-ID overhead plus the GPU decoder rework
+exp. 12 flagged for any format change. Not pursued.
+
+**Caution (measurement):** the first cut of this study ran on a 4× horizontally *shifted* RGBA
+extraction (the scratch tool passed the block's column `x` where the test passes the pixel coord
+`x*4`), which scrambled the generated BC1 and produced a phantom 1.5784 "baseline" that looked like
+a win. The faithful replica (pixel coords, the test's flat-buffer layout) reproduces the unit test
+exactly. Any future study of this pipeline must mirror the test's pixel extraction or it measures a
+different encoder.
+
+**Kept:** the closed verdict on the open thread. Both halves of "better VQ codebook" are measured
+dead ends for this content class: reordering + delta cannot harvest smoothness the content does not
+have (85.7% real transitions), and the majority-vote centroid is already the Hamming-optimal
+256-entry codebook (exp. 7/10). The reference component is incompressible as a VQ index; the only
+remaining structural lever is the format-v2 per-region table, gated behind the same wall.
+
+**Outcome:** not adopted; no code change. The repo stays at the 1.43 baseline (13/13 tests pass).
+This resolves the first lead of the open thread below.
+
+---
+
 ## Open thread (not a failed experiment, just a lead)
 
-The reference is the largest byte component (~22% of a typical image). Since it's a VQ index that is
-not coherent, neither codebook reordering nor delta-coding moves it. The lever that *would* is a
-**better VQ codebook** (more/smarter centroids, or spatially-aware quantization) so the index surface
-is inherently smoother and the residual smaller. Larger change, separate investigation — not started.
+The better-VQ-codebook lead is **resolved by exp. 13 and closed**: the reference surface is 85.7%
+genuinely-different-centroid transitions, so neither a spatially-smooth codebook order + delta nor
+smarter centroids can move it, and the format-v2 per-region table is gated behind the same wall. Do
+not re-litigate.
 
 A second lead from exp 9: a **per-row color predictor**. For each scanline, emit one flag bit and
 predict from whichever of row-above / zigzag-previous was cheaper for that row (decided in the
