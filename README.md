@@ -23,7 +23,7 @@ The techniques are adapted to make GPU decompression fast and simple:
 * **Static symbol ranking.** Symbols are remapped so that the most frequently used symbols have the lowest indices. The rank table is generated from a histogram during compression.
 * **Parallel decompression.** The texture is divided into 64 independent strips. 64 GPU threads decompress the strips in parallel, with no dependency between threads.
 
-Multiple independent Rice-Golomb models are used for the different data: endpoint color deltas (one set of red, green, blue per endpoint), top-table references, difference masks, and residual difference bytes.
+Multiple independent Rice-Golomb models are used for the different data: endpoint color deltas (one set of red, green, blue per endpoint, red and blue each with one model per green-delta context bucket — 14 color models, see Endpoints), top-table references, difference masks, and residual difference bytes (17 models in total).
 
 ### Rice-Golomb model
 
@@ -65,14 +65,14 @@ As the decompression happens on the GPU we need to decompress in parallel multip
 
 For example for a 1024x1024 texture : each thread will decode 256 blocks (in width) x 4 blocks (in height).
 
-As the models are static, each thread just loads the same nine models from the stream (`le_static_model_load`); there is no adaptive state to keep in sync between threads.
+As the models are static, each thread just loads the same 17 models from the stream (`le_static_model_load`); the color context is derived from the current block's own decoded green delta, so there is no adaptive state to keep in sync between threads.
 
 As Rice encoding output is non-fixed, we stored in the stream 64 offsets (uint16_t), each a delta in dword units relative to the previous strip, so each thread knows where to start.
 
 ### Endpoints
 
 BC1 endpoints are predicted from the previous block's endpoints.
-One set of three independent Rice-Golomb models is used per endpoint for the R, G, and B components (six models in total), so each endpoint adapts its own Rice parameter and rank table.
+One set of three independent Rice-Golomb models is used per endpoint for the R, G, and B components; red and blue additionally carry one model per context bucket — 14 color models in total. Each (channel, endpoint, context) model is fitted to the color deltas that occur in its context, so every block is priced by a model that matches its own regime.
 
 For each endpoint of each block:
 
@@ -82,7 +82,9 @@ red_delta   = (current_red   - previous_red) - green_delta / 2
 blue_delta  = (current_blue  - previous_blue) - green_delta / 2
 ```
 
-BC1 colors are R5G6B5, so the deltas always fit in 7 bits. Each delta is stored as an unsigned value offset by 64, and encoded with its respective static Rice-Golomb model.
+BC1 colors are R5G6B5, so the deltas always fit in 7 bits. Each delta is stored as an unsigned value offset by 64, and encoded with its static Rice-Golomb model.
+
+The red and blue deltas are contextual: the context is three value buckets of the endpoint's own 6-bit green delta (negative / zero / positive). The decorrelation removes the *linear* luminance component of the chroma deltas, but the residual chroma still scales with the local luminance energy, so a model fitted per luminance-delta regime prices each block tighter than a single image-wide model. The green deltas are encoded uncontexted. The context is derived from a value that is already decoded, so the model selection costs no stream bits.
 
 The blocks are traversed in a zigzag order to avoid a discontinuity at the end of each scanline:
 
@@ -151,7 +153,7 @@ Note : the stream does not include width, height or format, only the compressed 
 The output buffer must be at least `bc1_packed_maxsize(width, height)` bytes. This is a very rough bound: `(width/4) * (height/4) * 16`, i.e. the size of the standard raw BC1 texture (2× the packed input). In practice the stream is much smaller.
 
 ```text
-* 9 static models, in order: endpoint 0 red, endpoint 0 green, endpoint 0 blue, endpoint 1 red, endpoint 1 green, endpoint 1 blue, top-table reference, difference mask, table difference.
+* 17 static models, in order: for each endpoint (0, 1): red (3 context buckets), green, blue (3 context buckets) — 14 color models — then top-table reference, difference mask, table difference.
   Each is 3 + num_symbols bytes, no padding (max 259 bytes).
 * Top table size: one uint8_t (number of entries − 1), padded to a 4-byte boundary.
 * Strip seed: one uint32_t (little-endian) — the two endpoint colors of the "previous block" used to predict the first block of each strip, averaged over the 64 strips at compression time. Low 16 bits = color[0], high 16 bits = color[1].
@@ -172,11 +174,13 @@ Within a strip, the blocks are traversed in the zigzag row order. For each block
 * One difference byte per set mask bit.
 ```
 
-All symbols are encoded with Rice-Golomb using one of the nine static models.
+All symbols are encoded with Rice-Golomb using one of the 17 static models; each red/blue uses the model of its (channel, endpoint, context) — the three-bucket green delta described in Endpoints — and each green uses its endpoint's uncontexted model.
 
 ## Status
 
-The stream matches the format documented above, and both `bc1_packed_compress` and `bc1_packed_decompress` are implemented. All nine models are image-wide: one Rice `k` and one `q_escape` per model, no per-strip model state (a per-strip `k` for the mask model was prototyped and measured +0.03% — not adopted, the gain did not justify the added stream bytes and decoder state). The only per-strip state is the color predictor flag (8 bytes in the header, see Per-strip predictor): it selects between two predictors, it does not change any model.
+The stream matches the format documented above, and both `bc1_packed_compress` and `bc1_packed_decompress` are implemented. All 17 models are image-wide: one Rice `k` and one `q_escape` per model, no per-strip model state (a per-strip `k` for the mask model was prototyped and measured +0.03% — not adopted, the gain did not justify the added stream bytes and decoder state). The per-block color context (the three-bucket green delta) selects among the red/blue models; the color predictor flag (8 bytes in the header, see Per-strip predictor) selects between two predictors, it does not change any model.
+
+The 17-model header is a breaking change against the previous 9-model format (exp 19 in `failed_experiments.md`): the GPU decoder must load 17 models and select the red/blue model by context. Measured on the 74-image suite: +1.0% stream size (74/74 images improved, worst +0.19%) at neutral CPU decompression throughput (ground.png 1024², 18 threads, ≈3065 → ≈2970 MiB/s, inside run-to-run noise).
 
 * CPU decompression (`bc1_packed_decompress`) decodes one strip at a time; the unit tests decompress every strip and compare byte-exact against the input.
 * Unit tests (`tests/`) cover synthetic textures, a real-image roundtrip suite over `images/` (loaded with `stb_image.h`, converted with `stb_dxt.h` from `third_party/`, which the library itself does not depend on), and a multithreaded decompression benchmark.

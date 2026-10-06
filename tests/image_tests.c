@@ -142,7 +142,7 @@ TEST test_all_images_in_folder(const char *dir_path)
         stbi_image_free(rgba);
     }
 
-    fprintf(stats, "\n\n# %u images, average compression ratio : %2.2f:1\n\n", num_images, global_ratio / (float) num_images);
+    fprintf(stats, "\n\n# %u images, average compression ratio : %2.4f:1\n\n", num_images, global_ratio / (float) num_images);
 
     closedir(dir);
     free(original_bc1);
@@ -151,7 +151,7 @@ TEST test_all_images_in_folder(const char *dir_path)
     fclose(stats);
 
 
-    fprintf(stdout, "\n==> %u images, average compression ratio : %2.2f:1\n\n", num_images, global_ratio / (float) num_images);
+    fprintf(stdout, "\n==> %u images, average compression ratio : %2.4f:1\n\n", num_images, global_ratio / (float) num_images);
 
     PASS();
 }

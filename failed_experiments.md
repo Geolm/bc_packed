@@ -10,7 +10,9 @@ with two full-assignment Lloyd rounds (exp 15), per-model raw-byte `q_escape` fi
 the Rice `k` (exp 18, one header byte per model). Measured on the `suite_image` set (74 images):
 **1.44:1** average compression ratio (1.4438, byte-weighted 1.3900), 14/14 tests pass. (Before
 exp 18 the baseline was 1.4363 / 1.3840 on this suite; before exp 15 it was 1.4341 / 1.3830;
-before exp 11 it was 1.4102 / 1.3688.)
+before exp 11 it was 1.4102 / 1.3688.) Superseded pending decision: exp 19 (contextual color
+models on red/blue, 3 buckets, format v2) measures 1.4583 / 1.4151 with 74/74 improved, in the
+tree, CPU decompression neutral — awaiting the user's keep/revert call.
 
 Splitting the 3 shared color models into one set per endpoint (6 models, +3 model headers in the
 stream) beat the 3-model baseline: colors payload −0.41%, total stream −0.105%, average ratio
@@ -821,6 +823,75 @@ layout.
 
 ---
 
+## 19. Contextual color models: a green-delta context on red/blue (format v2)
+
+**Idea (the open thread, implemented):** the six independent static color models structurally
+cannot price the *joint* correlation between the per-block color symbols (cf. the entropy-floor
+study behind the open thread: colors 117% of its floor, the largest slice of the remaining
+≈6.7% of total headroom). Give the color symbols a *context* — a coarse bucket of a green
+delta that is already known when the symbol is decoded — so each block is priced by a model
+fitted to its own regime instead of the image-wide mixture. Final design (after two iterations,
+see below): **context on red and blue only**, three value buckets of the 6-bit green delta
+(negative / zero / positive), one shared `color_delta_context` used identically by the
+histogram, compress, and decompress passes:
+
+- `red[0], blue[0] | bucket(this block's ΔG0)` and `red[1], blue[1] | bucket(this block's ΔG1)`
+  — chroma scale coupling: the decorrelation (exp 12's ΔG/2) removes the *linear* luminance
+  component, the residual chroma still scales with the local luminance energy
+- `green[0], green[1]` — **uncontexted** (the auto-correlation and the DXT1-bracket contexts
+  were dropped, see the iteration record)
+
+Every symbol stays in the stream exactly once, in the same order; the context is derived from
+the block's own just-decoded green delta — no state crosses blocks or endpoints, and the
+selection costs zero payload bits. Stream format v2: the model header grows 9 → 17 models
+(14 color + reference/mask/difference unchanged), no other framing change. `bc1_packed_stats`
+reports the zero-context (middle bucket) `k` for red/blue. Regression test `color_context`:
+a quadratic green ramp (delta 2i+1 mod 64) sweeps the negative/positive buckets on both
+endpoints, byte-exact round-trip; the `synthetic_tests` header helpers walk the 17 models.
+
+**Iteration record:**
+- *First cut: context on all six symbols, 5 buckets* (`≤ −8, −7..−1, 0, 1..7, ≥ 8`; green[0] on
+  the previous block's ΔG0, green[1] on the current ΔG0, red/blue on their own): 1.4438 →
+  **1.4694 (+1.77%)**, 74/74 improved, colors −4.82% — but CPU decompression 3065 → ≈2430
+  MiB/s (**−15…−21%**): six data-dependent model selections per block, 30 live tables.
+- *Final (in the tree): red/blue only, 3 buckets.* The user dropped the green contexts ("no
+  proven link that green1 and green0 are related") and halved the bucket count. Result below;
+  the combined drop costs +0.76% of the size gain but recovers nearly all of the speed.
+
+**Result (final: red/blue only, 3 buckets):** 74-image suite, 15/15 tests, deterministic
+streams, vs the 1.4438 baseline:
+- average ratio **1.4438 → 1.4583 (+1.01%)**, byte-weighted 1.4029 → 1.4151 (+0.87%), total
+  stream 16,313,392 → 16,180,692 B (**−0.81%**); **74/74 improved, 0 regressed, 0 flat**
+  (worst kodim13 +0.19%; best Wood_02 +3.50%). 512² class +1.16%, 1024² class +0.74% — the
+  per-image gain beats the +8 rank tables even on the smallest streams.
+- components: colors 5,660,105 → 5,520,014 B (**−2.48%**, the whole story); reference, mask,
+  difference byte-identical (untouched). The 5-bucket first cut reached −4.82%; the drop to
+  red/blue-only + 3 buckets gives back half of it (the green contexts carried ≈ half the gain
+  and most of the speed cost).
+- CPU decompression (ground.png 1024², 18 threads, means of repeated runs): 0.163 s →
+  0.167–0.171 s, **≈3065 → ≈2970 MiB/s (−0…−3.5%, inside the baseline's own run-to-run
+  noise)** — the decode loop pays 4 data-dependent selections per block against 14 live
+  tables (vs 6 / 30 for the 5-bucket cut); the green symbols decode on the fixed-address
+  baseline path. Compression is a bit slower (8 extra histogram arrays + 8 model fits) —
+  covered by the README's "compression is expected to be a lot slower" clause.
+
+**Why it wins (the mechanism, measured):** one image-wide model prices every block at the
+*marginal* distribution; per-context models price each block at its *conditional*
+distribution, H(X|ctx) = H(X) − I(X;ctx). The selection is free (decoded state), so the gain is
+pure mutual information minus ≈8 rank tables of header. It is the same mechanism as the
+shipped per-endpoint split (3 → 6 models) with a *content-derived* key instead of a positional
+one — and unlike exp 6/8b the context is genuinely predictive, so 74/74 improve.
+
+**Pending decision (the user's call, code in place, nothing reverted):** the trade is now
+almost pure win on the CPU yardstick: +1.0% size, 74/74 improved, decompression neutral. The
+GPU decoder (not in this tree) must still adopt the 17-model header and the context selection.
+If kept: new baseline 1.4583 / 1.4151, stream format v2. The leftover size vs the 5-bucket cut
+(≈0.76%) is the price of dropping the green contexts and halving the buckets; the remaining
+tuning knobs are the bucket boundaries (3 is a first guess) and, if the user ever wants the
+size back, re-adding a green context measured per symbol.
+
+---
+
 ## Open thread (not a failed experiment, just a lead)
 
 The better-VQ-codebook lead is **resolved and closed**: exp. 13 measured the spatially-smooth
@@ -830,13 +901,12 @@ real lever in that family (the full-assignment rounds, kept). Do not re-litigate
 The per-row color-predictor lead is **resolved by exp. 17 and closed**: per-row measures zero
 payload gain over per-strip (exp. 11) plus a flag-word cost, 0/74 win. Do not re-litigate.
 
-One lead remains, and it is the only one that can move the remaining headroom: **contextual /
-joint coding (format v2)**. The entropy-floor study (offline, 74-image suite) prices the shipped
-coded payload against per-component entropy: **colors 117% of its floor, reference 103%, mask
-105%, difference bytes 103% — ≈6.7% of total headroom, almost all of it in the *joint*
-correlation between the six per-block color symbols**, which the independent static Rice models
-structurally cannot touch (cf. exp 12: any gain there requires a format change — contextual or
-joint models — plus the GPU decoder rework that note flagged). Gated on explicit approval; the
-smallest credible entry is a context on the six color symbols only (no stream-framing change
-beyond the model headers), with the exp 12 caution that independent *rotations* of the same
-information lose: a context model must be strictly more expressive, not a different basis.
+The contextual / joint coding lead is **measured by exp 19 and now a pending decision, not an
+open lead**: the final cut (three green-delta context buckets on red/blue only, greens
+uncontexted) is +1.01% average / 1.4151 byte-weighted, 74/74 improved, CPU decompression
+neutral, in the tree — awaiting the user's keep/revert call. What remains once the exp 19
+verdict lands: (1) the uncaptured slice of the colors gap (finer/wider bucket boundaries,
+further context candidates — e.g. the previous block's chroma for the current chroma, or the
+dropped green contexts re-added with measured per-symbol value); (2) the entropy-coder swap
+(Rice → range coder), the only lever that also touches the reference / mask / difference
+103–105%-of-floor gaps — a third-party change, gated on approval.

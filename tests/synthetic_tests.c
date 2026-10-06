@@ -306,13 +306,15 @@ static uint16_t pack_565(uint8_t r5, uint8_t g6, uint8_t b5)
 }
 
 //-----------------------------------------------------------------------------------------------------------------------------
-// walks the 9 static models, the top-table size byte, and the 4-byte padding of the stream header, returning the
-// offset of the strip seed, or (size_t)-1 if the header is truncated
+// walks the 17 static models (14 contextual color models: 3 red/blue per endpoint per green-delta
+// context + 1 uncontexted green per endpoint, plus reference / mask / difference), the top-table
+// size byte, and the 4-byte padding of the stream header, returning the offset of the strip seed,
+// or (size_t)-1 if the header is truncated
 static size_t header_after_models(const uint8_t* stream, size_t length)
 {
     size_t pos = 0;
 
-    for (uint32_t i = 0; i < 9; ++i)
+    for (uint32_t i = 0; i < 17; ++i)
     {
         if (pos + 3 > length) return (size_t)-1;
         uint32_t num_symbols = stream[pos++] + 1;
@@ -675,6 +677,36 @@ TEST top_table_full_refine(void)
 }
 
 
+//---------------------------------------------------------------------------------------------------------------
+// Test 13: contextual color models. a quadratic green ramp makes every block's green delta take a
+// different value (delta of i*i is 2i+1 mod 64), sweeping the negative/positive context buckets on
+// both endpoints. a mismatch of the context selection between encoder and decoder (or histogram and
+// encode) would corrupt the stream, the round-trip must stay byte-exact
+TEST color_context(void)
+{
+    const uint32_t width = 256;
+    const uint32_t height = 256;
+    const uint32_t width_blocks = width / 4;
+    const uint32_t height_blocks = height / 4;
+    const uint32_t num_blocks = width_blocks * height_blocks;
+
+    bc1_block image[TEST_IMAGE_SIZE];
+    for (uint32_t i = 0; i < num_blocks; ++i)
+    {
+        image[i] = (bc1_block)
+        {
+            .color = {
+                pack_565((uint8_t)((i * 7) & 0x1F), (uint8_t)((i * i) & 0x3F), (uint8_t)((i * 3) & 0x1F)),
+                pack_565((uint8_t)((i * 11) & 0x1F), (uint8_t)((i * i * 3) & 0x3F), (uint8_t)((i * 5) & 0x1F))
+            },
+            .indices = 0
+        };
+    }
+
+    return roundtrip(image, width, height);
+}
+
+
 SUITE(suite_synthetic)
 {
     (void)flat;
@@ -688,6 +720,7 @@ SUITE(suite_synthetic)
     (void)top_table_empty_floor;
     (void)strip_predictor;
     (void)top_table_full_refine;
+    (void)color_context;
 
     RUN_TEST(flat);
     RUN_TEST(checkerboard);
@@ -701,4 +734,5 @@ SUITE(suite_synthetic)
     RUN_TEST(top_table_empty_floor);
     RUN_TEST(strip_predictor);
     RUN_TEST(top_table_full_refine);
+    RUN_TEST(color_context);
 }
