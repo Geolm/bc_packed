@@ -2,14 +2,14 @@
 
 An asymmetric lossless compressor for BC1 textures, designed for fast GPU decompression.
 
-The compressor works on a *packed* representation of BC1: 8 bytes per 4×4 block (two 16-bit 565 endpoint colors + one 32-bit word of 2-bit indices), half the size of the standard 16-byte BC1 block. At runtime, the compressed stream is uploaded to the GPU, decompressed with a compute shader, and written directly to standard BC1 texture memory. The resulting textures can then be sampled normally.
+The compressor works directly on a standard BC1 texture: 8 bytes per 4×4 block (two 16-bit 565 endpoint colors + one 32-bit word of 2-bit indices). At runtime, the compressed stream is uploaded to the GPU, decompressed with a compute shader, and written directly back to standard BC1 texture memory. The resulting textures can then be sampled normally.
 
 The compressor is CPU-side and can use significantly more computation than the decompressor.
 
 ## Design goals
 
 * Lossless.
-* Input is a packed BC1 texture (8 bytes per 4×4 block: two 565 endpoints + one 32-bit index word); Decompression output is also a standard BC1 texture (8 bytes per block).
+* Input is a standard BC1 texture (8 bytes per 4×4 block: two 565 endpoints + one 32-bit index word); decompression reconstructs the same standard format byte-exact.
 * GPU decompression only requires a compute shader.
 * The texture is split into 64 independent strips, one GPU thread decodes each strip, with no dependency between threads.
 * No CPU-side work is required at runtime.
@@ -51,6 +51,8 @@ as `q_escape` unary bits, a zero, then the full 8-bit rank as a raw byte. The es
 distribution, and the compressor searches `(k, q_escape)` jointly against the histogram to minimize the model's total bit count.
 When the histogram has no heavy tail, the chosen `q_escape` sits beyond the largest rank that occurs and the escape never fires.
 
+A near-uniform histogram makes Rice coding uneconomical. Such a model falls back to a raw fixed-width code: bit 7 of the `k` byte is set and its lower bits hold the code width, `ceil(log2(num_symbols))`, the number of bits written per symbol. The decoder mirrors this and reads that many bits back per symbol; `q_escape` is unused in this mode. A single-symbol model keeps the Rice path, as a 0-bit raw code would emit an empty payload.
+
 The rank table, the best `k`, and the best `q_escape` are generated during the first compression pass from the symbol histogram.
 
 ### Two passes
@@ -67,7 +69,7 @@ For example for a 1024x1024 texture : each thread will decode 256 blocks (in wid
 
 As the models are static, each thread just loads the same 17 models from the stream (`le_static_model_load`); the color context is derived from the current block's own decoded green delta, so there is no adaptive state to keep in sync between threads.
 
-As Rice encoding output is non-fixed, we stored in the stream 64 offsets (uint16_t), each a delta in dword units relative to the previous strip, so each thread knows where to start.
+As Rice encoding output is non-fixed, we stored in the stream 63 offsets (uint16_t), each a delta in dword units relative to the previous strip, so each thread knows where to start (strip 0 always starts the strip data, its implicit zero offset is not stored).
 
 ### Endpoints
 
@@ -150,7 +152,7 @@ Pseudo-description of the stream.
 
 Note : the stream does not include width, height or format, only the compressed data. This is intended, it's up to the user to store that somewhere.
 
-The output buffer must be at least `bc1_packed_maxsize(width, height)` bytes. This is a very rough bound: `(width/4) * (height/4) * 16`, i.e. the size of the standard raw BC1 texture (2× the packed input). In practice the stream is much smaller.
+The output buffer must be at least `bc1_packed_maxsize(width, height)` bytes. This is a very rough bound: `(width/4) * (height/4) * 16`, i.e. 2× the standard BC1 texture size. In practice the stream is much smaller.
 
 ```text
 * 17 static models, in order: for each endpoint (0, 1): red (3 context buckets), green, blue (3 context buckets) — 14 color models — then top-table reference, difference mask, table difference.
@@ -178,10 +180,11 @@ All symbols are encoded with Rice-Golomb using one of the 17 static models; each
 
 ## Status
 
-The stream matches the format documented above, and both `bc1_packed_compress` and `bc1_packed_decompress` are implemented. All 17 models are image-wide: one Rice `k` and one `q_escape` per model, no per-strip model state (a per-strip `k` for the mask model was prototyped and measured +0.03% — not adopted, the gain did not justify the added stream bytes and decoder state). The per-block color context (the three-bucket green delta) selects among the red/blue models; the color predictor flag (8 bytes in the header, see Per-strip predictor) selects between two predictors, it does not change any model.
+The stream matches the format documented above, and both `bc1_packed_compress` and `bc1_packed_decompress` are implemented. All 17 models are image-wide: one `k` (the Rice parameter, or the raw flag + width in raw mode, see Rice-Golomb model) and one `q_escape` per model, no per-strip model state. The per-block color context (the three-bucket green delta) selects among the red/blue models; the color predictor flag (8 bytes in the header, see Per-strip predictor) selects between two predictors, it does not change any model.
 
 The 17-model header is a breaking change against the previous 9-model format (exp 19 in `failed_experiments.md`): the GPU decoder must load 17 models and select the red/blue model by context. Measured on the 74-image suite: +1.0% stream size (74/74 images improved, worst +0.19%) at neutral CPU decompression throughput (ground.png 1024², 18 threads, ≈3065 → ≈2970 MiB/s, inside run-to-run noise).
 
+* Both `bc1_packed_compress` and `bc1_packed_decompress` require `width >= 16` and `height >= 256` (pixels, multiples of 4), i.e. at least 4x64 blocks: smaller textures are rejected (0 returned / false returned).
 * CPU decompression (`bc1_packed_decompress`) decodes one strip at a time; the unit tests decompress every strip and compare byte-exact against the input.
 * Unit tests (`tests/`) cover synthetic textures, a real-image roundtrip suite over `images/` (loaded with `stb_image.h`, converted with `stb_dxt.h` from `third_party/`, which the library itself does not depend on), and a multithreaded decompression benchmark.
 * Textures whose height in blocks is not a multiple of 64 (i.e. height not a multiple of 256) silently drop the trailing block rows.
@@ -192,15 +195,14 @@ The 17-model header is a breaking change against the previous 9-model format (ex
 Everything must be validated on CPU, on multiple images
 
 * Load a power-of-two image (third_party/stb_image.h)
-* Compress the image into standard BC1 (third_party/stb_dxt.h); this is the reference texture
-* Pack it into packed BC1 (8 bytes per 4×4 block)
-* bc1_packed_compress, store the output stream. 
-* Compute the compression ratio against the standard BC1 size
-* bc1_packed_decompress, compare the output, should be byte-exact with the packed input
+* Compress the image into standard BC1 (third_party/stb_dxt.h); this is both the input and the reference texture
+* bc1_packed_compress; per-image stats (ratio, model parameters, payload bytes) are logged as a CSV to `logs/`
+* Compute the compression ratio against the standard BC1 size (8 bytes per 4x4 block)
+* bc1_packed_decompress, compare the output, should be byte-exact with the input BC1
 * Gather total compression ratio
 * Proceed the next image
 
 
-To be interesting the ratio should be higher than 1.4x.
+To be interesting the ratio should be higher than 1.4x; the current 74-image suite averages ~1.46x.
 
 Compression is expected to be a lot slower than decompression.
