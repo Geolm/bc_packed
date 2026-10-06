@@ -35,10 +35,16 @@
 // Bitstream: a 64-bit reservoir buffers bits to keep I/O at byte granularity.
 // Each symbol is written as q = rank >> k unary ones, a zero, then k remainder bits; a rank
 // whose q reaches q_escape is written as q_escape unary bits, a zero, then the raw rank byte.
+//
+// A near-uniform histogram makes Rice uneconomical, so such a model falls back to a raw
+// fixed-width code: bit 7 of k is set and the lower bits hold ceil(log2(num_symbols)), the
+// number of bits written per symbol. The decoder mirrors this and reads that many bits back.
+// A single-symbol model keeps the Rice path, as a 0-bit raw code would emit an empty payload.
 //-----------------------------------------------------------------------------------------------------------------------------
 
 #define LE_ALPHABET_SIZE (256U)
 #define LE_MAX_K (8)
+#define LE_K_RAW (1 << 7)
 
 #ifdef _MSC_VER
     #pragma intrinsic(_BitScanForward64)
@@ -51,6 +57,20 @@
 #else
     #define le_ctz64(mask) (uint32_t)__builtin_ctzll(mask)
 #endif
+
+//-----------------------------------------------------------------------------------------------------------------------------
+// ceil(log2(n)) for n in [1, 256] (0 for n <= 1): the bit width of a fixed-width code for n symbols
+static inline uint8_t le_ceil_log2(uint32_t n)
+{
+    uint8_t bits = 0;
+    uint32_t value = 1;
+    while (value < n)
+    {
+        value <<= 1;
+        bits++;
+    }
+    return bits;
+}
 
 typedef enum le_status
 {
@@ -203,6 +223,25 @@ static inline uint8_t le_read_byte(le_stream* s)
 }
 
 //-----------------------------------------------------------------------------------------------------------------------------
+static inline uint8_t le_read_bits(le_stream* s, uint8_t num_bits)
+{
+    if (s->bits_available < num_bits)
+    {
+        le_refill(s);
+        if (s->bits_available < num_bits)
+        {
+            s->status = LE_BUFFER_OVERRUN;
+            return 0;
+        }
+    }
+
+    uint8_t value = (uint8_t)(s->bit_reservoir & ((1U << num_bits) - 1U));
+    s->bit_reservoir >>= num_bits;
+    s->bits_available -= num_bits;
+    return value;
+}
+
+//-----------------------------------------------------------------------------------------------------------------------------
 // Builds a static model from a histogram: sorts symbols by frequency (most frequent first,
 // ties broken by the lower symbol), then searches (k, q_escape) jointly to minimize the
 // model's total bit count. With q_escape = Q, every rank with q = rank >> k >= Q is written
@@ -217,11 +256,13 @@ static inline void le_static_model_init(le_model *model, const uint32_t* histogr
         uint32_t count;
     } le_sym_freq;
 
+    uint32_t total_count = 0;
     le_sym_freq freq_table[LE_ALPHABET_SIZE];
     for (uint32_t i = 0; i < LE_ALPHABET_SIZE; ++i)
     {
         freq_table[i].symbol = (uint8_t)i;
         freq_table[i].count = (i < num_symbols && histogram) ? histogram[i] : 0;
+        total_count += freq_table[i].count;
     }
 
     for (uint32_t i = 1; i < LE_ALPHABET_SIZE; ++i)
@@ -300,8 +341,23 @@ static inline void le_static_model_init(le_model *model, const uint32_t* histogr
         i++;
     
     model->num_symbols = (uint16_t)i;
-    model->k = best_k;
-    model->q_escape = best_q_escape;
+
+    // a near-uniform histogram is cheaper with a raw fixed-width code: every symbol costs
+    // ceil(log2(num_symbols)) bits, which beats the best Rice code found above in that case.
+    // flag it in bit 7 of k and store the bit width in the lower bits. a single-symbol model
+    // is excluded: its raw cost is 0 bits, which would emit an empty payload and break the
+    // stream's strict length invariant, so it keeps the (lossless) 1-bit Rice path.
+    uint8_t raw_bits = le_ceil_log2(model->num_symbols);
+    if ((model->num_symbols > 1) && (min_total_bits > (uint64_t)raw_bits * total_count))
+    {
+        model->k = (uint8_t)(LE_K_RAW | raw_bits);
+        model->q_escape = 0;
+    }
+    else
+    {
+        model->k = best_k;
+        model->q_escape = best_q_escape;
+    }
 }
 
 //-----------------------------------------------------------------------------------------------------------------------------
@@ -377,17 +433,29 @@ static inline uint8_t rice_decode(le_stream *s, uint8_t k, uint8_t q_escape)
 
 //-----------------------------------------------------------------------------------------------------------------------------
 // Encodes [value] by its rank in the model: a static model never changes, so the rank is the symbol.
+// In raw mode (bit 7 of k) the rank is written as a fixed-width bit field, otherwise with Rice.
 static inline void le_encode_symbol(le_stream *s, le_model *model, uint8_t value)
 {
     uint32_t index = model->index[value];
-    rice_encode(s, index, model->k, model->q_escape);
+
+    if (model->k & LE_K_RAW)
+        le_write_bits(s, index, (uint8_t)(model->k & 0x7f));
+    else
+        rice_encode(s, index, model->k, model->q_escape);
 }
 
 //-----------------------------------------------------------------------------------------------------------------------------
-// Decodes one symbol: read the rank, then map it back through the rank table.
-static inline uint8_t le_decode_symbol(le_stream *restrict s, le_model *restrict model) 
+// Decodes one symbol: read the rank (fixed-width in raw mode, otherwise Rice), then map it back
+// through the rank table.
+static inline uint8_t le_decode_symbol(le_stream *restrict s, le_model *restrict model)
 {
-    uint8_t index = rice_decode(s, model->k, model->q_escape);
+    uint8_t index;
+
+    if (model->k & LE_K_RAW)
+        index = le_read_bits(s, (uint8_t)(model->k & 0x7f));
+    else
+        index = rice_decode(s, model->k, model->q_escape);
+
     return model->alphabet[index];
 }
 
@@ -1057,8 +1125,9 @@ static inline bool load_static_model(le_model* model, byte_stream* stream)
     uint8_t k = stream->buffer[stream->pos++];
     uint8_t q_escape = stream->buffer[stream->pos++];
 
-    if (k > LE_MAX_K)
-        k = LE_MAX_K; 
+    // k stores the raw-mode flag in bit 7 and a width / Rice parameter (<= LE_MAX_K) in the lower bits
+    if ((k & 0x7f) > LE_MAX_K)
+        k = (uint8_t)((k & 0x80) | LE_MAX_K);
 
     if (stream->pos + num_symbols > stream->length)
         return false;
