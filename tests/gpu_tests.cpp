@@ -192,21 +192,26 @@ TEST metal_gpu_decompression(void)
     free(source);
 
     //-------------------------------------------------------------------------------------------------------------------------
-    // upload the compressed stream, allocate the output buffer for the decoded BC1 blocks
-    MTL::Buffer* stream_buffer = device->newBuffer((NS::UInteger)compressed_length, MTL::ResourceStorageModeShared);
+    // upload the compressed stream (tiled GPU_DECODE_RUNS times so each run reads a distinct
+    // region), allocate the output buffer for all runs
+    const size_t total_input_size = compressed_length * (size_t)GPU_DECODE_RUNS;
+    MTL::Buffer* stream_buffer = device->newBuffer((NS::UInteger)total_input_size, MTL::ResourceStorageModeShared);
     ASSERT(stream_buffer != nullptr);
-    ASSERT(stream_buffer->length() == (NS::UInteger)compressed_length);
-    memcpy(stream_buffer->contents(), compressed, compressed_length);
-    stream_buffer->didModifyRange(NS::Range(0, (NS::UInteger)compressed_length));
+    ASSERT(stream_buffer->length() == (NS::UInteger)total_input_size);
+    uint8_t* stream_contents = (uint8_t*)stream_buffer->contents();
+    for (int run = 0; run < GPU_DECODE_RUNS; ++run)
+        memcpy(stream_contents + run * compressed_length, compressed, compressed_length);
+    stream_buffer->didModifyRange(NS::Range(0, (NS::UInteger)total_input_size));
 
-    MTL::Buffer* output_buffer = device->newBuffer((NS::UInteger)image_size, MTL::ResourceStorageModeShared);
+    const size_t total_output_size = image_size * (size_t)GPU_DECODE_RUNS;
+    MTL::Buffer* output_buffer = device->newBuffer((NS::UInteger)total_output_size, MTL::ResourceStorageModeShared);
     ASSERT(output_buffer != nullptr);
-    ASSERT(output_buffer->length() == (NS::UInteger)image_size);
+    ASSERT(output_buffer->length() == (NS::UInteger)total_output_size);
 
     //-------------------------------------------------------------------------------------------------------------------------
-    // dispatch one thread per strip, repeated GPU_DECODE_RUNS times in the Y dimension:
-    // the kernel only reads the x component of thread_position_in_grid, so each Y row
-    // re-decodes the full texture into the same output buffer (idempotent, same input)
+    // dispatch: 64 threads (one per strip) x GPU_DECODE_RUNS runs in the Y dimension.
+    // each Y row offsets both input and output by run_id, so every run reads from and
+    // writes to a distinct memory region, exercising DRAM bandwidth
     MTL::CommandBuffer* command_buffer = queue->commandBuffer();
     ASSERT(command_buffer != nullptr);
 
@@ -229,8 +234,8 @@ TEST metal_gpu_decompression(void)
     const double gpu_ms = (command_buffer->GPUEndTime() - command_buffer->GPUStartTime()) * 1000.0;
 
     //-------------------------------------------------------------------------------------------------------------------------
-    // read the output back from the shared memory and compare it block by block
-    // against the original BC1 texture
+    // read the first run's output (at offset 0) and compare it block by block
+    // against the original BC1 texture; all runs produce identical data
     uint8_t* gpu_bc1 = (uint8_t*)malloc(image_size);
     ASSERT(gpu_bc1 != nullptr);
     memcpy(gpu_bc1, output_buffer->contents(), image_size);

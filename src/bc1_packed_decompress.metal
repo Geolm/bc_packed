@@ -222,18 +222,25 @@ void write_block(device uint8_t* output, uint block_index, uint16_t color0, uint
 kernel void bc1_packed_decompress(const device uint8_t* input [[buffer(0)]],
                                   device uint8_t* output [[buffer(1)]],
                                   constant bc1_decode_args_t& args [[buffer(2)]],
-                                  uint strip_id [[thread_position_in_grid]])
+                                  uint3 grid_pos [[thread_position_in_grid]])
 {
-    if (strip_id >= BC1_NUM_STRIPS)
+    if (grid_pos.x >= BC1_NUM_STRIPS)
         return;
 
     if ((args.width < 16) || (args.height < 256))
         return;
 
+    const uint strip_id = grid_pos.x;
     const uint height_blocks = args.height / 4;
     const uint width_blocks = args.width / 4;
     const uint strip_width = height_blocks / BC1_NUM_STRIPS;
     const uint64_t length = args.input_length;
+
+    // offset both input and output by run_id so each run reads from and writes to
+    // a distinct memory region, exercising DRAM bandwidth instead of staying in L2
+    const uint64_t image_size = (uint64_t)width_blocks * (uint64_t)height_blocks * 8;
+    input += (uint64_t)grid_pos.y * length;
+    output += (uint64_t)grid_pos.y * image_size;
 
     //-------------------------------------------------------------------------------------------------------------------------
     // load the static models: contextual red/blue per endpoint (3 contexts each) + one uncontexted
@@ -332,7 +339,7 @@ kernel void bc1_packed_decompress(const device uint8_t* input [[buffer(0)]],
     const uint start_y = strip_id * strip_width;
 
     // the output is read back for the top prediction: the two endpoint colors of a block are packed in one u32
-    const device uint32_t* output_colors32 = (const device uint32_t*)output;
+    const device uint32_t* output_colors32 = (const device uint32_t*)output; // already offset by run_id
 
     for (uint y = start_y; y < start_y + strip_width; ++y)
     {
