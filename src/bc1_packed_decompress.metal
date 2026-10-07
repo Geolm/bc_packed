@@ -113,13 +113,13 @@ uint8_t rice_decode(thread bit_stream_t* s, uint32_t k, uint32_t q_escape)
         bs_refill(s);
 
     // count the consecutive ones from the LSB: the index of the first zero. bit 63 is force
-    // set in the mask so the count can never run past the 64-bit word (clz = count leading zeros)
+    // set in the mask so the count can never run past the 64-bit word (ctz = count trailing zeros)
     uint64_t mask = ~s->bit_reservoir | (((uint64_t)1) << 63);
     uint32_t lo = (uint32_t)mask;
     uint32_t hi = (uint32_t)(mask >> 32);
 
-    uint32_t q = (lo != 0) ? ((uint32_t)31u - (uint32_t)clz((int)lo))
-                           : ((uint32_t)63u - (uint32_t)clz((int)hi));
+    // MSL has no 64-bit ctz: count in the low half, or 32 + the high half if the low half is all ones
+    uint32_t q = (lo != 0) ? (uint32_t)ctz((int)lo) : ((uint32_t)32u + (uint32_t)ctz((int)hi));
 
     if (q >= q_escape)
     {
