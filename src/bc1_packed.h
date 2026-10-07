@@ -2,6 +2,10 @@
 #define BC1_PACKED
 
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
@@ -73,6 +77,10 @@ void bc1_packed_get_stats(bc1_packed_context* ctx, bc1_packed_stats* stats);
 //      [strip_index]   index of the strip, must be [0; BC1_PACKED_NUM_STRIPS[
 // Returns false on error otherwise true
 bool bc1_packed_decompress(bc1_packed_context* ctx, const void* input, size_t input_length, uint32_t width, uint32_t height, void* output, uint32_t strip_index);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif
 
