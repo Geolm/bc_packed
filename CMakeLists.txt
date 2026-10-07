@@ -25,6 +25,21 @@ add_executable(unit_tests
 
 target_include_directories(unit_tests PRIVATE ./src ./third_party)
 
+if(APPLE)
+    # Metal is only available on Apple platforms, so the GPU tests are macOS-only.
+    # Exposed to the C runner via a compile definition.
+    target_compile_definitions(unit_tests PRIVATE HAS_GPU_TESTS)
+    # The .cpp is compiled as C++17 (CMake drives C++ sources with CXX_STANDARD).
+    set_property(TARGET unit_tests PROPERTY CXX_STANDARD 17)
+    # Mirror the C warning flags for C++, minus the C-only diagnostics
+    # (-Wstrict-prototypes, -Wgnu-empty-initializer have no C++ meaning).
+    target_compile_options(unit_tests PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-Wpedantic -Werror -Wall -Wextra -Wnewline-eof>)
+    # The vendored Metal.hpp uses anonymous structs, which trip -Wgnu-anonymous-struct.
+    set_property(SOURCE ./tests/gpu_tests.cpp PROPERTY COMPILE_OPTIONS -Wno-gnu-anonymous-struct)
+    target_sources(unit_tests PRIVATE ./tests/gpu_tests.cpp)
+    target_link_libraries(unit_tests PRIVATE "-framework Metal" "-framework Foundation")
+endif()
+
 if(UNIX AND NOT APPLE)
     target_link_libraries(test m)
 endif()

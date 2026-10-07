@@ -12,6 +12,10 @@ void suite_synthetic(void);
 void suite_image(void);
 void suite_benchmark(void);
 
+#ifdef HAS_GPU_TESTS
+void suite_gpu(void);
+#endif
+
 
 // Define the test runner's main() and greatest internals.
 GREATEST_MAIN_DEFS();
@@ -27,6 +31,9 @@ int main(int argc, char **argv)
     RUN_SUITE(suite_synthetic);
     RUN_SUITE(suite_image);
     RUN_SUITE(suite_benchmark);
+#ifdef HAS_GPU_TESTS
+    RUN_SUITE(suite_gpu);
+#endif
     GREATEST_MAIN_END();
     return EXIT_SUCCESS;
 }
