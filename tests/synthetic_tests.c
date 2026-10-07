@@ -219,8 +219,10 @@ TEST stats_constant_image(void)
     // constant indices match the top-table entry exactly -> no residual byte is written
     ASSERT_EQ(stats.difference_bytes, 0);
 
-    // 6 color delta symbols per block, each at least 1 bit
-    ASSERT(stats.colors_bytes >= (6 * num_blocks) / 8);
+    // at least 1 bit per block: an enabled strip writes the 1-bit dictionary flag (a matched block's
+    // flag + reference replaces the six deltas), a disabled strip writes the six deltas, six symbols
+    // of at least 1 bit each, so the floor holds for either per-strip decision
+    ASSERT(stats.colors_bytes >= num_blocks / 8);
 
     // 1 reference and 1 mask symbol per block, each at least 1 bit
     ASSERT(stats.reference_bytes >= num_blocks / 8);
@@ -357,6 +359,24 @@ static bool read_header_predictor(const uint8_t* stream, size_t length, uint64_t
     *predictor = 0;
     for (uint32_t j = 0; j < 8; ++j)
         *predictor |= (uint64_t)stream[pos + j] << (j * 8);
+    return true;
+}
+
+//-----------------------------------------------------------------------------------------------------------------------------
+// reads the 8 bytes of per-strip color-pair dictionary enable flags from the stream header, they
+// follow the strip predictor word (bit s = 1 → strip s writes the 1-bit dictionary flag + reference
+// per block; 0 → the six color deltas only, no flag)
+static bool read_header_dict_enable(const uint8_t* stream, size_t length, uint64_t* enable)
+{
+    size_t pos = header_after_models(stream, length);
+    if (pos == (size_t)-1) return false;
+
+    if (pos + 4 + 8 + 8 > length) return false;
+    pos += 4 + 8; // strip seed + predictor
+
+    *enable = 0;
+    for (uint32_t j = 0; j < 8; ++j)
+        *enable |= (uint64_t)stream[pos + j] << (j * 8);
     return true;
 }
 
@@ -707,6 +727,129 @@ TEST color_context(void)
 }
 
 
+//---------------------------------------------------------------------------------------------------------------
+// Test 14: the color-pair dictionary. the two endpoint colors cycle through eight distinct values
+// along the zigzag chain (period 8 divides the 64-block row width, so it is period 8 in the chain
+// too): every block after the first seven exactly matches the block eight back, exercising the
+// variable-width reference. an encoder/decoder disagreement on the flag or the reference width would
+// desynchronise the stream and corrupt the round-trip, which must stay byte-exact
+TEST color_dict_repeat(void)
+{
+    const uint32_t width = 256;
+    const uint32_t height = 256;
+    const uint32_t num_blocks = (width / 4) * (height / 4);
+
+    bc1_block image[TEST_IMAGE_SIZE];
+    for (uint32_t i = 0; i < num_blocks; ++i)
+    {
+        uint32_t t = i & 7; // period 8 in the zigzag chain
+
+        image[i] = (bc1_block)
+        {
+            .color = {
+                pack_565((uint8_t)((t * 3) & 0x1F), (uint8_t)((t * 5) & 0x3F), (uint8_t)((t * 2) & 0x1F)),
+                pack_565((uint8_t)((t * 4 + 1) & 0x1F), (uint8_t)((t * 6 + 2) & 0x3F), (uint8_t)((t * 2 + 3) & 0x1F))
+            },
+            .indices = 0x2B2B2B2Bu
+        };
+    }
+
+    return roundtrip(image, width, height);
+}
+
+
+//---------------------------------------------------------------------------------------------------------------
+// Test 15: the per-strip dictionary enable. the top half of the image cycles through eight
+// endpoint colors (every block matches the one eight back, those strips must enable the dictionary),
+// the bottom half uses all-distinct color pairs (a splitmix32 state is a 32-bit permutation of the block
+// index, so no pair repeats; those strips must stay disabled and pay zero flag overhead). the enable
+// word is read back from the stream header, the round-trip must stay byte-exact, and the colors
+// payload must pay at least the 1-bit flag of the enabled strips and the six deltas of the disabled
+// ones, 32 of 64 strips of each kind for 3.5 bits per block on average
+TEST color_dict_per_strip(void)
+{
+    const uint32_t width = 256;
+    const uint32_t height = 256;
+    const uint32_t width_blocks = width / 4;
+    const uint32_t height_blocks = height / 4;
+    const uint32_t num_blocks = width_blocks * height_blocks;
+
+    bc1_block image[TEST_IMAGE_SIZE];
+    uint32_t rng_state = 0x4286F4A7u;
+
+    for (uint32_t i = 0; i < num_blocks; ++i)
+    {
+        const uint32_t y = i / width_blocks;
+        uint16_t c0, c1;
+
+        if (y < height_blocks / 2)
+        {
+            // period 8 in the zigzag chain: the 64-block row width is a multiple of 8, like color_dict_repeat
+            const uint32_t t = i & 7;
+
+            c0 = pack_565((uint8_t)((t * 3) & 0x1F), (uint8_t)((t * 5) & 0x3F), (uint8_t)((t * 2) & 0x1F));
+            c1 = pack_565((uint8_t)((t * 4 + 1) & 0x1F), (uint8_t)((t * 6 + 2) & 0x3F), (uint8_t)((t * 2 + 3) & 0x1F));
+        }
+        else
+        {
+            // all-distinct endpoint color pairs: the two 16-bit colors are the two halves of a permutation
+            const uint32_t t = splitmix32(&rng_state);
+
+            c0 = (uint16_t)t;
+            c1 = (uint16_t)(t >> 16);
+        }
+
+        image[i] = (bc1_block)
+        {
+            .color = { c0, c1 },
+            .indices = 0x11111111u
+        };
+    }
+
+    bc1_packed_context* ctx = bc1_packed_init(NULL);
+    ASSERT(ctx != NULL);
+
+    size_t compressed_buffer_size = bc1_packed_maxsize(width, height);
+    uint8_t* compressed_buffer = malloc(compressed_buffer_size);
+    ASSERT(compressed_buffer != NULL);
+
+    size_t stream_size = bc1_packed_compress(ctx, image, width, height, compressed_buffer, compressed_buffer_size);
+    ASSERT(stream_size != 0);
+
+    // the 32 periodic strips must enable the dictionary, the 32 match-free strips must not
+    uint64_t enable = 0;
+    ASSERT(read_header_dict_enable(compressed_buffer, stream_size, &enable));
+    ASSERT_EQ(enable, 0x00000000FFFFFFFFull);
+
+    // every block pays at least its 1-bit flag (enabled strips) or its six deltas (disabled strips)
+    bc1_packed_stats stats;
+    bc1_packed_get_stats(ctx, &stats);
+    ASSERT(stats.colors_bytes >= (7 * num_blocks) / 16);
+
+    bc1_block* decompressed = malloc(num_blocks * sizeof(bc1_block));
+    ASSERT(decompressed != NULL);
+
+    for (uint32_t i = 0; i < BC1_PACKED_NUM_STRIPS; ++i)
+    {
+        ASSERT(bc1_packed_decompress(ctx, compressed_buffer, stream_size, width, height, decompressed, i));
+    }
+
+    for (uint32_t i = 0; i < num_blocks; ++i)
+    {
+        ASSERT_EQ(decompressed[i].color[0], image[i].color[0]);
+        ASSERT_EQ(decompressed[i].color[1], image[i].color[1]);
+        ASSERT_EQ(decompressed[i].indices, image[i].indices);
+    }
+
+    bc1_packed_terminate(ctx);
+
+    free(compressed_buffer);
+    free(decompressed);
+
+    PASS();
+}
+
+
 SUITE(suite_synthetic)
 {
     (void)flat;
@@ -721,6 +864,8 @@ SUITE(suite_synthetic)
     (void)strip_predictor;
     (void)top_table_full_refine;
     (void)color_context;
+    (void)color_dict_repeat;
+    (void)color_dict_per_strip;
 
     RUN_TEST(flat);
     RUN_TEST(checkerboard);
@@ -735,4 +880,6 @@ SUITE(suite_synthetic)
     RUN_TEST(strip_predictor);
     RUN_TEST(top_table_full_refine);
     RUN_TEST(color_context);
+    RUN_TEST(color_dict_repeat);
+    RUN_TEST(color_dict_per_strip);
 }

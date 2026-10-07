@@ -42,6 +42,7 @@ Rice `k` and rank table per endpoint fits better. Kept.
 | 16 | 512-entry top table (9-bit raw-Rice reference, format v2) | offline study; difference −6.86% but reference + mask + doubled header net out to +1.41% on the index payload | n/a (est. ≈+0.9% stream, 2/74 win) | not adopted — more centroids buy nothing; lever closed |
 | 17 | Per-row color predictor (1 bit/row, the open-thread lead of exp 9/11) | offline study; same color symbols as per-strip, only the flag word differs — a loss on 74/74 | n/a (+0.16…+0.70%, 0/74 win) | not adopted — per-strip (exp 11) is already optimal; lead closed |
 | 18 | Per-model raw-byte `q_escape` for static models, searched jointly with the Rice `k` against the histogram (replaces the fixed per-k escape table; one header byte per model) | round-trips; colors −1.19%, 74/74 improved, worst +0.01% | **1.4438:1** (+0.52%) | **kept — this is the new baseline** |
+| 20 | Color-pair sliding dictionary: a 1-bit flag + a `ceil(log2(min(pos,256)))`-bit reference to a matching block within the last 256 replaces the six color deltas when the two endpoint colors exactly repeat, plus a per-strip enable flag | round-trips (CPU + GPU); forced version was a net loss (25 improved / 44 regressed), the per-strip version: 44 improved / 5 regressed / 25 flat, the flat ones byte-identical to the baseline | 1.4587 → 1.4654 (+0.46%) avg; 1.4020 → 1.4073 (+0.38%) byte-weighted; best +2.95% (wall2), worst −0.14% (kodim15) | **kept — this is the new baseline** (the per-strip flag turns the forced-match net loss into a net win) |
 
 ---
 
@@ -889,6 +890,74 @@ If kept: new baseline 1.4583 / 1.4151, stream format v2. The leftover size vs th
 (≈0.76%) is the price of dropping the green contexts and halving the buckets; the remaining
 tuning knobs are the bucket boundaries (3 is a first guess) and, if the user ever wants the
 size back, re-adding a green context measured per symbol.
+
+---
+
+## 20. Color-pair sliding dictionary (format v3)
+
+**Idea (user-requested):** endpoint colors repeat on many textures, so instead of always deltaing
+both endpoints against the color predictor, keep a sliding dictionary of the last 256 endpoint-color
+*pairs* of the strip's zigzag chain (a 32-bit entry = the two 565 colors packed, one ring buffer per
+strip, `color_dict`). Before each block's deltas, write one flag bit:
+- 1 + a reference (the distance to the most recent exact match, minus one, in
+  `ceil(log2(min(position, 256)))` bits — 0 bits for the first block, 8 bits once the window is full;
+  "be smart with bits": the 4th block references at most 3 back → 2 bits) → skip the six color-delta
+  symbols. The decoder reads the flag, and on 1 reads the reference and copies the two colors of the
+  referenced, already-decoded block.
+- 0 → the six color-delta symbols as before.
+
+The match is decided on the *decoded* colors only, so it is identical on the compressor and the
+decompressor and independent of the color predictor (a matched block still emits its indices). The
+color models are fit on the deltas of the *non-matched* blocks (the histogram skips matched blocks),
+the ones actually emitted. Mirrored in the CPU decoder and the Metal kernel (a 256-entry `dict[256]`
+thread-local ring; the decoder only *reads* the referenced slot, never scans, so it stays cheap).
+
+**Result of the forced version (match on any exact hit, 74-image suite, 16/16 tests incl. the CPU + GPU
+round-trip):** average ratio **1.4587 → 1.4552 (−0.24%)**; byte-weighted **1.4020 → 1.3945 (−0.53%)**;
+**25 improved / 44 regressed / 5 flat**. Structured content **wins** (wall2 +2.95%, Wood_04 +2.59%,
+Wood_03 +2.27%, rustywall3 +2.06%, wall3 +1.46%, woodplanks2 +1.36%); feature-rich content **loses**
+(grass −1.73%, drygrass −1.74%, sand −1.80%, rock02/04 −1.82%, sky −1.53%, bricks −1.44%) — colors
+are mostly *unique*, so almost no block matches and the unavoidable 1-bit-per-block flag dominates. The
+win is real but concentrated in a minority of structured textures; the price is paid on *every* block of
+*every* image, which made the forced version a net loss.
+
+**Refinement 1, implemented (user-approved): the per-strip enable flag.** One bit per strip in the stream
+header (8 bytes, after the predictor word): a strip pays one flag bit per block when enabled, so it is
+enabled exactly when the total savings of its matched blocks — the six color deltas they would emit
+(priced with `le_symbol_cost` on the provisional models) minus the reference they pay — exceed the
+per-block flag cost (`savings > num_blocks`, tie → disabled). Disabled strips write exactly the six
+color-delta symbols with no flag: **byte-identical to the dictionary-less format, zero overhead**.
+
+This requires a two-pass model fit (losslessness: the color models' rank tables must contain every
+symbol the encoder emits, and a disabled strip emits *all* its deltas while an enabled strip emits only
+the non-matched ones): the provisional models (fit on every block's deltas) price the per-strip
+decision, then the final color models are refit on the deltas that are actually emitted — every block
+of the disabled strips, the non-matched blocks of the enabled ones. The decision is a one-time
+approximation (it prices deltas with the provisional models) but is stored in the header and read back
+by encoder and decoder alike, so the stream stays lossless. Compression cost: two extra block walks in
+`init_static_models` (provisional histogram, decision); the index histogram and the VQ nearest search
+are unchanged.
+
+**Final result (74-image suite, 18/18 tests pass incl. the CPU + GPU round-trip):**
+- average ratio **1.4587 → 1.4654 (+0.46%)**; byte-weighted **1.4020 → 1.4073 (+0.38%)**.
+- **44 improved / 5 regressed / 25 flat** — the flat images are byte-identical to the baseline (every
+  strip disabled), the 44-image regression of the forced version is closed. Best +2.95% (wall2),
+  Wood_04 +2.57%, Wood_03 +2.26%, rustywall3 +2.05%; worst −0.14% (kodim15), the rest of the 5
+  regressions ≤ 0.02% (the 8-byte header on near break-even strips).
+- CPU decompression neutral (ground.png benchmark, inside run-to-run noise); the GPU kernel keeps the
+  256-entry thread-local ring and only skips the flag read on disabled strips, so GPU throughput is
+  unchanged.
+
+Regression tests: `color_dict_repeat` (all strips enabled, period-8 colors, variable-width reference)
+and `color_dict_per_strip` (top half periodic → the 32 low enable bits set, bottom half all-distinct
+→ the 32 high bits clear; pins the enable word, the 1-bit/6-delta payload floor, and the round-trip).
+The `stats_constant_image` colors floor is the 1-bit flag per block: it holds for either per-strip
+decision (a disabled strip's six deltas are six symbols of ≥ 1 bit each).
+
+**Kept — this is the new baseline.** Remaining refinement (not implemented, small expected value):
+*cost-aware match* — emit the reference only when `1 + ref_bits < ` the six deltas' actual bit cost,
+otherwise emit the six deltas; it would trim the few remaining cases where a match is more expensive
+than the deltas inside an enabled strip.
 
 ---
 

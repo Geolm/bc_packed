@@ -25,6 +25,21 @@
 
 
 //-----------------------------------------------------------------------------------------------------------------------------
+// ceil(log2(n)) for n in [1, 256] (0 for n <= 1): the bit width of a fixed-width code for n symbols
+static inline uint8_t le_ceil_log2(uint32_t n)
+{
+    uint8_t bits = 0;
+    uint32_t value = 1;
+    while (value < n)
+    {
+        value <<= 1;
+        bits++;
+    }
+    return bits;
+}
+
+
+//-----------------------------------------------------------------------------------------------------------------------------
 // Static Rice-Golomb entropy coder, inlined from the lite_encoding library.
 //
 // Every model is static: the rank table, the Rice parameter k, and the raw-byte escape
@@ -57,20 +72,6 @@
 #else
     #define le_ctz64(mask) (uint32_t)__builtin_ctzll(mask)
 #endif
-
-//-----------------------------------------------------------------------------------------------------------------------------
-// ceil(log2(n)) for n in [1, 256] (0 for n <= 1): the bit width of a fixed-width code for n symbols
-static inline uint8_t le_ceil_log2(uint32_t n)
-{
-    uint8_t bits = 0;
-    uint32_t value = 1;
-    while (value < n)
-    {
-        value <<= 1;
-        bits++;
-    }
-    return bits;
-}
 
 typedef enum le_status
 {
@@ -459,6 +460,23 @@ static inline uint8_t le_decode_symbol(le_stream *restrict s, le_model *restrict
     return model->alphabet[index];
 }
 
+//-----------------------------------------------------------------------------------------------------------------------------
+// Bit cost that le_encode_symbol would write for [value] without writing it: a fixed field in raw
+// mode, otherwise the Rice cost (a rank whose q reached q_escape costs the escape bits + a raw byte)
+static inline uint32_t le_symbol_cost(const le_model* model, uint8_t value)
+{
+    uint32_t index = model->index[value];
+
+    if (model->k & LE_K_RAW)
+        return model->k & 0x7f;
+
+    uint32_t q = index >> model->k;
+    if (q >= model->q_escape)
+        return model->q_escape + 1 + 8;
+
+    return q + 1 + model->k;
+}
+
 
 //-----------------------------------------------------------------------------------------------------------------------------
 // Constants
@@ -471,6 +489,12 @@ static inline uint8_t le_decode_symbol(le_stream *restrict s, le_model *restrict
 
 // contextual color models: number of context buckets on the (6-bit) green delta, see color_delta_context
 #define COLOR_DELTA_CONTEXTS    (3)
+
+// sliding dictionary of endpoint color pairs: a block whose two endpoint colors exactly match one of
+// the previous COLOR_DICT_SIZE blocks of its zigzag chain is written as a 1-bit flag + a reference
+// to that block, instead of the six color-delta symbols (see color_dict_match / color_ref_bits)
+#define COLOR_DICT_SIZE         (256U)
+#define COLOR_DICT_MASK         (COLOR_DICT_SIZE - 1U)
 
 
 //-----------------------------------------------------------------------------------------------------------------------------
@@ -505,6 +529,12 @@ struct bc1_packed_context
     // scanline; 0 → zigzag-previous block. the first scanline of every strip is always predicted from the
     // strip seed via the zigzag chain, as there is no previous row within the strip
     uint64_t strip_predictor;
+
+    // per-strip color-pair dictionary: bit s = 1 → strip s writes the 1-bit flag + reference / delta
+    // choice per block; 0 → the block colors are always the six deltas (no flag), i.e. the baseline.
+    // a strip enables the dictionary only when it saves bits overall, so feature-rich strips (few
+    // matching blocks) pay no flag overhead. see the per-strip dictionary enable in init_static_models
+    uint64_t strip_dict_enable;
 
     // bit counters of the range-coded payload, per component
     uint64_t colors_bits, reference_bits, mask_bits, difference_bits;
@@ -574,6 +604,69 @@ static inline void unpack_strip_seed(uint32_t seed, bc1_block* previous)
 }
 
 //----------------------------------------------------------------------------------------------------------------------------
+// packs a block's two endpoint colors into one uint32: color[0] in the low word, color[1] in the high
+// word — the same layout as the strip seed, so a color pair is a single comparable/storable value
+static inline uint32_t color_pair(const bc1_block* b)
+{
+    return ((uint32_t)b->color[1] << 16) | (uint32_t)b->color[0];
+}
+
+//----------------------------------------------------------------------------------------------------------------------------
+// unpacks a packed color pair (see color_pair) into a block's two endpoint colors
+static inline void unpack_color_pair(uint32_t pair, uint16_t* c0, uint16_t* c1)
+{
+    *c0 = (uint16_t)pair;
+    *c1 = (uint16_t)(pair >> 16);
+}
+
+//----------------------------------------------------------------------------------------------------------------------------
+// sliding dictionary of the last COLOR_DICT_SIZE endpoint color pairs of a strip's zigzag chain.
+// a fixed-size ring buffer keyed by chain position: block [p] owns slot [p & COLOR_DICT_MASK], so the
+// most recent COLOR_DICT_SIZE blocks are always the live window. the caller clears it once per strip.
+typedef struct color_dict
+{
+    uint32_t entry[COLOR_DICT_SIZE];
+} color_dict;
+
+//----------------------------------------------------------------------------------------------------------------------------
+// searches the dictionary for an exact match of [pair] among the [position] previous blocks of the
+// chain (at most COLOR_DICT_SIZE of them): returns the distance in blocks to the most recent match
+// (1 = the immediately previous block, up to min(position, COLOR_DICT_SIZE)), or 0 if there is none.
+// [dict] must hold the color pairs of chain positions [max(0, position - COLOR_DICT_SIZE) .. position - 1].
+static inline uint32_t color_dict_match(const color_dict* dict, uint32_t position, uint32_t pair)
+{
+    uint32_t limit = (position < COLOR_DICT_SIZE) ? position : COLOR_DICT_SIZE;
+
+    for (uint32_t back = 1; back <= limit; ++back)
+    {
+        if (dict->entry[(position - back) & COLOR_DICT_MASK] == pair)
+            return back;
+    }
+
+    return 0;
+}
+
+//----------------------------------------------------------------------------------------------------------------------------
+// number of bits to store a dictionary reference of the block at chain position [position]: the
+// reference is the distance minus one, in [0, limit - 1] with limit = min(position, COLOR_DICT_SIZE),
+// so it needs ceil(log2(limit)) bits (0 for the first block, 8 once the window is full)
+static inline uint8_t color_ref_bits(uint32_t position)
+{
+    uint32_t limit = (position < COLOR_DICT_SIZE) ? position : COLOR_DICT_SIZE;
+    return le_ceil_log2(limit);
+}
+
+//----------------------------------------------------------------------------------------------------------------------------
+// Histogram of the six color-delta symbols: one bucket per (endpoint, context) model, mirroring
+// the layout of the models themselves (14 models of 2^COLOR_DELTA_NUM_BITS symbols)
+typedef struct color_hists
+{
+    uint32_t red[2][COLOR_DELTA_CONTEXTS][1<<COLOR_DELTA_NUM_BITS];
+    uint32_t green[2][1<<COLOR_DELTA_NUM_BITS];
+    uint32_t blue[2][COLOR_DELTA_CONTEXTS][1<<COLOR_DELTA_NUM_BITS];
+} color_hists;
+
+//----------------------------------------------------------------------------------------------------------------------------
 // branchless absolute value (arithmetic shift: mask is -1 for a negative, 0 otherwise)
 static inline uint32_t abs32(int v)
 {
@@ -624,6 +717,92 @@ static inline uint8_t color_delta_context(int dgreen)
     if (dgreen > 0)
         return 1;
     return 2;
+}
+
+//----------------------------------------------------------------------------------------------------------------------------
+// Bit cost of the six color-delta symbols [current] would emit against [reference] with the
+// current color models: the same symbols the encoder writes per block, priced without writing
+// them. used by the per-strip color-pair dictionary decision, which weighs the deltas of a
+// matched block against the flag + reference they are replaced by
+static inline uint32_t color_delta_cost(const bc1_packed_context* ctx, const bc1_block* current, const bc1_block* reference)
+{
+    uint32_t cost = 0;
+
+    for(uint32_t j=0; j<2; ++j)
+    {
+        uint8_t current_red, current_green, current_blue;
+        uint8_t reference_red, reference_green, reference_blue;
+
+        bc1_extract_565(current->color[j], &current_red, &current_green, &current_blue);
+        bc1_extract_565(reference->color[j], &reference_red, &reference_green, &reference_blue);
+
+        int dred = current_red - reference_red;
+        int dgreen = current_green - reference_green;
+        int dblue = current_blue - reference_blue;
+
+        cost += le_symbol_cost(&ctx->green_model[j], (uint8_t)(dgreen + COLOR_DELTA_OFFSET));
+
+        // the red/blue deltas scale with the endpoint's own green delta, bucket it before halving
+        uint8_t chroma_context = color_delta_context(dgreen);
+
+        dgreen /= 2;
+        dred -= dgreen;
+        dblue -= dgreen;
+
+        cost += le_symbol_cost(&ctx->red_model[j][chroma_context], (uint8_t)(dred + COLOR_DELTA_OFFSET));
+        cost += le_symbol_cost(&ctx->blue_model[j][chroma_context], (uint8_t)(dblue + COLOR_DELTA_OFFSET));
+    }
+
+    return cost;
+}
+
+//----------------------------------------------------------------------------------------------------------------------------
+// adds the six color-delta symbols of [current] against [reference] to [h]: the same symbols
+// the encoder writes per block, mirroring its delta computation
+static inline void color_hists_add(color_hists* h, const bc1_block* current, const bc1_block* reference)
+{
+    for(uint32_t j=0; j<2; ++j)
+    {
+        uint8_t current_red, current_green, current_blue;
+        uint8_t reference_red, reference_green, reference_blue;
+
+        bc1_extract_565(current->color[j], &current_red, &current_green, &current_blue);
+        bc1_extract_565(reference->color[j], &reference_red, &reference_green, &reference_blue);
+
+        int dred = current_red - reference_red;
+        int dgreen = current_green - reference_green;
+        int dblue = current_blue - reference_blue;
+
+        h->green[j][dgreen + COLOR_DELTA_OFFSET]++;
+
+        // the red/blue deltas scale with the endpoint's own green delta, bucket it before halving
+        uint8_t chroma_context = color_delta_context(dgreen);
+
+        dgreen /= 2;
+        dred -= dgreen;
+        dblue -= dgreen;
+
+        h->red[j][chroma_context][dred + COLOR_DELTA_OFFSET]++;
+        h->blue[j][chroma_context][dblue + COLOR_DELTA_OFFSET]++;
+    }
+}
+
+//----------------------------------------------------------------------------------------------------------------------------
+// subtracts [m] from [h]: every symbol of [m] was added to [h] as well, so no count underflows
+static inline void color_hists_sub(color_hists* h, const color_hists* m)
+{
+    for(uint32_t j=0; j<2; ++j)
+    {
+        for(uint32_t c=0; c<COLOR_DELTA_CONTEXTS; ++c)
+            for(uint32_t i=0; i<(1<<COLOR_DELTA_NUM_BITS); ++i)
+            {
+                h->red[j][c][i] -= m->red[j][c][i];
+                h->blue[j][c][i] -= m->blue[j][c][i];
+            }
+
+        for(uint32_t i=0; i<(1<<COLOR_DELTA_NUM_BITS); ++i)
+            h->green[j][i] -= m->green[j][i];
+    }
 }
 
 //----------------------------------------------------------------------------------------------------------------------------
@@ -932,18 +1111,31 @@ void build_top_table(hashmap_entry* hashmap, const void* input, uint32_t num_blo
 }
 
 //-----------------------------------------------------------------------------------------------------------------------------
+// fits the 14 color models (3 contextual red / blue per endpoint + 1 uncontexted green per endpoint)
+// from [hist]
+static inline void init_color_models(bc1_packed_context* ctx, const color_hists* hist)
+{
+    for(uint32_t j=0; j<2; ++j)
+    {
+        le_static_model_init(&ctx->green_model[j], hist->green[j], 1<<COLOR_DELTA_NUM_BITS);
+
+        for(uint32_t c=0; c<COLOR_DELTA_CONTEXTS; ++c)
+        {
+            le_static_model_init(&ctx->red_model[j][c], &hist->red[j][c][0], 1<<COLOR_DELTA_NUM_BITS);
+            le_static_model_init(&ctx->blue_model[j][c], &hist->blue[j][c][0], 1<<COLOR_DELTA_NUM_BITS);
+        }
+    }
+}
+
+//-----------------------------------------------------------------------------------------------------------------------------
 void init_static_models(bc1_packed_context* ctx, const void* input, uint32_t width_blocks, uint32_t strip_width)
 {
-    uint32_t hist_red[2][COLOR_DELTA_CONTEXTS][1<<COLOR_DELTA_NUM_BITS];
-    uint32_t hist_green[2][1<<COLOR_DELTA_NUM_BITS];
-    uint32_t hist_blue[2][COLOR_DELTA_CONTEXTS][1<<COLOR_DELTA_NUM_BITS];
+    color_hists hist;
     uint32_t hist_reference[TOP_TABLE_SIZE];
     uint32_t hist_mask[16];
     uint32_t hist_difference[LE_ALPHABET_SIZE];
 
-    memset(hist_red, 0, sizeof(hist_red));
-    memset(hist_green, 0, sizeof(hist_green));
-    memset(hist_blue, 0, sizeof(hist_blue));
+    memset(&hist, 0, sizeof(hist));
     memset(hist_reference, 0, sizeof(hist_reference));
     memset(hist_mask, 0, sizeof(hist_mask));
     memset(hist_difference, 0, sizeof(hist_difference));
@@ -1007,6 +1199,10 @@ void init_static_models(bc1_packed_context* ctx, const void* input, uint32_t wid
             ctx->strip_predictor |= (uint64_t)1 << strip_index;
     }
 
+    // provisional histogram: every block's color deltas, the dictionary not involved, plus the index
+    // symbols (the dictionary does not touch the indices). the color models fit on this pass price
+    // the matched blocks in the per-strip dictionary decision below, the final color models are
+    // refit on the deltas that are actually emitted after the decision
     for(uint32_t strip_index=0; strip_index<BC1_PACKED_NUM_STRIPS; ++strip_index)
     {
         bc1_block previous;
@@ -1023,36 +1219,13 @@ void init_static_models(bc1_packed_context* ctx, const void* input, uint32_t wid
 
                 const bc1_block* current = (const bc1_block*) input + (y * width_blocks) + zigzag_x;
 
-                // first scanline of a strip is always predicted from the seed via the zigzag-previous chain,
-                // after that a top-flagged strip is predicted from the row above, same zigzag position
+                // first scanline of a strip is always predicted from the seed via the zigzag-previous
+                // chain, after that a top-flagged strip is predicted from the row above, same zigzag position
                 const bc1_block* color_reference = &previous;
                 if (use_top && y > start_y)
                     color_reference = (const bc1_block*) input + (y - 1) * width_blocks + zigzag_x;
 
-                for(uint32_t j=0; j<2; ++j)
-                {
-                    uint8_t current_red, current_green, current_blue;
-                    uint8_t reference_red, reference_green, reference_blue;
-
-                    bc1_extract_565(current->color[j], &current_red, &current_green, &current_blue);
-                    bc1_extract_565(color_reference->color[j], &reference_red, &reference_green, &reference_blue);
-
-                    int dred = current_red - reference_red;
-                    int dgreen = current_green - reference_green;
-                    int dblue = current_blue - reference_blue;
-
-                    hist_green[j][dgreen + COLOR_DELTA_OFFSET]++;
-
-                    // the red/blue deltas scale with the endpoint's own green delta, bucket it before halving
-                    uint8_t chroma_context = color_delta_context(dgreen);
-
-                    dgreen /= 2;
-                    dred -= dgreen;
-                    dblue -= dgreen;
-
-                    hist_red[j][chroma_context][dred + COLOR_DELTA_OFFSET]++;
-                    hist_blue[j][chroma_context][dblue + COLOR_DELTA_OFFSET]++;
-                }
+                color_hists_add(&hist, current, color_reference);
 
                 uint8_t reference = nearest32(ctx->top_table, ctx->top_table_size, current->indices) & 0xff;
                 hist_reference[reference]++;
@@ -1075,21 +1248,72 @@ void init_static_models(bc1_packed_context* ctx, const void* input, uint32_t wid
         }
     }
 
-    for(uint32_t j=0; j<2; ++j)
-    {
-        le_static_model_init(&ctx->green_model[j], hist_green[j], 1<<COLOR_DELTA_NUM_BITS);
+    init_color_models(ctx, &hist);
 
-        for(uint32_t c=0; c<COLOR_DELTA_CONTEXTS; ++c)
+    // per-strip color-pair dictionary enable: an enabled strip pays one flag bit per block, so it
+    // wins only when the savings of its matched blocks, the six deltas they would emit minus the
+    // reference they pay, exceed that. the matched blocks of an enabled strip emit no deltas, so
+    // their deltas are subtracted from the histogram before the final color models are refit
+    ctx->strip_dict_enable = 0;
+    color_dict dict;
+    color_hists matched;
+    for(uint32_t strip_index=0; strip_index<BC1_PACKED_NUM_STRIPS; ++strip_index)
+    {
+        bc1_block previous;
+        unpack_strip_seed(ctx->strip_seed, &previous);
+        memset(&dict, 0, sizeof(dict));
+        memset(&matched, 0, sizeof(matched));
+        const bool use_top = ((ctx->strip_predictor >> strip_index) & 1) != 0;
+        uint32_t start_y = strip_index * strip_width;
+
+        int64_t savings = 0;
+        uint32_t num_blocks = 0;
+
+        for(uint32_t y = start_y; y < start_y + strip_width; ++y)
         {
-            le_static_model_init(&ctx->red_model[j][c], &hist_red[j][c][0], 1<<COLOR_DELTA_NUM_BITS);
-            le_static_model_init(&ctx->blue_model[j][c], &hist_blue[j][c][0], 1<<COLOR_DELTA_NUM_BITS);
+            for(uint32_t x = 0; x < width_blocks; ++x)
+            {
+                // zig-zag pattern delta compression for colors
+                uint32_t zigzag_x = (y&1) ? x : width_blocks - x - 1;
+
+                const bc1_block* current = (const bc1_block*) input + (y * width_blocks) + zigzag_x;
+                uint32_t position = (y - start_y) * width_blocks + x;
+
+                const bc1_block* color_reference = &previous;
+                if (use_top && y > start_y)
+                    color_reference = (const bc1_block*) input + (y - 1) * width_blocks + zigzag_x;
+
+                if (color_dict_match(&dict, position, color_pair(current)) > 0)
+                {
+                    // a match: the flag + reference replaces the six deltas, weigh the two
+                    savings += (int64_t)color_delta_cost(ctx, current, color_reference) - color_ref_bits(position);
+                    color_hists_add(&matched, current, color_reference);
+                }
+                else
+                    color_hists_add(&hist, current, color_reference);
+
+                dict.entry[position & COLOR_DICT_MASK] = color_pair(current);
+                previous = *current;
+                num_blocks++;
+            }
+        }
+
+        if (savings > num_blocks)
+        {
+            ctx->strip_dict_enable |= (uint64_t)1 << strip_index;
+            color_hists_sub(&hist, &matched);
         }
     }
+
+    // final color models: fit on the deltas that are actually emitted, every block of the disabled
+    // strips and the non-matched blocks of the enabled ones
+    init_color_models(ctx, &hist);
 
     le_static_model_init(&ctx->table_reference_model, hist_reference, TOP_TABLE_SIZE);
     le_static_model_init(&ctx->mask_model, hist_mask, 16);
     le_static_model_init(&ctx->table_difference_model, hist_difference, LE_ALPHABET_SIZE);
 }
+
 
 
 //-----------------------------------------------------------------------------------------------------------------------------
@@ -1237,8 +1461,8 @@ size_t bc1_packed_compress(bc1_packed_context* ctx, const void* bc1_image, uint3
     if (!save_static_model(&ctx->mask_model, &stream)) return 0;
     if (!save_static_model(&ctx->table_difference_model, &stream)) return 0;
 
-    // top-table + strip seed + predictor flags
-    if (stream.pos + 1 + 3 + sizeof(uint32_t) + 8 + ctx->top_table_size * sizeof(uint32_t) > stream.length)
+    // top-table + strip seed + predictor flags + dictionary enable flags
+    if (stream.pos + 1 + 3 + sizeof(uint32_t) + 8 + 8 + ctx->top_table_size * sizeof(uint32_t) > stream.length)
         return 0;
 
     stream.buffer[stream.pos++] = (uint8_t) (ctx->top_table_size - 1); // there is no zero toptable, so minus 1 to fit in a uint8_t
@@ -1249,6 +1473,9 @@ size_t bc1_packed_compress(bc1_packed_context* ctx, const void* bc1_image, uint3
 
     for(uint32_t j=0; j<8; ++j)
         stream.buffer[stream.pos++] = (uint8_t) ((ctx->strip_predictor >> (j*8)) & 0xff);
+
+    for(uint32_t j=0; j<8; ++j)
+        stream.buffer[stream.pos++] = (uint8_t) ((ctx->strip_dict_enable >> (j*8)) & 0xff);
 
     for(uint32_t i=0; i<ctx->top_table_size; ++i)
         for(uint32_t j=0; j<4; ++j)
@@ -1285,7 +1512,10 @@ size_t bc1_packed_compress(bc1_packed_context* ctx, const void* bc1_image, uint3
 
         bc1_block previous;
         unpack_strip_seed(ctx->strip_seed, &previous);
+        color_dict dict;
+        memset(&dict, 0, sizeof(dict));
         const bool use_top = ((ctx->strip_predictor >> strip_index) & 1) != 0;
+        const bool dict_enabled = ((ctx->strip_dict_enable >> strip_index) & 1) != 0;
         uint32_t start_y = strip_index * strip_width;
 
         for(uint32_t y = start_y; y < start_y + strip_width; ++y)
@@ -1296,35 +1526,51 @@ size_t bc1_packed_compress(bc1_packed_context* ctx, const void* bc1_image, uint3
                 uint32_t zigzag_x = (y&1) ? x : width_blocks - x - 1;
                 const bc1_block* current = (const bc1_block*) bc1_image + (y * width_blocks) + zigzag_x;
 
-                // first scanline of a strip is always predicted from the seed via the zigzag-previous chain,
-                // after that a top-flagged strip is predicted from the row above, same zigzag position
-                const bc1_block* color_reference = &previous;
-                if (use_top && y > start_y)
-                    color_reference = (const bc1_block*) bc1_image + (y - 1) * width_blocks + zigzag_x;
+                uint32_t position = (y - start_y) * width_blocks + x;
+                uint32_t pair = color_pair(current);
 
-                for(uint32_t j=0; j<2; ++j)
+                // a disabled strip never matches: no flag bit, the six color deltas go straight into the stream
+                uint32_t match = dict_enabled ? color_dict_match(&dict, position, pair) : 0;
+
+                // color payload: an enabled strip writes a 1-bit flag, then either a reference to the matching
+                // block (the six color-delta symbols are skipped) or the six deltas predicted from the color
+                // reference; a disabled strip writes the six deltas directly, no flag
+                if (dict_enabled)
+                    le_write_bits(&compressed_stream, match ? 1 : 0, 1);
+                if (match)
+                    le_write_bits(&compressed_stream, match - 1, color_ref_bits(position));
+                else
                 {
-                    uint8_t current_red, current_green, current_blue;
-                    uint8_t reference_red, reference_green, reference_blue;
+                    // first scanline of a strip is always predicted from the seed via the zigzag-previous
+                    // chain, after that a top-flagged strip is predicted from the row above, same zigzag position
+                    const bc1_block* color_reference = &previous;
+                    if (use_top && y > start_y)
+                        color_reference = (const bc1_block*) bc1_image + (y - 1) * width_blocks + zigzag_x;
 
-                    bc1_extract_565(current->color[j], &current_red, &current_green, &current_blue);
-                    bc1_extract_565(color_reference->color[j], &reference_red, &reference_green, &reference_blue);
+                    for(uint32_t j=0; j<2; ++j)
+                    {
+                        uint8_t current_red, current_green, current_blue;
+                        uint8_t reference_red, reference_green, reference_blue;
 
-                    int dred = current_red - reference_red;
-                    int dgreen = current_green - reference_green;
-                    int dblue = current_blue - reference_blue;
+                        bc1_extract_565(current->color[j], &current_red, &current_green, &current_blue);
+                        bc1_extract_565(color_reference->color[j], &reference_red, &reference_green, &reference_blue);
 
-                    le_encode_symbol(&compressed_stream, &ctx->green_model[j], dgreen + COLOR_DELTA_OFFSET);
+                        int dred = current_red - reference_red;
+                        int dgreen = current_green - reference_green;
+                        int dblue = current_blue - reference_blue;
 
-                    // the red/blue deltas scale with the endpoint's own green delta, bucket it before halving
-                    uint8_t chroma_context = color_delta_context(dgreen);
+                        le_encode_symbol(&compressed_stream, &ctx->green_model[j], dgreen + COLOR_DELTA_OFFSET);
 
-                    dgreen /= 2;
-                    dred -= dgreen;
-                    dblue -= dgreen;
+                        // the red/blue deltas scale with the endpoint's own green delta, bucket it before halving
+                        uint8_t chroma_context = color_delta_context(dgreen);
 
-                    le_encode_symbol(&compressed_stream, &ctx->red_model[j][chroma_context], dred + COLOR_DELTA_OFFSET);
-                    le_encode_symbol(&compressed_stream, &ctx->blue_model[j][chroma_context], dblue + COLOR_DELTA_OFFSET);
+                        dgreen /= 2;
+                        dred -= dgreen;
+                        dblue -= dgreen;
+
+                        le_encode_symbol(&compressed_stream, &ctx->red_model[j][chroma_context], dred + COLOR_DELTA_OFFSET);
+                        le_encode_symbol(&compressed_stream, &ctx->blue_model[j][chroma_context], dblue + COLOR_DELTA_OFFSET);
+                    }
                 }
                 stream_bits_since(&bit_pos, &compressed_stream, &ctx->colors_bits);
 
@@ -1348,6 +1594,7 @@ size_t bc1_packed_compress(bc1_packed_context* ctx, const void* bc1_image, uint3
                         le_encode_symbol(&compressed_stream, &ctx->table_difference_model, (difference >> (j*8)) & 0xff);
                 stream_bits_since(&bit_pos, &compressed_stream, &ctx->difference_bits);
 
+                dict.entry[position & COLOR_DICT_MASK] = pair;
                 previous = *current;
             }
         }
@@ -1399,7 +1646,7 @@ bool bc1_packed_decompress(bc1_packed_context* ctx, const void* input, size_t in
     ctx->top_table_size = (uint32_t)stream.buffer[stream.pos++] + 1;
     read_stream_align(&stream, sizeof(uint32_t));
 
-    if (stream.pos + sizeof(uint32_t) + 8 > stream.length)
+    if (stream.pos + sizeof(uint32_t) + 8 + 8 > stream.length)
         return false;
 
     ctx->strip_seed = 0;
@@ -1409,6 +1656,10 @@ bool bc1_packed_decompress(bc1_packed_context* ctx, const void* input, size_t in
     ctx->strip_predictor = 0;
     for(uint32_t j=0; j<8; ++j)
         ctx->strip_predictor |= (uint64_t)stream.buffer[stream.pos++] << (j*8);
+
+    ctx->strip_dict_enable = 0;
+    for(uint32_t j=0; j<8; ++j)
+        ctx->strip_dict_enable |= (uint64_t)stream.buffer[stream.pos++] << (j*8);
 
     for(uint32_t i=0; i<ctx->top_table_size; ++i)
     {
@@ -1444,7 +1695,10 @@ bool bc1_packed_decompress(bc1_packed_context* ctx, const void* input, size_t in
     
     bc1_block previous;
     unpack_strip_seed(ctx->strip_seed, &previous);
+    color_dict dict;
+    memset(&dict, 0, sizeof(dict));
     const bool use_top = ((ctx->strip_predictor >> strip_index) & 1) != 0;
+    const bool dict_enabled = ((ctx->strip_dict_enable >> strip_index) & 1) != 0;
     uint32_t start_y = strip_index * strip_width;
 
     for(uint32_t y = start_y; y < start_y + strip_width; ++y)
@@ -1454,36 +1708,51 @@ bool bc1_packed_decompress(bc1_packed_context* ctx, const void* input, size_t in
             uint32_t zigzag_x = (y&1) ? x : width_blocks - x - 1;
             bc1_block* current = (bc1_block*) output + (y * width_blocks) + zigzag_x;
 
-            // first scanline of a strip is always predicted from the seed via the zigzag-previous chain,
-            // after that a top-flagged strip is predicted from the row above, same zigzag position
-            const bc1_block* color_reference = &previous;
-            if (use_top && y > start_y)
-                color_reference = (const bc1_block*) output + (y - 1) * width_blocks + zigzag_x;
+            uint32_t position = (y - start_y) * width_blocks + x;
 
-            for(uint32_t j=0; j<2; ++j)
+            // color payload: an enabled strip writes a 1-bit flag, then either a dictionary reference
+            // (copy the two endpoint colors of the referenced block, skipping the six delta symbols)
+            // or the six deltas; a disabled strip writes the six deltas directly, no flag
+            uint8_t match = dict_enabled ? le_read_bits(&compressed_stream, 1) : 0;
+            if (match)
             {
-                uint8_t reference_red, reference_green, reference_blue;
-                bc1_extract_565(color_reference->color[j], &reference_red, &reference_green, &reference_blue);
+                uint8_t ref = le_read_bits(&compressed_stream, color_ref_bits(position));
+                uint32_t pair = dict.entry[(position - ref - 1) & COLOR_DICT_MASK];
+                unpack_color_pair(pair, &current->color[0], &current->color[1]);
+            }
+            else
+            {
+                // first scanline of a strip is always predicted from the seed via the zigzag-previous chain,
+                // after that a top-flagged strip is predicted from the row above, same zigzag position
+                const bc1_block* color_reference = &previous;
+                if (use_top && y > start_y)
+                    color_reference = (const bc1_block*) output + (y - 1) * width_blocks + zigzag_x;
 
-                uint8_t green_symbol = le_decode_symbol(&compressed_stream, &ctx->green_model[j]);
+                for(uint32_t j=0; j<2; ++j)
+                {
+                    uint8_t reference_red, reference_green, reference_blue;
+                    bc1_extract_565(color_reference->color[j], &reference_red, &reference_green, &reference_blue);
 
-                // red and blue delta are based on green delta
-                int dgreen_orig = (int)green_symbol - COLOR_DELTA_OFFSET;
-                uint8_t chroma_context = color_delta_context(dgreen_orig);
+                    uint8_t green_symbol = le_decode_symbol(&compressed_stream, &ctx->green_model[j]);
 
-                uint8_t delta_red = le_decode_symbol(&compressed_stream, &ctx->red_model[j][chroma_context]);
-                uint8_t delta_blue = le_decode_symbol(&compressed_stream, &ctx->blue_model[j][chroma_context]);
+                    // red and blue delta are based on green delta
+                    int dgreen_orig = (int)green_symbol - COLOR_DELTA_OFFSET;
+                    uint8_t chroma_context = color_delta_context(dgreen_orig);
 
-                int current_green_value = reference_green + dgreen_orig;
-                int dgreen_halved = dgreen_orig / 2;
+                    uint8_t delta_red = le_decode_symbol(&compressed_stream, &ctx->red_model[j][chroma_context]);
+                    uint8_t delta_blue = le_decode_symbol(&compressed_stream, &ctx->blue_model[j][chroma_context]);
 
-                int dred_orig = ((int)delta_red - COLOR_DELTA_OFFSET) + dgreen_halved;
-                int dblue_orig = ((int)delta_blue - COLOR_DELTA_OFFSET) + dgreen_halved;
+                    int current_green_value = reference_green + dgreen_orig;
+                    int dgreen_halved = dgreen_orig / 2;
 
-                int current_red_value = reference_red + dred_orig;
-                int current_blue_value = reference_blue + dblue_orig;
+                    int dred_orig = ((int)delta_red - COLOR_DELTA_OFFSET) + dgreen_halved;
+                    int dblue_orig = ((int)delta_blue - COLOR_DELTA_OFFSET) + dgreen_halved;
 
-                current->color[j] = bc1_pack_565((uint8_t)current_red_value, (uint8_t)current_green_value, (uint8_t)current_blue_value);
+                    int current_red_value = reference_red + dred_orig;
+                    int current_blue_value = reference_blue + dblue_orig;
+
+                    current->color[j] = bc1_pack_565((uint8_t)current_red_value, (uint8_t)current_green_value, (uint8_t)current_blue_value);
+                }
             }
             
             // indices difference with top table
@@ -1497,6 +1766,7 @@ bool bc1_packed_decompress(bc1_packed_context* ctx, const void* input, size_t in
 
             current->indices =  difference ^ ctx->top_table[reference];
 
+            dict.entry[position & COLOR_DICT_MASK] = color_pair(current);
             previous = *current;
         }
     }
