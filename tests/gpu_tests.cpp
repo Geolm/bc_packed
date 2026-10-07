@@ -25,6 +25,7 @@
 #define SHADER_FILE ("src/bc1_packed_decompress.metal")
 #define SHADER_FUNCTION ("bc1_packed_decompress")
 #define IMAGE_FILE ("images/brick1.png")
+#define GPU_DECODE_RUNS (1000)
 
 
 //-----------------------------------------------------------------------------------------------------------------------------
@@ -203,7 +204,9 @@ TEST metal_gpu_decompression(void)
     ASSERT(output_buffer->length() == (NS::UInteger)image_size);
 
     //-------------------------------------------------------------------------------------------------------------------------
-    // dispatch one thread per strip
+    // dispatch one thread per strip, repeated GPU_DECODE_RUNS times in the Y dimension:
+    // the kernel only reads the x component of thread_position_in_grid, so each Y row
+    // re-decodes the full texture into the same output buffer (idempotent, same input)
     MTL::CommandBuffer* command_buffer = queue->commandBuffer();
     ASSERT(command_buffer != nullptr);
 
@@ -215,13 +218,15 @@ TEST metal_gpu_decompression(void)
     encoder->setBytes(&args, sizeof(args), 2);
     encoder->setBuffer(stream_buffer, 0, 0);
     encoder->setBuffer(output_buffer, 0, 1);
-    encoder->dispatchThreads(MTL::Size(BC1_PACKED_NUM_STRIPS, 1, 1), MTL::Size(1, 1, 1));
+    encoder->dispatchThreads(MTL::Size(BC1_PACKED_NUM_STRIPS, GPU_DECODE_RUNS, 1), MTL::Size(1, 1, 1));
     encoder->endEncoding();
 
     command_buffer->commit();
     command_buffer->waitUntilCompleted();
     ASSERT(command_buffer->status() == MTL::CommandBufferStatusCompleted);
     ASSERT(command_buffer->error() == nullptr);
+
+    const double gpu_ms = (command_buffer->GPUEndTime() - command_buffer->GPUStartTime()) * 1000.0;
 
     //-------------------------------------------------------------------------------------------------------------------------
     // read the output back from the shared memory and compare it block by block
@@ -239,6 +244,12 @@ TEST metal_gpu_decompression(void)
         ASSERT_EQ(gpu_blocks[i].color[1], original_blocks[i].color[1]);
         ASSERT_EQ(gpu_blocks[i].indices, original_blocks[i].indices);
     }
+
+    //-------------------------------------------------------------------------------------------------------------------------
+    const double total_mib = (double)(image_size * GPU_DECODE_RUNS) / (1024.0 * 1024.0);
+    const double gpu_mib_per_s = (gpu_ms > 0.0) ? total_mib / (gpu_ms / 1000.0) : 0.0;
+
+    fprintf(stdout, "==> GPU : %d decompress runs in %.3f ms, %.1f MiB/s\n", GPU_DECODE_RUNS, gpu_ms, gpu_mib_per_s);
 
     //-------------------------------------------------------------------------------------------------------------------------
     // release everything
