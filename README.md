@@ -107,6 +107,23 @@ The compressor runs a pre-pass before the histogram and, for each strip, sums th
 
 Textures whose features follow the zigzag columns (e.g. plank scans) make the row-above predictor much cheaper, while most other textures keep the zigzag-previous one. On the 74-image test suite this moves the average ratio 1.41 → 1.43 (colors payload −2.7%), with 58/74 images improving and the worst single image at −0.01% (the 8-byte header overhead on an image where no strip switches). For GPU decompression the row-above predictor also removes the serial zigzag chain: every block after the first scanline depends only on the row above, so a whole row decodes in parallel.
 
+### Color-pair dictionary
+
+A sliding dictionary of the last 256 endpoint-color *pairs* of the strip's zigzag chain (one ring buffer per strip, 32-bit entry = the two 565 colors packed). For each block of a strip with the dictionary enabled, one flag bit is written before the deltas:
+
+* If the block's two endpoint colors exactly match one of the previous 256 blocks of the strip, the flag is 1 and a reference is written — the distance to the most recent match, minus one, in `ceil(log2(min(position, 256)))` bits (`position` is the block's 0-indexed position in the strip; 0 bits for the first block, 8 bits once the window is full). The six color-delta symbols are skipped: the decoder copies the two colors of the referenced, already-decoded block.
+* Otherwise the flag is 0 and the six color-delta symbols are written as described in Endpoints.
+
+The match is decided on the *decoded* colors only, so it is identical on the compressor and the decompressor and independent of the color predictor. A matched block still emits its top-table reference, mask, and difference bytes (the indices are not part of the color pair).
+
+#### Per-strip enable flag
+
+The flag bit is only as cheap as the matches it replaces, so each strip decides independently whether to use the dictionary: one bit per strip in the stream header (8 bytes, like the predictor flag). A strip pays one flag bit per block when enabled, so it is enabled exactly when the total savings of its matched blocks — the six color deltas they would emit minus the reference they pay — exceed that flag cost. The decision is made with the models fit on every block's deltas (a one-time approximation, stored in the header and read by both the encoder and the decoder, so it stays lossless).
+
+Disabled strips write exactly the six color-delta symbols with no flag: byte-identical to the dictionary-less format, zero overhead. This is a two-pass model fit: the final color models are refit on the deltas that are actually emitted — every block of the disabled strips, the non-matched blocks of the enabled ones.
+
+Measured on the 74-image test suite this turns the dictionary into a net win: average ratio 1.4587 → 1.4654, byte-weighted 1.4020 → 1.4073, with 44 images improving, 25 byte-identical, and 5 regressing at most 0.14% (8-byte header on near break-even strips). Structured content (wood, walls, planks) gains up to +2.95%; feature-rich content (grass, sand, rock) is left untouched. See `failed_experiments.md`, exp. 20.
+
 ### Indices
 
 BC1 contains a 32-bit index field for each block.
@@ -160,6 +177,7 @@ The output buffer must be at least `bc1_packed_maxsize(width, height)` bytes. Th
 * Top table size: one uint8_t (number of entries − 1), padded to a 4-byte boundary.
 * Strip seed: one uint32_t (little-endian) — the two endpoint colors of the "previous block" used to predict the first block of each strip, averaged over the 64 strips at compression time. Low 16 bits = color[0], high 16 bits = color[1].
 * Strip predictor flags: 8 bytes (little-endian uint64_t) — one bit per strip: 1 → endpoint colors of that strip are predicted from the row above (same zigzag position) after the first scanline, 0 → zigzag-previous block. See Per-strip predictor.
+* Strip dictionary enable flags: 8 bytes (little-endian uint64_t) — one bit per strip: 1 → the strip's blocks write the color-pair dictionary flag + reference per block, 0 → the six color deltas only (byte-identical to the dictionary-less format). See Per-strip enable flag.
 * Top table entries, 4 bytes each (little-endian uint32_t).
 * Padded to a 2-byte boundary.
 * 63 strip offsets (uint16_t each), relative deltas in dword units. Strip 0 always starts the strip data so its offset is zero and not stored; the k-th stored offset (k = 1..63) is the delta from strip k-1 to strip k in dword units.
@@ -170,17 +188,24 @@ The output buffer must be at least `bc1_packed_maxsize(width, height)` bytes. Th
 Within a strip, the blocks are traversed in the zigzag row order. For each block:
 
 ```text
+* For a strip with the dictionary enabled: the color-pair dictionary flag (1 bit): 1 if the block's two endpoint
+  colors exactly match a previous block of the strip, 0 otherwise.
+  * If 1: a reference to the matching block — the distance minus one, in ceil(log2(min(position, 256))) bits,
+    where position is the block's 0-indexed position in the strip (0 bits for the first block, 8 bits once 256
+    blocks back are reachable). The six color-delta symbols are skipped.
+  * If 0: the six color deltas, as below.
+* For a strip with the dictionary disabled: no flag.
 * Two endpoints, each: green, red, blue deltas (7-bit values offset by 64).
 * Top-table reference (8-bit index).
 * Difference mask (4 bits).
 * One difference byte per set mask bit.
 ```
 
-All symbols are encoded with Rice-Golomb using one of the 17 static models; each red/blue uses the model of its (channel, endpoint, context) — the three-bucket green delta described in Endpoints — and each green uses its endpoint's uncontexted model.
+See Color-pair dictionary. The six color deltas, the top-table reference, the mask, and the difference bytes are all encoded with Rice-Golomb using one of the 17 static models; each red/blue uses the model of its (channel, endpoint, context) — the three-bucket green delta described in Endpoints — and each green uses its endpoint's uncontexted model. The dictionary flag and reference are raw bits, not Rice-Golomb symbols.
 
 ## Status
 
-The stream matches the format documented above, and both `bc1_packed_compress` and `bc1_packed_decompress` are implemented. All 17 models are image-wide: one `k` (the Rice parameter, or the raw flag + width in raw mode, see Rice-Golomb model) and one `q_escape` per model, no per-strip model state. The per-block color context (the three-bucket green delta) selects among the red/blue models; the color predictor flag (8 bytes in the header, see Per-strip predictor) selects between two predictors, it does not change any model.
+The stream matches the format documented above, and both `bc1_packed_compress` and `bc1_packed_decompress` are implemented. All 17 models are image-wide: one `k` (the Rice parameter, or the raw flag + width in raw mode, see Rice-Golomb model) and one `q_escape` per model, no per-strip model state. The per-block color context (the three-bucket green delta) selects among the red/blue models; the color predictor flag (8 bytes in the header, see Per-strip predictor) selects between two predictors, it does not change any model. The color-pair dictionary (see Color-pair dictionary) adds a 1-bit flag + a variable-width reference per block of the enabled strips (the per-strip enable word, 8 header bytes); it is a breaking change against the previous format — both the CPU and the GPU decoders must read the enable word, the flag, and the reference.
 
 The 17-model header is a breaking change against the previous 9-model format (exp 19 in `failed_experiments.md`): the GPU decoder must load 17 models and select the red/blue model by context. Measured on the 74-image suite: +1.0% stream size (74/74 images improved, worst +0.19%) at neutral CPU decompression throughput (ground.png 1024², 18 threads, ≈3065 → ≈2970 MiB/s, inside run-to-run noise).
 
@@ -203,6 +228,6 @@ Everything must be validated on CPU, on multiple images
 * Proceed the next image
 
 
-To be interesting the ratio should be higher than 1.4x; the current 74-image suite averages ~1.46x.
+To be interesting the ratio should be higher than 1.4x; the current 74-image suite averages ~1.46x without the color-pair dictionary and ~1.455x with it (the dictionary is a net win on structured textures and a small loss on feature-rich ones; see `failed_experiments.md`).
 
-Compression is expected to be a lot slower than decompression.
+Compression is expected to be a lot slower than decompression (the compressor scans the 256-entry color-pair dictionary of the previous blocks for every block).

@@ -20,7 +20,7 @@
 // buffer(2): constant bc1_decode_args_t
 //
 // The stream layout parsed here mirrors bc1_packed_compress / bc1_packed_decompress:
-//   [17 static models][top table size u8][4-align][strip seed u32][strip predictor u64]
+//   [17 static models][top table size u8][4-align][strip seed u32][strip predictor u64][strip dict enable u64]
 //   [top table u32s][2-align][63 strip offsets u16, deltas in dword units][4-align][strip bitstreams]
 //
 // On a corrupted stream the decode runs to completion and the output is garbage, mirroring the
@@ -160,6 +160,22 @@ uint8_t decode_symbol(thread bit_stream_t* s, const thread model_t* m)
     return m->alphabet[index];
 }
 
+// number of bits to store a color-pair dictionary reference of the block at chain position [position]:
+// the reference is the distance minus one in [0, limit - 1] with limit = min(position, 256), so it
+// needs ceil(log2(limit)) bits (0 for the first block, 8 once the window of 256 is full)
+uint32_t color_ref_bits(uint32_t position)
+{
+    uint32_t limit = (position < 256) ? position : 256;
+    uint32_t bits = 0;
+    uint32_t value = 1;
+    while (value < limit)
+    {
+        value <<= 1;
+        bits++;
+    }
+    return bits;
+}
+
 //-----------------------------------------------------------------------------------------------------------------------------
 // mirror of load_static_model / le_static_model_load
 bool load_model(const device uint8_t* input, uint64_t length, thread uint64_t* pos, thread model_t* m)
@@ -278,7 +294,7 @@ kernel void bc1_packed_decompress(const device uint8_t* input [[buffer(0)]],
     uint top_table_size = input[pos++] + 1;
     pos = (pos + 3) & ~(uint64_t)3; // 4-byte align
 
-    if (pos + 12 > length)
+    if (pos + 20 > length)
         return;
 
     const device uint32_t* input32 = (const device uint32_t*)input;
@@ -288,6 +304,10 @@ kernel void bc1_packed_decompress(const device uint8_t* input [[buffer(0)]],
 
     // the predictor is 8 bytes but only 4-aligned right after the seed, so read it as two u32
     uint64_t strip_predictor = ((uint64_t)input32[(pos >> 2) + 1] << 32) | (uint64_t)input32[pos >> 2];
+    pos += 8;
+
+    // same for the per-strip color-pair dictionary enable word
+    uint64_t strip_dict_enable = ((uint64_t)input32[(pos >> 2) + 1] << 32) | (uint64_t)input32[pos >> 2];
     pos += 8;
 
     uint32_t top_table[TOP_TABLE_SIZE];
@@ -336,10 +356,17 @@ kernel void bc1_packed_decompress(const device uint8_t* input [[buffer(0)]],
     uint16_t previous_color0 = (uint16_t)strip_seed;
     uint16_t previous_color1 = (uint16_t)(strip_seed >> 16);
     const bool use_top = ((strip_predictor >> strip_id) & 1) != 0;
+    const bool dict_enabled = ((strip_dict_enable >> strip_id) & 1) != 0;
     const uint start_y = strip_id * strip_width;
 
     // the output is read back for the top prediction: the two endpoint colors of a block are packed in one u32
     const device uint32_t* output_colors32 = (const device uint32_t*)output; // already offset by run_id
+
+    // thread-local sliding dictionary of the last 256 decoded endpoint color pairs of the zigzag chain:
+    // a fixed ring buffer keyed by chain position (mirrors COLOR_DICT_SIZE in src/bc1_packed.c)
+    uint32_t dict[256];
+    for (uint i = 0; i < 256; ++i)
+        dict[i] = 0;
 
     for (uint y = start_y; y < start_y + strip_width; ++y)
     {
@@ -347,51 +374,66 @@ kernel void bc1_packed_decompress(const device uint8_t* input [[buffer(0)]],
         {
             uint zigzag_x = (y & 1) ? x : width_blocks - x - 1;
             uint block_index = y * width_blocks + zigzag_x;
-
-            // first scanline of a strip is always predicted from the seed via the zigzag-previous chain,
-            // after that a top-flagged strip is predicted from the row above, same zigzag position
-            uint16_t reference_color0 = previous_color0;
-            uint16_t reference_color1 = previous_color1;
-
-            if (use_top && y > start_y)
-            {
-                uint32_t previous_colors = output_colors32[((uint64_t)(y - 1) * width_blocks + zigzag_x) * 2];
-                reference_color0 = (uint16_t)previous_colors;
-                reference_color1 = (uint16_t)(previous_colors >> 16);
-            }
+            uint position = (y - start_y) * width_blocks + x;
 
             uint16_t current_color0 = 0;
             uint16_t current_color1 = 0;
 
-            for (uint j = 0; j < 2; ++j)
+            // color payload: an enabled strip writes a 1-bit flag, then either a dictionary reference
+            // (copy the two endpoint colors of the referenced block, skipping the six delta symbols)
+            // or the six deltas; a disabled strip writes the six deltas directly, no flag
+            uint8_t match = dict_enabled ? bs_read_bits(&compressed_stream, 1) : 0;
+            if (match)
             {
-                uint16_t reference_color = (j == 0) ? reference_color0 : reference_color1;
+                uint8_t ref = bs_read_bits(&compressed_stream, color_ref_bits(position));
+                uint32_t pair = dict[(position - ref - 1) & 255];
+                current_color0 = (uint16_t)pair;
+                current_color1 = (uint16_t)(pair >> 16);
+            }
+            else
+            {
+                // first scanline of a strip is always predicted from the seed via the zigzag-previous chain,
+                // after that a top-flagged strip is predicted from the row above, same zigzag position
+                uint16_t reference_color0 = previous_color0;
+                uint16_t reference_color1 = previous_color1;
 
-                uint8_t reference_red = (uint8_t)((reference_color >> 11) & 0x1F);
-                uint8_t reference_green = (uint8_t)((reference_color >> 5) & 0x3F);
-                uint8_t reference_blue = (uint8_t)(reference_color & 0x1F);
+                if (use_top && y > start_y)
+                {
+                    uint32_t previous_colors = output_colors32[((uint64_t)(y - 1) * width_blocks + zigzag_x) * 2];
+                    reference_color0 = (uint16_t)previous_colors;
+                    reference_color1 = (uint16_t)(previous_colors >> 16);
+                }
 
-                uint8_t green_symbol = decode_symbol(&compressed_stream, &green[j]);
+                for (uint j = 0; j < 2; ++j)
+                {
+                    uint16_t reference_color = (j == 0) ? reference_color0 : reference_color1;
 
-                // red and blue delta are based on green delta
-                int dgreen_orig = (int)green_symbol - COLOR_DELTA_OFFSET;
-                uint8_t chroma_context = (dgreen_orig < 0) ? 0 : ((dgreen_orig > 0) ? 1 : 2);
+                    uint8_t reference_red = (uint8_t)((reference_color >> 11) & 0x1F);
+                    uint8_t reference_green = (uint8_t)((reference_color >> 5) & 0x3F);
+                    uint8_t reference_blue = (uint8_t)(reference_color & 0x1F);
 
-                uint8_t delta_red = decode_symbol(&compressed_stream, &red[j * 3 + chroma_context]);
-                uint8_t delta_blue = decode_symbol(&compressed_stream, &blue[j * 3 + chroma_context]);
+                    uint8_t green_symbol = decode_symbol(&compressed_stream, &green[j]);
 
-                int dgreen_halved = dgreen_orig / 2;
+                    // red and blue delta are based on green delta
+                    int dgreen_orig = (int)green_symbol - COLOR_DELTA_OFFSET;
+                    uint8_t chroma_context = (dgreen_orig < 0) ? 0 : ((dgreen_orig > 0) ? 1 : 2);
 
-                int current_red = (int)reference_red + ((int)delta_red - COLOR_DELTA_OFFSET) + dgreen_halved;
-                int current_green = (int)reference_green + dgreen_orig;
-                int current_blue = (int)reference_blue + ((int)delta_blue - COLOR_DELTA_OFFSET) + dgreen_halved;
+                    uint8_t delta_red = decode_symbol(&compressed_stream, &red[j * 3 + chroma_context]);
+                    uint8_t delta_blue = decode_symbol(&compressed_stream, &blue[j * 3 + chroma_context]);
 
-                uint16_t current_color = (uint16_t)(((current_red & 0x1F) << 11) | ((current_green & 0x3F) << 5) | (current_blue & 0x1F));
+                    int dgreen_halved = dgreen_orig / 2;
 
-                if (j == 0)
-                    current_color0 = current_color;
-                else
-                    current_color1 = current_color;
+                    int current_red = (int)reference_red + ((int)delta_red - COLOR_DELTA_OFFSET) + dgreen_halved;
+                    int current_green = (int)reference_green + dgreen_orig;
+                    int current_blue = (int)reference_blue + ((int)delta_blue - COLOR_DELTA_OFFSET) + dgreen_halved;
+
+                    uint16_t current_color = (uint16_t)(((current_red & 0x1F) << 11) | ((current_green & 0x3F) << 5) | (current_blue & 0x1F));
+
+                    if (j == 0)
+                        current_color0 = current_color;
+                    else
+                        current_color1 = current_color;
+                }
             }
 
             // indices difference with top table
@@ -406,6 +448,8 @@ kernel void bc1_packed_decompress(const device uint8_t* input [[buffer(0)]],
             uint32_t indices = difference ^ top_table[reference];
 
             write_block(output, block_index, current_color0, current_color1, indices);
+
+            dict[position & 255] = ((uint32_t)current_color1 << 16) | (uint32_t)current_color0;
 
             // the previous block of the zigzag chain becomes the block just decoded
             previous_color0 = current_color0;
