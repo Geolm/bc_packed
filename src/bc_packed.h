@@ -10,8 +10,6 @@ extern "C" {
 #include <stddef.h>
 #include <stdbool.h>
 
-#define BCP_NUM_STRIPS              (64)
-
 
 //----------------------------------------------------------------------------------------------------------------------------
 // Memory interface, used for the large working buffers of the compressor.
@@ -57,8 +55,9 @@ size_t packed_bc1_maxsize(uint32_t width, uint32_t height);
 
 //----------------------------------------------------------------------------------------------------------------------------
 // Compresses a BC1 texture (width x height pixels, must be a multiple of 4) into [output].
+// [num_strips] receives the number of strips used for the compressed stream.
 // Returns the size of the compressed stream in bytes, or 0 on failure.
-size_t bcp_compress_bc1(bcp_context* ctx, const void* bc1_image, uint32_t width, uint32_t height, uint8_t* output, size_t output_length);
+size_t bcp_compress_bc1(bcp_context* ctx, const void* bc1_image, uint32_t width, uint32_t height, uint8_t* output, size_t output_length, uint32_t* num_strips);
 
 //----------------------------------------------------------------------------------------------------------------------------
 // Extracts statistics after compression
@@ -68,15 +67,16 @@ void bcp_get_stats(bcp_context* ctx, bcp_stats* stats);
 
 //----------------------------------------------------------------------------------------------------------------------------
 // CPU decompression, for unit tests and validation.
-// 
-// Decompress one strip of the image, for a complete image this function should be called BCP_NUM_STRIPS times
+//
+// Decompress one strip of the image, for a complete image this function should be called [num_strips] times
 //      [input]         compressed data (output of bcp_compress_bc1)
 //      [input_length]  size in byte of the compressed data
 //      [width, height] dimensions of the output BC1 image
+//      [num_strips]    number of strips, as returned by bcp_compress_bc1
 //      [output]        must be big enough to contain a BC1 image of width x height
-//      [strip_index]   index of the strip, must be [0; BCP_NUM_STRIPS[
+//      [strip_index]   index of the strip, must be in [0; num_strips[
 // Returns false on error otherwise true
-bool bcp_decompress_bc1(bcp_context* ctx, const void* input, size_t input_length, uint32_t width, uint32_t height, void* output, uint32_t strip_index);
+bool bcp_decompress_bc1(bcp_context* ctx, const void* input, size_t input_length, uint32_t width, uint32_t height, uint32_t num_strips, void* output, uint32_t strip_index);
 
 #ifdef __cplusplus
 }

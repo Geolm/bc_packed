@@ -5,6 +5,10 @@
 #include "bc_packed.h"
 #include <stdlib.h>
 
+// number of strips the compressor currently uses; kept here for tests that
+// build image patterns with a fixed strip count before calling the API
+#define BCP_NUM_STRIPS (64)
+
 //-----------------------------------------------------------------------------------------------------------------------------
 typedef struct bc1_block
 {

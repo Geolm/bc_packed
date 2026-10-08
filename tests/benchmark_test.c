@@ -42,7 +42,7 @@ typedef struct bench_args
     const uint8_t* compressed;
     size_t compressed_size;
     uint8_t* output;
-    uint32_t width, height;
+    uint32_t width, height, num_strips;
 } bench_args;
 
 static void bench_decompress_task(void* pArg, struct scheduler* s, struct sched_task_partition partition, sched_uint thread_num)
@@ -51,7 +51,7 @@ static void bench_decompress_task(void* pArg, struct scheduler* s, struct sched_
     bench_args* args = (bench_args*)pArg;
     for (uint32_t strip = partition.start; strip < partition.end; ++strip)
     {
-        if (!bcp_decompress_bc1(args->ctxs[thread_num], args->compressed, args->compressed_size, args->width, args->height, args->output, strip))
+        if (!bcp_decompress_bc1(args->ctxs[thread_num], args->compressed, args->compressed_size, args->width, args->height, args->num_strips, args->output, strip))
             args->failures[thread_num] = 1;
     }
 }
@@ -104,7 +104,8 @@ TEST benchmark_ground_decompression(void)
     const size_t max_stream_size = packed_bc1_maxsize(bench_width, bench_height);
     uint8_t* compressed = malloc(max_stream_size);
     ASSERT(compressed != NULL);
-    const size_t compressed_size = bcp_compress_bc1(compress_ctx, original_bc1, bench_width, bench_height, compressed, max_stream_size);
+    uint32_t num_strips = 0;
+    const size_t compressed_size = bcp_compress_bc1(compress_ctx, original_bc1, bench_width, bench_height, compressed, max_stream_size, &num_strips);
     ASSERT(compressed_size != 0);
     ASSERT(compressed_size <= max_stream_size);
 
@@ -138,6 +139,7 @@ TEST benchmark_ground_decompression(void)
     args.output = decompressed;
     args.width = bench_width;
     args.height = bench_height;
+    args.num_strips = num_strips;
 
     struct sched_task task;
 
@@ -146,7 +148,7 @@ TEST benchmark_ground_decompression(void)
     const uint64_t start = stm_now();
     for (int run = 0; run < BENCH_DECOMPRESS_RUNS; ++run)
     {
-        scheduler_add(&sched, &task, bench_decompress_task, &args, BCP_NUM_STRIPS, 1);
+        scheduler_add(&sched, &task, bench_decompress_task, &args, num_strips, 1);
         scheduler_join(&sched, &task);
     }
     const double seconds = stm_sec(stm_now() - start);

@@ -140,7 +140,8 @@ TEST metal_gpu_decompression(void)
     uint8_t* compressed = (uint8_t*)malloc(compressed_size);
     ASSERT(compressed != nullptr);
 
-    size_t compressed_length = bcp_compress_bc1(ctx, original_bc1, width, height, compressed, compressed_size);
+    uint32_t num_strips = 0;
+    size_t compressed_length = bcp_compress_bc1(ctx, original_bc1, width, height, compressed, compressed_size, &num_strips);
     ASSERT(compressed_length != 0);
     ASSERT(compressed_length <= compressed_size);
 
@@ -224,7 +225,7 @@ TEST metal_gpu_decompression(void)
     encoder->setBytes(&args, sizeof(args), 2);
     encoder->setBuffer(stream_buffer, 0, 0);
     encoder->setBuffer(output_buffer, 0, 1);
-    encoder->dispatchThreads(MTL::Size(BCP_NUM_STRIPS, GPU_DECODE_RUNS, 1), MTL::Size(1, 1, 1));
+    encoder->dispatchThreads(MTL::Size(num_strips, GPU_DECODE_RUNS, 1), MTL::Size(1, 1, 1));
     encoder->endEncoding();
 
     command_buffer->commit();

@@ -108,7 +108,8 @@ TEST test_all_images_in_folder(const char *dir_path)
         }
 
         // compress the bc1 image
-        size_t compressed_buffer_length = bcp_compress_bc1(ctx, original_bc1, width, height, compressed_buffer, compressed_buffer_size);
+        uint32_t num_strips = 0;
+        size_t compressed_buffer_length = bcp_compress_bc1(ctx, original_bc1, width, height, compressed_buffer, compressed_buffer_size, &num_strips);
         ASSERT(compressed_buffer_length != 0);
         ASSERT(compressed_buffer_length <= compressed_buffer_size);
 
@@ -130,9 +131,9 @@ TEST test_all_images_in_folder(const char *dir_path)
         num_images++;
 
         // roundtrip test
-        for(uint32_t i=0; i<BCP_NUM_STRIPS; ++i)
+        for(uint32_t i=0; i<num_strips; ++i)
         {
-            ASSERT(bcp_decompress_bc1(ctx, compressed_buffer, compressed_buffer_length, width, height, decompressed_bc1, i));
+            ASSERT(bcp_decompress_bc1(ctx, compressed_buffer, compressed_buffer_length, width, height, num_strips, decompressed_bc1, i));
         }
 
         for(uint32_t i=0; i<image_size; ++i)

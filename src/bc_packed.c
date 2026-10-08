@@ -1128,7 +1128,7 @@ static inline void init_color_models(bcp_context* ctx, const color_hists* hist)
 }
 
 //-----------------------------------------------------------------------------------------------------------------------------
-void init_static_models(bcp_context* ctx, const void* input, uint32_t width_blocks, uint32_t strip_width)
+void init_static_models(bcp_context* ctx, const void* input, uint32_t width_blocks, uint32_t strip_width, uint32_t num_strips)
 {
     color_hists hist;
     uint32_t hist_reference[TOP_TABLE_SIZE];
@@ -1143,7 +1143,7 @@ void init_static_models(bcp_context* ctx, const void* input, uint32_t width_bloc
     // pre-pass: the average of the first block of each strip becomes the seed "previous" block used to start every strip
     uint32_t sums[6] = { 0, 0, 0, 0, 0, 0 }; // r, g, b of color[0] and color[1]
 
-    for(uint32_t strip_index=0; strip_index<BCP_NUM_STRIPS; ++strip_index)
+    for(uint32_t strip_index=0; strip_index<num_strips; ++strip_index)
     {
         uint32_t start_y = strip_index * strip_width;
         uint32_t zigzag_x = (start_y & 1) ? 0 : width_blocks - 1;
@@ -1161,14 +1161,14 @@ void init_static_models(bcp_context* ctx, const void* input, uint32_t width_bloc
         }
     }
 
-    uint16_t average0 = bc1_pack_565((uint8_t)(sums[0] / BCP_NUM_STRIPS), (uint8_t)(sums[1] / BCP_NUM_STRIPS), (uint8_t)(sums[2] / BCP_NUM_STRIPS));
-    uint16_t average1 = bc1_pack_565((uint8_t)(sums[3] / BCP_NUM_STRIPS), (uint8_t)(sums[4] / BCP_NUM_STRIPS), (uint8_t)(sums[5] / BCP_NUM_STRIPS));
+    uint16_t average0 = bc1_pack_565((uint8_t)(sums[0] / num_strips), (uint8_t)(sums[1] / num_strips), (uint8_t)(sums[2] / num_strips));
+    uint16_t average1 = bc1_pack_565((uint8_t)(sums[3] / num_strips), (uint8_t)(sums[4] / num_strips), (uint8_t)(sums[5] / num_strips));
     ctx->strip_seed = ((uint32_t)average1 << 16) | (uint32_t)average0;
 
     // pre-pass: per strip, pick the cheaper color predictor, zigzag-previous vs the row above (same zigzag
     // position) after the first scanline, by the total absolute magnitude of the color deltas each would emit
     ctx->strip_predictor = 0;
-    for(uint32_t strip_index=0; strip_index<BCP_NUM_STRIPS; ++strip_index)
+    for(uint32_t strip_index=0; strip_index<num_strips; ++strip_index)
     {
         uint64_t energy_previous = 0;
         uint64_t energy_top = 0;
@@ -1203,7 +1203,7 @@ void init_static_models(bcp_context* ctx, const void* input, uint32_t width_bloc
     // symbols (the dictionary does not touch the indices). the color models fit on this pass price
     // the matched blocks in the per-strip dictionary decision below, the final color models are
     // refit on the deltas that are actually emitted after the decision
-    for(uint32_t strip_index=0; strip_index<BCP_NUM_STRIPS; ++strip_index)
+    for(uint32_t strip_index=0; strip_index<num_strips; ++strip_index)
     {
         bc1_block previous;
         unpack_strip_seed(ctx->strip_seed, &previous);
@@ -1257,7 +1257,7 @@ void init_static_models(bcp_context* ctx, const void* input, uint32_t width_bloc
     ctx->strip_dict_enable = 0;
     color_dict dict;
     color_hists matched;
-    for(uint32_t strip_index=0; strip_index<BCP_NUM_STRIPS; ++strip_index)
+    for(uint32_t strip_index=0; strip_index<num_strips; ++strip_index)
     {
         bc1_block previous;
         unpack_strip_seed(ctx->strip_seed, &previous);
@@ -1416,10 +1416,12 @@ size_t packed_bc1_maxsize(uint32_t width, uint32_t height)
 }
 
 //-----------------------------------------------------------------------------------------------------------------------------
-size_t bcp_compress_bc1(bcp_context* ctx, const void* bc1_image, uint32_t width, uint32_t height, uint8_t* output, size_t output_length)
+size_t bcp_compress_bc1(bcp_context* ctx, const void* bc1_image, uint32_t width, uint32_t height, uint8_t* output, size_t output_length, uint32_t* num_strips)
 {
     if (width < 16 || height < 256 || !bc1_image || !ctx || !output)
         return 0;
+
+    *num_strips = 64;   // for now, could depend on the resolution in the future
 
     // reset stats, they are only valid after a successful compression
     ctx->colors_bits = 0;
@@ -1430,13 +1432,13 @@ size_t bcp_compress_bc1(bcp_context* ctx, const void* bc1_image, uint32_t width,
     const uint32_t num_blocks = (width*height) / 16;
     const uint32_t height_blocks = height / 4;
     const uint32_t width_blocks = width / 4;
-    const uint32_t strip_width = height_blocks / BCP_NUM_STRIPS;
+    const uint32_t strip_width = height_blocks / *num_strips;
 
     if (ctx->hashmap == NULL)
         ctx->hashmap = ctx->mem.malloc_fn(sizeof(hashmap_entry) * HASHMAP_SIZE, ctx->mem.user);
 
     build_top_table(ctx->hashmap, bc1_image, num_blocks, ctx->top_table, &ctx->top_table_size);
-    init_static_models(ctx, bc1_image, width_blocks, strip_width);
+    init_static_models(ctx, bc1_image, width_blocks, strip_width, *num_strips);
 
     byte_stream stream = {.buffer = output, .length = output_length, .pos = 0};
 
@@ -1475,7 +1477,7 @@ size_t bcp_compress_bc1(bcp_context* ctx, const void* bc1_image, uint32_t width,
             stream.buffer[stream.pos++] = (ctx->top_table[i] >> (j*8)) & 0xff;
 
     stream_align(&stream, sizeof(uint16_t));
-    size_t strips_offset_array_size = sizeof(uint16_t) * (BCP_NUM_STRIPS - 1);
+    size_t strips_offset_array_size = sizeof(uint16_t) * (*num_strips - 1);
 
     // check if we have enough space
     if (stream.pos + strips_offset_array_size >= stream.length)
@@ -1489,7 +1491,7 @@ size_t bcp_compress_bc1(bcp_context* ctx, const void* bc1_image, uint32_t width,
     stream_align(&stream, sizeof(uint32_t));
     size_t previous_offset = stream.pos;
 
-    for(uint32_t strip_index=0; strip_index<BCP_NUM_STRIPS; ++strip_index)
+    for(uint32_t strip_index=0; strip_index<*num_strips; ++strip_index)
     {
         le_stream compressed_stream;
         le_init(&compressed_stream, &stream.buffer[stream.pos], stream.length - stream.pos);
@@ -1607,14 +1609,14 @@ size_t bcp_compress_bc1(bcp_context* ctx, const void* bc1_image, uint32_t width,
 }
 
 //-----------------------------------------------------------------------------------------------------------------------------
-bool bcp_decompress_bc1(bcp_context* ctx, const void* input, size_t input_length, uint32_t width, uint32_t height, void* output, uint32_t strip_index)
+bool bcp_decompress_bc1(bcp_context* ctx, const void* input, size_t input_length, uint32_t width, uint32_t height, uint32_t num_strips, void* output, uint32_t strip_index)
 {
-    if (width < 16 || height < 256 || !input || !ctx || !output || strip_index >= BCP_NUM_STRIPS)
+    if (width < 16 || height < 256 || !input || !ctx || !output || strip_index >= num_strips)
         return false;
 
     const uint32_t height_blocks = height / 4;
     const uint32_t width_blocks = width / 4;
-    const uint32_t strip_width = height_blocks / BCP_NUM_STRIPS;
+    const uint32_t strip_width = height_blocks / num_strips;
 
     byte_stream stream = {.buffer = (uint8_t *) input, .length = input_length, .pos = 0};
 
@@ -1664,7 +1666,7 @@ bool bcp_decompress_bc1(bcp_context* ctx, const void* input, size_t input_length
 
     // strip offsets
     read_stream_align(&stream, sizeof(uint16_t));
-    size_t strips_offset_array_size = sizeof(uint16_t) * (BCP_NUM_STRIPS - 1);
+    size_t strips_offset_array_size = sizeof(uint16_t) * (num_strips - 1);
 
     if (stream.pos + strips_offset_array_size >= stream.length)
         return false;

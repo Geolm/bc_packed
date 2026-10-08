@@ -22,16 +22,17 @@ TEST roundtrip(const bc1_block* bc1_image, uint32_t width, uint32_t height)
     void* compressed_buffer = malloc(compressed_buffer_size);
     ASSERT(compressed_buffer != NULL);
 
-    size_t compressed_buffer_length = bcp_compress_bc1(ctx, bc1_image, width, height, compressed_buffer, compressed_buffer_size);
+    uint32_t num_strips = 0;
+    size_t compressed_buffer_length = bcp_compress_bc1(ctx, bc1_image, width, height, compressed_buffer, compressed_buffer_size, &num_strips);
     ASSERT(compressed_buffer_length != 0);
     ASSERT(compressed_buffer_length <= compressed_buffer_size);
 
     bc1_block* decompressed_bc1_image = malloc(num_blocks * sizeof(bc1_block));
     ASSERT(decompressed_bc1_image != NULL);
 
-    for(uint32_t i=0; i<BCP_NUM_STRIPS; ++i)
+    for(uint32_t i=0; i<num_strips; ++i)
     {
-        ASSERT(bcp_decompress_bc1(ctx, compressed_buffer, compressed_buffer_length, width, height, decompressed_bc1_image, i));
+        ASSERT(bcp_decompress_bc1(ctx, compressed_buffer, compressed_buffer_length, width, height, num_strips, decompressed_bc1_image, i));
     }
 
     for(uint32_t i=0; i<num_blocks; ++i)
@@ -216,7 +217,8 @@ TEST stats_constant_image(void)
     void* compressed_buffer = malloc(compressed_buffer_size);
     ASSERT(compressed_buffer != NULL);
 
-    size_t stream_size = bcp_compress_bc1(ctx, image, width, height, compressed_buffer, compressed_buffer_size);
+    uint32_t num_strips = 0;
+    size_t stream_size = bcp_compress_bc1(ctx, image, width, height, compressed_buffer, compressed_buffer_size, &num_strips);
     ASSERT(stream_size != 0);
     ASSERT(stream_size <= compressed_buffer_size);
 
@@ -230,9 +232,9 @@ TEST stats_constant_image(void)
     bc1_block* decompressed = malloc(num_blocks * sizeof(bc1_block));
     ASSERT(decompressed != NULL);
 
-    for(uint32_t i=0; i<BCP_NUM_STRIPS; ++i)
+    for(uint32_t i=0; i<num_strips; ++i)
     {
-        ASSERT(bcp_decompress_bc1(ctx, compressed_buffer, stream_size, width, height, decompressed, i));
+        ASSERT(bcp_decompress_bc1(ctx, compressed_buffer, stream_size, width, height, num_strips, decompressed, i));
     }
 
     for(uint32_t i=0; i<num_blocks; ++i)
