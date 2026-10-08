@@ -1403,17 +1403,7 @@ bcp_context* bcp_init(bcp_mem_interface* user_mem)
     if (ctx == NULL)
         return NULL;
 
-    *ctx = (bcp_context)
-    {
-        .hashmap = mem.malloc_fn(sizeof(hashmap_entry) * HASHMAP_SIZE, mem.user),
-        .mem = mem
-    };
-
-    if (ctx->hashmap == NULL)
-    {
-        mem.free_fn(ctx, mem.user);
-        return NULL;
-    }
+    *ctx = (bcp_context) {.mem = mem };
 
     return ctx;
 }
@@ -1441,6 +1431,9 @@ size_t bcp_compress_bc1(bcp_context* ctx, const void* bc1_image, uint32_t width,
     const uint32_t height_blocks = height / 4;
     const uint32_t width_blocks = width / 4;
     const uint32_t strip_width = height_blocks / BCP_NUM_STRIPS;
+
+    if (ctx->hashmap == NULL)
+        ctx->hashmap = ctx->mem.malloc_fn(sizeof(hashmap_entry) * HASHMAP_SIZE, ctx->mem.user);
 
     build_top_table(ctx->hashmap, bc1_image, num_blocks, ctx->top_table, &ctx->top_table_size);
     init_static_models(ctx, bc1_image, width_blocks, strip_width);

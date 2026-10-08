@@ -6,11 +6,16 @@ The compressor works directly on a standard BC1 texture: 8 bytes per 4×4 block 
 
 The compressor is CPU-side and can use significantly more computation than the decompressor.
 
-| Hardware |  CPU/GPU | Throughput                |
+| Hardware |  Processor | Throughput                |
 |:-----: | :------------: | ----- |
-|      M5 Pro | CPU | 2560 MiB/s      |
+|      M5 Pro | CPU 18 cores | 2500 MiB/s      |
 |      M5 Pro | GPU | 15300 MiB/s      |
+|      M2 Max | CPU 12 cores | 1300 MiB/s      |
+|      M2 Max | GPU | 11850 MiB/s      |
 
+Average compression ratio for 74 images in test is **1:47:1**
+
+Note: AI disclaimer, although everything is based on my ideas and my previous libraries, almost all the code was written by a LLM. It wouldn't have been possible with my fulltime job otherwise.
 
 ## Design goals
 
