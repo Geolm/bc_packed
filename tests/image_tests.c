@@ -110,6 +110,7 @@ TEST test_all_images_in_folder(const char *dir_path)
         // compress the bc1 image
         size_t compressed_buffer_length = bc1_packed_compress(ctx, original_bc1, width, height, compressed_buffer, compressed_buffer_size);
         ASSERT(compressed_buffer_length != 0);
+        ASSERT(compressed_buffer_length <= compressed_buffer_size);
 
         const size_t image_size = (width/4)*(height/4)*sizeof(bc1_block);
         const float compression_ratio = (float) image_size / (float) compressed_buffer_length;

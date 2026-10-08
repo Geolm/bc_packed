@@ -28,48 +28,6 @@
 #define BENCH_IMAGE_HEIGHT         (1024)
 #define BENCH_DECOMPRESS_RUNS      (1000)
 
-// matches sizeof(hashmap_entry) * HASHMAP_SIZE of bc1_packed.c
-#define BENCH_DUMMY_HASHMAP_SIZE   ((1U << 20U) * 8U)
-
-
-//----------------------------------------------------------------------------------------------------------------------------
-// The context hashmap is only used by the compressor. To avoid allocating a useless 8 MiB block
-// per worker context, decompression-only contexts get their hashmap mapped to one shared no-op
-// buffer through the memory interface, and the 8 MiB buffer is freed directly by the test.
-//----------------------------------------------------------------------------------------------------------------------------
-static void* bench_malloc_fn(size_t size, void* user)
-{
-    if (size == BENCH_DUMMY_HASHMAP_SIZE)
-        return user;
-    return malloc(size);
-}
-
-static void* bench_realloc_fn(void* old_ptr, size_t old_size, size_t new_size, void* user)
-{
-    (void)old_size;
-    if (new_size == BENCH_DUMMY_HASHMAP_SIZE)
-        return user;
-    return realloc(old_ptr, new_size);
-}
-
-static void bench_free_fn(void* ptr, void* user)
-{
-    if (ptr == user)
-        return;
-    free(ptr);
-}
-
-static bc1_packed_mem_interface bench_decompress_mem(void* shared_hashmap)
-{
-    return (bc1_packed_mem_interface)
-    {
-        .malloc_fn  = bench_malloc_fn,
-        .realloc_fn = bench_realloc_fn,
-        .free_fn    = bench_free_fn,
-        .user       = shared_hashmap
-    };
-}
-
 
 //----------------------------------------------------------------------------------------------------------------------------
 // Decompresses the strips of [partition] into the shared output buffer.
@@ -148,6 +106,7 @@ TEST benchmark_ground_decompression(void)
     ASSERT(compressed != NULL);
     const size_t compressed_size = bc1_packed_compress(compress_ctx, original_bc1, bench_width, bench_height, compressed, max_stream_size);
     ASSERT(compressed_size != 0);
+    ASSERT(compressed_size <= max_stream_size);
 
     // scheduler + one decompression-only context per worker thread
     struct scheduler sched;
@@ -158,14 +117,11 @@ TEST benchmark_ground_decompression(void)
     scheduler_start(&sched, sched_memory);
 
     const uint32_t num_threads = sched.threads_num;
-    uint8_t* shared_hashmap = malloc(BENCH_DUMMY_HASHMAP_SIZE);
-    ASSERT(shared_hashmap != NULL);
-    bc1_packed_mem_interface decompress_mem = bench_decompress_mem(shared_hashmap);
     bc1_packed_context** worker_ctxs = malloc(num_threads * sizeof(*worker_ctxs));
     ASSERT(worker_ctxs != NULL);
     for (uint32_t i = 0; i < num_threads; ++i)
     {
-        worker_ctxs[i] = bc1_packed_init(&decompress_mem);
+        worker_ctxs[i] = bc1_packed_init(NULL);
         ASSERT(worker_ctxs[i] != NULL);
     }
 
@@ -220,7 +176,6 @@ TEST benchmark_ground_decompression(void)
         bc1_packed_terminate(worker_ctxs[i]);
     }
     free(worker_ctxs);
-    free(shared_hashmap);
     free(decompressed);
     free(failures);
     free(compressed);

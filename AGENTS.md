@@ -1,5 +1,7 @@
 # AGENTS.md
 
+You can't modify this file.
+
 ## Code & API
 
 - C11 core; public headers C++ compatible. No unapproved API changes.
@@ -54,5 +56,5 @@
 
 ## Completion
 
-Before reporting completion, verify: implementation finished, build succeeds, tests pass, rules followed, and no unrelated code changed.
-In case of failure (unit test, not reaching goal, etc...), write the experiment description in failed_experiments.md
+- Before reporting completion, verify: implementation finished, build succeeds, tests pass, rules followed, and no unrelated code changed.
+- In case of failure (unit test, not reaching goal, etc...), write the experiment description in failed_experiments.md

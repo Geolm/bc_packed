@@ -142,6 +142,7 @@ TEST metal_gpu_decompression(void)
 
     size_t compressed_length = bc1_packed_compress(ctx, original_bc1, width, height, compressed, compressed_size);
     ASSERT(compressed_length != 0);
+    ASSERT(compressed_length <= compressed_size);
 
     fprintf(stdout, "==> %s %ux%u : %u KiB BC1, %zu bytes compressed\n",
             IMAGE_FILE, width, height, (uint32_t)(image_size / 1024), compressed_length);
