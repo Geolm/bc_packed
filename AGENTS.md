@@ -47,6 +47,11 @@
 - Test behavior/results, not implementation details; don't enforce a specific implementation.
 - No harness tests.
 
+## Git
+
+- Don't create a branch without permission
+- Don't submit code without permission
+
 ## Completion
 
 Before reporting completion, verify: implementation finished, build succeeds, tests pass, rules followed, and no unrelated code changed.
