@@ -62,10 +62,10 @@ TEST test_all_images_in_folder(const char *dir_path)
     }
 
     // init and alloc buffers
-    bc1_packed_context* ctx = bc1_packed_init(NULL);
+    bcp_context* ctx = bcp_init(NULL);
     ASSERT(ctx != NULL);
 
-    size_t compressed_buffer_size = bc1_packed_maxsize(IMAGE_MAX_SIDE,  IMAGE_MAX_SIDE);
+    size_t compressed_buffer_size = packed_bc1_maxsize(IMAGE_MAX_SIDE,  IMAGE_MAX_SIDE);
     void* compressed_buffer = malloc(compressed_buffer_size);
     ASSERT(compressed_buffer != NULL);
     size_t max_image_size = (IMAGE_MAX_SIDE/4)*(IMAGE_MAX_SIDE/4)*sizeof(bc1_block);
@@ -108,7 +108,7 @@ TEST test_all_images_in_folder(const char *dir_path)
         }
 
         // compress the bc1 image
-        size_t compressed_buffer_length = bc1_packed_compress(ctx, original_bc1, width, height, compressed_buffer, compressed_buffer_size);
+        size_t compressed_buffer_length = bcp_compress_bc1(ctx, original_bc1, width, height, compressed_buffer, compressed_buffer_size);
         ASSERT(compressed_buffer_length != 0);
         ASSERT(compressed_buffer_length <= compressed_buffer_size);
 
@@ -116,8 +116,8 @@ TEST test_all_images_in_folder(const char *dir_path)
         const float compression_ratio = (float) image_size / (float) compressed_buffer_length;
         fprintf(stats, "%s,%" PRIu32 ",%" PRIu32 ",%.6f,", file_path, width, height, compression_ratio);
 
-        bc1_packed_stats cmp_stats;
-        bc1_packed_get_stats(ctx, &cmp_stats);
+        bcp_stats cmp_stats;
+        bcp_get_stats(ctx, &cmp_stats);
 
         fprintf(stats, "%" PRIu32 ",%" PRIu32 ",%" PRIu32 ",%" PRIu32 ",%" PRIu32 ",%" PRIu32 ",%" PRIu32 ",%" PRIu32 ",%" PRIu32 ",%" PRIu32 ",%" PRIu32 ",%" PRIu32 ",%" PRIu32 ",%" PRIu32 "\n",
             cmp_stats.top_table_size, cmp_stats.red_k[0], cmp_stats.red_k[1], cmp_stats.green_k[0], cmp_stats.green_k[1], cmp_stats.blue_k[0], cmp_stats.blue_k[1],
@@ -130,9 +130,9 @@ TEST test_all_images_in_folder(const char *dir_path)
         num_images++;
 
         // roundtrip test
-        for(uint32_t i=0; i<BC1_PACKED_NUM_STRIPS; ++i)
+        for(uint32_t i=0; i<BCP_NUM_STRIPS; ++i)
         {
-            ASSERT(bc1_packed_decompress(ctx, compressed_buffer, compressed_buffer_length, width, height, decompressed_bc1, i));
+            ASSERT(bcp_decompress_bc1(ctx, compressed_buffer, compressed_buffer_length, width, height, decompressed_bc1, i));
         }
 
         for(uint32_t i=0; i<image_size; ++i)

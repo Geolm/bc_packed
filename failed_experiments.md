@@ -59,7 +59,7 @@ Rice `k` and rank table per endpoint fits better. Kept.
 
 **Why it lost:** for the same 6 color symbols, per-endpoint deltas (each one delta, lower variance) are inherently more compact than one average + one spread (the spread is a second-order difference). You cannot get both the 1.41:1 ratio *and* the per-channel avg/spread split from a 6-symbol average/spread scheme.
 
-**Kept:** the avg/spread split is a valid *derived* statistic — it can be computed from the per-endpoint models in `bc1_packed_get_stats` with zero stream cost. The encoding itself was reverted.
+**Kept:** the avg/spread split is a valid *derived* statistic — it can be computed from the per-endpoint models in `bcp_get_stats` with zero stream cost. The encoding itself was reverted.
 
 ---
 
@@ -214,7 +214,7 @@ Baseline 1.4102. Target ≥ 1.50 (expected 1.52–1.57). Best combo = +0.9%. Per
 - **Rice-k cliff:** the selection shifts the emitted symbol distributions and flips the globally-minimized `k` (metal.png: reference_k 6→5, mask_k 1→2) → reference +11% (64006 → 71147 B) and mask +8% (23891 → 25800 B), eating the difference gain. A two-pass init (model fitted to the actually-emitted distribution) recovers most of it (1.4230), but the plan's ~10% expectation was built on a difference drop ~5× bigger than what the window can deliver.
 - **Stage 2 has no lever:** the exact table covers more blocks exactly (zero-residual 4.1% → 6.3% suite-wide) but the refined centroids are closer on average for the rest (avg nearest popcount 5.36 → 5.59, difference bytes 86685 → 87851 with two-pass init) — the exact variant is slightly worse in every selection row (−0.3 to −0.5%). The refinement stays as-is, and the plan's "gated" variant is vacuous: a majority-vote centroid move always decreases total Hamming distance by construction.
 
-**Open bug found (fixed in the exp 10 cleanup — see below):** the top table can come out **empty**. `vq_top_table` drops clusters with sampled count ≤ 1; on small random images (512 blocks; reproduced on 1 of 20 splitmix32 seeds, e.g. seed `0x296969A4`) no cluster survives → `top_table_size = 0` → compress writes header byte `(uint8_t)(0−1) = 255` ("256 entries") but zero entries, corrupting the stream layout; `bc1_packed_decompress` then asserts (`stream.length > strip_offset`) in test builds and reads past the end of the stream with asserts off. The minus-singletons ablation triggers it deterministically (≥ 256 unique patterns → all top-256 are singletons → all dropped). Fixed: a 1-entry floor in `build_top_table` plus the `top_table_empty_floor` regression test (kept from exp 10).
+**Open bug found (fixed in the exp 10 cleanup — see below):** the top table can come out **empty**. `vq_top_table` drops clusters with sampled count ≤ 1; on small random images (512 blocks; reproduced on 1 of 20 splitmix32 seeds, e.g. seed `0x296969A4`) no cluster survives → `top_table_size = 0` → compress writes header byte `(uint8_t)(0−1) = 255` ("256 entries") but zero entries, corrupting the stream layout; `bcp_decompress_bc1` then asserts (`stream.length > strip_offset`) in test builds and reads past the end of the stream with asserts off. The minus-singletons ablation triggers it deterministically (≥ 256 unique patterns → all top-256 are singletons → all dropped). Fixed: a 1-entry floor in `build_top_table` plus the `top_table_empty_floor` regression test (kept from exp 10).
 
 **Kept:** (1) the Rice-k cliff is a standing constraint on any future selection experiment: static Rice `k` is a global cliff, so any selection that skews the emitted reference/mask/byte distribution must re-fit the models to the emitted distribution (two-pass init) or accept the cliff; (2) refined centroids ≥ exact patterns, `vq_top_table` stays; (3) the empty-table bug above.
 
@@ -401,7 +401,7 @@ rehash of the same hashmap: the mode's blocks get a zero residual instead of one
 by the higher value, same convention as `nearest32`), and candidates are deduped against the current
 table. Rounds are factored into one `collect_top_table_round` function. A **1-entry floor** (the single
 most frequent exact pattern) guards the documented empty-table corruption. Histogram and decompression
-passes untouched; stream format and `bc1_packed_maxsize` unchanged.
+passes untouched; stream format and `packed_bc1_maxsize` unchanged.
 
 **n sweep (2..8):** all values produced **byte-identical streams** on the 74-image suite (the pattern
 histograms are heavy-tailed enough that the top-256 selection is stable for any threshold below the
@@ -517,7 +517,7 @@ In 565, green has twice the precision of red/blue, so a pure luminance step is
 **Method:** offline cost study (exp 5 style, no code change): real stb_image → stb_dxt(HIGHQUAL) →
 packed BC1 on the 74-image suite, real `le_static_model_init` models, exact Rice bit cost per symbol,
 4-byte strip alignment and the full header mirrored. A replica of the shipped scheme (v0) reproduced
-the real `bc1_packed_compress` stream **byte-exact on 74/74 images** (200k fuzz round-trips of both
+the real `bcp_compress_bc1` stream **byte-exact on 74/74 images** (200k fuzz round-trips of both
 transforms, 0 decode mismatches, 0 out-of-alphabet symbols). Three variants measured, each with its
 best-case per-strip predictor flag:
 
@@ -564,7 +564,7 @@ inherently smoother and the residual smaller. Two halves:
    10 ablations of the `vq_top_table` refinement (see below).
 
 **Method:** faithful offline cost study (exp. 5/12 style, no code change). The scratch tool
-`#include "bc1_packed.c"` and mirrors the unit-test pipeline exactly (stb_image → stb_dxt
+`#include "bc_packed.c"` and mirrors the unit-test pipeline exactly (stb_image → stb_dxt
 HIGHQUAL → `extract_4x4_rgba_block` at pixel coords `x*4, y*4` → `build_top_table` → `nearest32`
 selection), then prices the reference component with the real `le_static_model_init` models. The
 replica reproduces the unit test byte-exact (metal.png 1.405311, stream 373,076 B, table 256) and
@@ -723,7 +723,7 @@ near-uniform 8-bit symbol, more than the difference gain there). The study is a 
 the real stream is the verdict (cf. exp 13's caution, and the same lesson as exp 8b).
 
 **Kept:** this is the **new baseline** (1.4363 / 1.3840). Stream format, decoder, and
-`bc1_packed_stats` are unchanged.
+`bcp_stats` are unchanged.
 
 ---
 
@@ -734,7 +734,7 @@ Lloyd recipe) so more, closer centroids shrink the residual; the reference becom
 raw-Rice symbol (`LE_ALPHABET_SIZE = 256` caps the rank models, so a 512-symbol reference must
 leave the rank coding — exp 5's constraint; a format-v2 candidate).
 
-**Method:** offline study on a copy of `bc1_packed.c` with `TOP_TABLE_SIZE = 512` (all internals
+**Method:** offline study on a copy of `bc_packed.c` with `TOP_TABLE_SIZE = 512` (all internals
 scale; `vq_top_table`/`nearest32` byte-identical to the repo's, verified by diff), 74-image
 suite, reference repriced as 9-bit raw Rice with its own best `k`, everything else shipped.
 
@@ -845,7 +845,7 @@ histogram, compress, and decompress passes:
 Every symbol stays in the stream exactly once, in the same order; the context is derived from
 the block's own just-decoded green delta — no state crosses blocks or endpoints, and the
 selection costs zero payload bits. Stream format v2: the model header grows 9 → 17 models
-(14 color + reference/mask/difference unchanged), no other framing change. `bc1_packed_stats`
+(14 color + reference/mask/difference unchanged), no other framing change. `bcp_stats`
 reports the zero-context (middle bucket) `k` for red/blue. Regression test `color_context`:
 a quadratic green ramp (delta 2i+1 mod 64) sweeps the negative/positive buckets on both
 endpoints, byte-exact round-trip; the `synthetic_tests` header helpers walk the 17 models.

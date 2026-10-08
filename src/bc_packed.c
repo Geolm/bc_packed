@@ -1,4 +1,4 @@
-#include "bc1_packed.h"
+#include "bc_packed.h"
 #include <stdlib.h>
 #include <assert.h>
 #include <string.h>
@@ -6,10 +6,10 @@
 
 #if defined(__aarch64__) || defined(_M_ARM64) || defined(__ARM_NEON)
     #include <arm_neon.h>
-    #define BC1_PACKED_NEON
+    #define BCP_NEON
 #else
     #include <immintrin.h>
-    #define BC1_PACKED_SSE
+    #define BCP_SSE
 #endif
 
 #if defined(_MSC_VER)
@@ -506,10 +506,10 @@ typedef struct hashmap_entry
     uint32_t count;
 } hashmap_entry;
 
-struct bc1_packed_context
+struct bcp_context
 {
     hashmap_entry* hashmap;
-    bc1_packed_mem_interface mem;
+    bcp_mem_interface mem;
 
     // contextual color models: red/blue carry one model per green-delta context bucket (the chroma deltas
     // scale with the endpoint's own luminance delta); the green models stay uncontexted
@@ -569,9 +569,9 @@ static inline void* realloc_wrapper(void* old_ptr, size_t old_size, size_t new_s
 static inline void free_wrapper(void* ptr, void* user) {(void)user; free(ptr);}
 
 //----------------------------------------------------------------------------------------------------------------------------
-static inline bc1_packed_mem_interface default_allocator(void) 
+static inline bcp_mem_interface default_allocator(void) 
 {
-    return (bc1_packed_mem_interface) 
+    return (bcp_mem_interface) 
     {
         .malloc_fn  = malloc_wrapper,
         .realloc_fn = realloc_wrapper,
@@ -724,7 +724,7 @@ static inline uint8_t color_delta_context(int dgreen)
 // current color models: the same symbols the encoder writes per block, priced without writing
 // them. used by the per-strip color-pair dictionary decision, which weighs the deltas of a
 // matched block against the flag + reference they are replaced by
-static inline uint32_t color_delta_cost(const bc1_packed_context* ctx, const bc1_block* current, const bc1_block* reference)
+static inline uint32_t color_delta_cost(const bcp_context* ctx, const bc1_block* current, const bc1_block* reference)
 {
     uint32_t cost = 0;
 
@@ -825,7 +825,7 @@ uint32_t nearest32(const uint32_t* table, uint32_t table_size, uint32_t bitfield
     uint32_t masks[TOP_TABLE_SIZE];
     uint32_t i = 0;
 
-#ifdef BC1_PACKED_NEON
+#ifdef BCP_NEON
     static const uint8_t byte_weight[16] = { 1, 2, 4, 8, 1, 2, 4, 8, 1, 2, 4, 8, 1, 2, 4, 8 };
     uint32x4_t bf_vec = vdupq_n_u32(bitfield);
     uint8x16_t one_bytes = vdupq_n_u8(1);
@@ -1113,7 +1113,7 @@ void build_top_table(hashmap_entry* hashmap, const void* input, uint32_t num_blo
 //-----------------------------------------------------------------------------------------------------------------------------
 // fits the 14 color models (3 contextual red / blue per endpoint + 1 uncontexted green per endpoint)
 // from [hist]
-static inline void init_color_models(bc1_packed_context* ctx, const color_hists* hist)
+static inline void init_color_models(bcp_context* ctx, const color_hists* hist)
 {
     for(uint32_t j=0; j<2; ++j)
     {
@@ -1128,7 +1128,7 @@ static inline void init_color_models(bc1_packed_context* ctx, const color_hists*
 }
 
 //-----------------------------------------------------------------------------------------------------------------------------
-void init_static_models(bc1_packed_context* ctx, const void* input, uint32_t width_blocks, uint32_t strip_width)
+void init_static_models(bcp_context* ctx, const void* input, uint32_t width_blocks, uint32_t strip_width)
 {
     color_hists hist;
     uint32_t hist_reference[TOP_TABLE_SIZE];
@@ -1143,7 +1143,7 @@ void init_static_models(bc1_packed_context* ctx, const void* input, uint32_t wid
     // pre-pass: the average of the first block of each strip becomes the seed "previous" block used to start every strip
     uint32_t sums[6] = { 0, 0, 0, 0, 0, 0 }; // r, g, b of color[0] and color[1]
 
-    for(uint32_t strip_index=0; strip_index<BC1_PACKED_NUM_STRIPS; ++strip_index)
+    for(uint32_t strip_index=0; strip_index<BCP_NUM_STRIPS; ++strip_index)
     {
         uint32_t start_y = strip_index * strip_width;
         uint32_t zigzag_x = (start_y & 1) ? 0 : width_blocks - 1;
@@ -1161,14 +1161,14 @@ void init_static_models(bc1_packed_context* ctx, const void* input, uint32_t wid
         }
     }
 
-    uint16_t average0 = bc1_pack_565((uint8_t)(sums[0] / BC1_PACKED_NUM_STRIPS), (uint8_t)(sums[1] / BC1_PACKED_NUM_STRIPS), (uint8_t)(sums[2] / BC1_PACKED_NUM_STRIPS));
-    uint16_t average1 = bc1_pack_565((uint8_t)(sums[3] / BC1_PACKED_NUM_STRIPS), (uint8_t)(sums[4] / BC1_PACKED_NUM_STRIPS), (uint8_t)(sums[5] / BC1_PACKED_NUM_STRIPS));
+    uint16_t average0 = bc1_pack_565((uint8_t)(sums[0] / BCP_NUM_STRIPS), (uint8_t)(sums[1] / BCP_NUM_STRIPS), (uint8_t)(sums[2] / BCP_NUM_STRIPS));
+    uint16_t average1 = bc1_pack_565((uint8_t)(sums[3] / BCP_NUM_STRIPS), (uint8_t)(sums[4] / BCP_NUM_STRIPS), (uint8_t)(sums[5] / BCP_NUM_STRIPS));
     ctx->strip_seed = ((uint32_t)average1 << 16) | (uint32_t)average0;
 
     // pre-pass: per strip, pick the cheaper color predictor, zigzag-previous vs the row above (same zigzag
     // position) after the first scanline, by the total absolute magnitude of the color deltas each would emit
     ctx->strip_predictor = 0;
-    for(uint32_t strip_index=0; strip_index<BC1_PACKED_NUM_STRIPS; ++strip_index)
+    for(uint32_t strip_index=0; strip_index<BCP_NUM_STRIPS; ++strip_index)
     {
         uint64_t energy_previous = 0;
         uint64_t energy_top = 0;
@@ -1203,7 +1203,7 @@ void init_static_models(bc1_packed_context* ctx, const void* input, uint32_t wid
     // symbols (the dictionary does not touch the indices). the color models fit on this pass price
     // the matched blocks in the per-strip dictionary decision below, the final color models are
     // refit on the deltas that are actually emitted after the decision
-    for(uint32_t strip_index=0; strip_index<BC1_PACKED_NUM_STRIPS; ++strip_index)
+    for(uint32_t strip_index=0; strip_index<BCP_NUM_STRIPS; ++strip_index)
     {
         bc1_block previous;
         unpack_strip_seed(ctx->strip_seed, &previous);
@@ -1257,7 +1257,7 @@ void init_static_models(bc1_packed_context* ctx, const void* input, uint32_t wid
     ctx->strip_dict_enable = 0;
     color_dict dict;
     color_hists matched;
-    for(uint32_t strip_index=0; strip_index<BC1_PACKED_NUM_STRIPS; ++strip_index)
+    for(uint32_t strip_index=0; strip_index<BCP_NUM_STRIPS; ++strip_index)
     {
         bc1_block previous;
         unpack_strip_seed(ctx->strip_seed, &previous);
@@ -1395,15 +1395,15 @@ static inline bool load_static_model(le_model* model, byte_stream* stream)
 
 
 //-----------------------------------------------------------------------------------------------------------------------------
-bc1_packed_context* bc1_packed_init(bc1_packed_mem_interface* user_mem)
+bcp_context* bcp_init(bcp_mem_interface* user_mem)
 {
-    bc1_packed_mem_interface mem = (user_mem) ? *user_mem : default_allocator();
+    bcp_mem_interface mem = (user_mem) ? *user_mem : default_allocator();
 
-    bc1_packed_context* ctx = mem.malloc_fn(sizeof(bc1_packed_context), mem.user);
+    bcp_context* ctx = mem.malloc_fn(sizeof(bcp_context), mem.user);
     if (ctx == NULL)
         return NULL;
 
-    *ctx = (bc1_packed_context)
+    *ctx = (bcp_context)
     {
         .hashmap = mem.malloc_fn(sizeof(hashmap_entry) * HASHMAP_SIZE, mem.user),
         .mem = mem
@@ -1419,14 +1419,14 @@ bc1_packed_context* bc1_packed_init(bc1_packed_mem_interface* user_mem)
 }
 
 //-----------------------------------------------------------------------------------------------------------------------------
-size_t bc1_packed_maxsize(uint32_t width, uint32_t height)
+size_t packed_bc1_maxsize(uint32_t width, uint32_t height)
 {
     // very rough
     return (width/4) * (height/4) * 2 * sizeof(bc1_block);
 }
 
 //-----------------------------------------------------------------------------------------------------------------------------
-size_t bc1_packed_compress(bc1_packed_context* ctx, const void* bc1_image, uint32_t width, uint32_t height, uint8_t* output, size_t output_length)
+size_t bcp_compress_bc1(bcp_context* ctx, const void* bc1_image, uint32_t width, uint32_t height, uint8_t* output, size_t output_length)
 {
     if (width < 16 || height < 256 || !bc1_image || !ctx || !output)
         return 0;
@@ -1440,7 +1440,7 @@ size_t bc1_packed_compress(bc1_packed_context* ctx, const void* bc1_image, uint3
     const uint32_t num_blocks = (width*height) / 16;
     const uint32_t height_blocks = height / 4;
     const uint32_t width_blocks = width / 4;
-    const uint32_t strip_width = height_blocks / BC1_PACKED_NUM_STRIPS;
+    const uint32_t strip_width = height_blocks / BCP_NUM_STRIPS;
 
     build_top_table(ctx->hashmap, bc1_image, num_blocks, ctx->top_table, &ctx->top_table_size);
     init_static_models(ctx, bc1_image, width_blocks, strip_width);
@@ -1482,7 +1482,7 @@ size_t bc1_packed_compress(bc1_packed_context* ctx, const void* bc1_image, uint3
             stream.buffer[stream.pos++] = (ctx->top_table[i] >> (j*8)) & 0xff;
 
     stream_align(&stream, sizeof(uint16_t));
-    size_t strips_offset_array_size = sizeof(uint16_t) * (BC1_PACKED_NUM_STRIPS - 1);
+    size_t strips_offset_array_size = sizeof(uint16_t) * (BCP_NUM_STRIPS - 1);
 
     // check if we have enough space
     if (stream.pos + strips_offset_array_size >= stream.length)
@@ -1496,7 +1496,7 @@ size_t bc1_packed_compress(bc1_packed_context* ctx, const void* bc1_image, uint3
     stream_align(&stream, sizeof(uint32_t));
     size_t previous_offset = stream.pos;
 
-    for(uint32_t strip_index=0; strip_index<BC1_PACKED_NUM_STRIPS; ++strip_index)
+    for(uint32_t strip_index=0; strip_index<BCP_NUM_STRIPS; ++strip_index)
     {
         le_stream compressed_stream;
         le_init(&compressed_stream, &stream.buffer[stream.pos], stream.length - stream.pos);
@@ -1614,14 +1614,14 @@ size_t bc1_packed_compress(bc1_packed_context* ctx, const void* bc1_image, uint3
 }
 
 //-----------------------------------------------------------------------------------------------------------------------------
-bool bc1_packed_decompress(bc1_packed_context* ctx, const void* input, size_t input_length, uint32_t width, uint32_t height, void* output, uint32_t strip_index)
+bool bcp_decompress_bc1(bcp_context* ctx, const void* input, size_t input_length, uint32_t width, uint32_t height, void* output, uint32_t strip_index)
 {
-    if (width < 16 || height < 256 || !input || !ctx || !output || strip_index >= BC1_PACKED_NUM_STRIPS)
+    if (width < 16 || height < 256 || !input || !ctx || !output || strip_index >= BCP_NUM_STRIPS)
         return false;
 
     const uint32_t height_blocks = height / 4;
     const uint32_t width_blocks = width / 4;
-    const uint32_t strip_width = height_blocks / BC1_PACKED_NUM_STRIPS;
+    const uint32_t strip_width = height_blocks / BCP_NUM_STRIPS;
 
     byte_stream stream = {.buffer = (uint8_t *) input, .length = input_length, .pos = 0};
 
@@ -1671,7 +1671,7 @@ bool bc1_packed_decompress(bc1_packed_context* ctx, const void* input, size_t in
 
     // strip offsets
     read_stream_align(&stream, sizeof(uint16_t));
-    size_t strips_offset_array_size = sizeof(uint16_t) * (BC1_PACKED_NUM_STRIPS - 1);
+    size_t strips_offset_array_size = sizeof(uint16_t) * (BCP_NUM_STRIPS - 1);
 
     if (stream.pos + strips_offset_array_size >= stream.length)
         return false;
@@ -1775,9 +1775,9 @@ bool bc1_packed_decompress(bc1_packed_context* ctx, const void* input, size_t in
 }
 
 //-----------------------------------------------------------------------------------------------------------------------------
-void bc1_packed_get_stats(bc1_packed_context* ctx, bc1_packed_stats* stats)
+void bcp_get_stats(bcp_context* ctx, bcp_stats* stats)
 {
-    *stats = (bc1_packed_stats)
+    *stats = (bcp_stats)
     {
         // contextual models: report the zero-context (middle bucket) k, the one that carries most of the mass
         .blue_k = { ctx->blue_model[0][COLOR_DELTA_CONTEXTS/2].k, ctx->blue_model[1][COLOR_DELTA_CONTEXTS/2].k },
@@ -1795,9 +1795,9 @@ void bc1_packed_get_stats(bc1_packed_context* ctx, bc1_packed_stats* stats)
 }
 
 //-----------------------------------------------------------------------------------------------------------------------------
-void bc1_packed_terminate(bc1_packed_context* ctx)
+void bcp_terminate(bcp_context* ctx)
 {
-    bc1_packed_mem_interface mem = ctx->mem;
+    bcp_mem_interface mem = ctx->mem;
 
     mem.free_fn(ctx->hashmap, mem.user);
     mem.free_fn(ctx, mem.user);

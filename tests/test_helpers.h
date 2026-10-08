@@ -2,7 +2,7 @@
 #define TEST_HELPERS
 
 #include "greatest.h"
-#include "bc1_packed.h"
+#include "bc_packed.h"
 #include <stdlib.h>
 
 //-----------------------------------------------------------------------------------------------------------------------------

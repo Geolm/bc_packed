@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
-project(bc1_packed)
+project(bc_packed)
 
 if(CMAKE_GENERATOR STREQUAL "Xcode")
     set(CMAKE_MACOSX_BUNDLE TRUE)
@@ -16,7 +16,7 @@ else()
 endif()
 
 add_executable(unit_tests
-    ./src/bc1_packed.c
+    ./src/bc_packed.c
     ./tests/benchmark_test.c
     ./tests/image_tests.c
     ./tests/main_test.c

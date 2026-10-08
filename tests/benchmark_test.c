@@ -31,13 +31,13 @@
 
 //----------------------------------------------------------------------------------------------------------------------------
 // Decompresses the strips of [partition] into the shared output buffer.
-// One context per worker thread: bc1_packed_decompress rewrites ctx state on every call,
+// One context per worker thread: bcp_decompress_bc1 rewrites ctx state on every call,
 // so a single context must never be used from multiple threads. Strips write disjoint
 // rows of the output buffer, the compressed stream is read-only.
 //----------------------------------------------------------------------------------------------------------------------------
 typedef struct bench_args
 {
-    bc1_packed_context** ctxs;
+    bcp_context** ctxs;
     uint8_t* failures;
     const uint8_t* compressed;
     size_t compressed_size;
@@ -51,7 +51,7 @@ static void bench_decompress_task(void* pArg, struct scheduler* s, struct sched_
     bench_args* args = (bench_args*)pArg;
     for (uint32_t strip = partition.start; strip < partition.end; ++strip)
     {
-        if (!bc1_packed_decompress(args->ctxs[thread_num], args->compressed, args->compressed_size, args->width, args->height, args->output, strip))
+        if (!bcp_decompress_bc1(args->ctxs[thread_num], args->compressed, args->compressed_size, args->width, args->height, args->output, strip))
             args->failures[thread_num] = 1;
     }
 }
@@ -99,12 +99,12 @@ TEST benchmark_ground_decompression(void)
     }
 
     // compress once, not measured
-    bc1_packed_context* compress_ctx = bc1_packed_init(NULL);
+    bcp_context* compress_ctx = bcp_init(NULL);
     ASSERT(compress_ctx != NULL);
-    const size_t max_stream_size = bc1_packed_maxsize(bench_width, bench_height);
+    const size_t max_stream_size = packed_bc1_maxsize(bench_width, bench_height);
     uint8_t* compressed = malloc(max_stream_size);
     ASSERT(compressed != NULL);
-    const size_t compressed_size = bc1_packed_compress(compress_ctx, original_bc1, bench_width, bench_height, compressed, max_stream_size);
+    const size_t compressed_size = bcp_compress_bc1(compress_ctx, original_bc1, bench_width, bench_height, compressed, max_stream_size);
     ASSERT(compressed_size != 0);
     ASSERT(compressed_size <= max_stream_size);
 
@@ -117,11 +117,11 @@ TEST benchmark_ground_decompression(void)
     scheduler_start(&sched, sched_memory);
 
     const uint32_t num_threads = sched.threads_num;
-    bc1_packed_context** worker_ctxs = malloc(num_threads * sizeof(*worker_ctxs));
+    bcp_context** worker_ctxs = malloc(num_threads * sizeof(*worker_ctxs));
     ASSERT(worker_ctxs != NULL);
     for (uint32_t i = 0; i < num_threads; ++i)
     {
-        worker_ctxs[i] = bc1_packed_init(NULL);
+        worker_ctxs[i] = bcp_init(NULL);
         ASSERT(worker_ctxs[i] != NULL);
     }
 
@@ -146,7 +146,7 @@ TEST benchmark_ground_decompression(void)
     const uint64_t start = stm_now();
     for (int run = 0; run < BENCH_DECOMPRESS_RUNS; ++run)
     {
-        scheduler_add(&sched, &task, bench_decompress_task, &args, BC1_PACKED_NUM_STRIPS, 1);
+        scheduler_add(&sched, &task, bench_decompress_task, &args, BCP_NUM_STRIPS, 1);
         scheduler_join(&sched, &task);
     }
     const double seconds = stm_sec(stm_now() - start);
@@ -173,13 +173,13 @@ TEST benchmark_ground_decompression(void)
     free(sched_memory);
     for (uint32_t i = 0; i < num_threads; ++i)
     {
-        bc1_packed_terminate(worker_ctxs[i]);
+        bcp_terminate(worker_ctxs[i]);
     }
     free(worker_ctxs);
     free(decompressed);
     free(failures);
     free(compressed);
-    bc1_packed_terminate(compress_ctx);
+    bcp_terminate(compress_ctx);
     free(original_bc1);
     stbi_image_free(rgba);
 

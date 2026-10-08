@@ -1,5 +1,5 @@
 // GPU roundtrip test: load a real image, convert it to BC1 with stb_dxt, compress it on the
-// CPU with bc1_packed_compress, then decompress it on the GPU with the bc1_packed_decompress
+// CPU with bcp_compress_bc1, then decompress it on the GPU with the bcp_decompress_bc1
 // compute kernel and verify the decoded image is bit-identical to the original BC1 texture.
 //
 // Every Metal object is checked to be created without error (the Metal compiler reports
@@ -22,14 +22,14 @@
 #include "stb_image.h"
 #include "stb_dxt.h"
 
-#define SHADER_FILE ("src/bc1_packed_decompress.metal")
-#define SHADER_FUNCTION ("bc1_packed_decompress")
+#define SHADER_FILE ("src/bc_decompress.metal")
+#define SHADER_FUNCTION ("bcp_decompress_bc1")
 #define IMAGE_FILE ("images/brick1.png")
 #define GPU_DECODE_RUNS (1000)
 
 
 //-----------------------------------------------------------------------------------------------------------------------------
-// mirror of bc1_decode_args_t from src/bc1_packed_decompress.metal: the 8-byte aligned
+// mirror of bc1_decode_args_t from src/bcp_decompress_bc1.metal: the 8-byte aligned
 // input_length pads the struct to 16 bytes, so the layout matches on both sides of the API
 typedef struct bc1_decode_args
 {
@@ -106,7 +106,7 @@ TEST metal_gpu_decompression(void)
         FAIL();
     }
 
-    // constraints enforced by both bc1_packed_compress and the compute kernel
+    // constraints enforced by both bcp_compress_bc1 and the compute kernel
     ASSERT(width >= 16 && height >= 256 && (width & 3) == 0 && (height & 3) == 0);
 
     const uint32_t width_blocks = width / 4;
@@ -133,14 +133,14 @@ TEST metal_gpu_decompression(void)
 
     //-------------------------------------------------------------------------------------------------------------------------
     // compress the BC1 texture on the CPU
-    bc1_packed_context* ctx = bc1_packed_init(nullptr);
+    bcp_context* ctx = bcp_init(nullptr);
     ASSERT(ctx != nullptr);
 
-    size_t compressed_size = bc1_packed_maxsize(width, height);
+    size_t compressed_size = packed_bc1_maxsize(width, height);
     uint8_t* compressed = (uint8_t*)malloc(compressed_size);
     ASSERT(compressed != nullptr);
 
-    size_t compressed_length = bc1_packed_compress(ctx, original_bc1, width, height, compressed, compressed_size);
+    size_t compressed_length = bcp_compress_bc1(ctx, original_bc1, width, height, compressed, compressed_size);
     ASSERT(compressed_length != 0);
     ASSERT(compressed_length <= compressed_size);
 
@@ -176,7 +176,7 @@ TEST metal_gpu_decompression(void)
         print_metal_error("shader compilation", error);
     ASSERT(library != nullptr);
 
-    MTL::Function* function = library->newFunction(MTLSTR("bc1_packed_decompress"));
+    MTL::Function* function = library->newFunction(MTLSTR("bcp_decompress_bc1"));
     if (function == nullptr)
         fprintf(stderr, "==> function %s not found in %s\n", SHADER_FUNCTION, SHADER_FILE);
     ASSERT(function != nullptr);
@@ -224,7 +224,7 @@ TEST metal_gpu_decompression(void)
     encoder->setBytes(&args, sizeof(args), 2);
     encoder->setBuffer(stream_buffer, 0, 0);
     encoder->setBuffer(output_buffer, 0, 1);
-    encoder->dispatchThreads(MTL::Size(BC1_PACKED_NUM_STRIPS, GPU_DECODE_RUNS, 1), MTL::Size(1, 1, 1));
+    encoder->dispatchThreads(MTL::Size(BCP_NUM_STRIPS, GPU_DECODE_RUNS, 1), MTL::Size(1, 1, 1));
     encoder->endEncoding();
 
     command_buffer->commit();
@@ -272,7 +272,7 @@ TEST metal_gpu_decompression(void)
 
     free(gpu_bc1);
     free(compressed);
-    bc1_packed_terminate(ctx);
+    bcp_terminate(ctx);
     free(original_bc1);
 
     PASS();

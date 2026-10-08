@@ -1,25 +1,25 @@
 //-----------------------------------------------------------------------------------------------------------------------------
-// bc1_packed_decompress.metal
+// bcp_decompress_bc1.metal
 //
-// GPU mirror of bc1_packed_decompress (src/bc1_packed.c): one thread decompresses one strip of a
-// bc1_packed stream. The compressed stream is read from a device buffer, the decoded BC1 blocks
+// GPU mirror of bcp_decompress_bc1 (src/bc_packed.c): one thread decompresses one strip of a
+// bc_packed stream. The compressed stream is read from a device buffer, the decoded BC1 blocks
 // (two 16-bit 565 endpoint colors followed by the 32-bit indices, 8 bytes per block) are written
 // to an output device buffer laid out as a row-major grid of width/4 x height/4 blocks.
 //
 // Dispatch 64 threads, one per strip:
 //
 //     bc1_decode_args_t args = { width, height, (uint64_t)stream_length };
-//     encoder.setComputePipelineState(pipeline);   // pipeline built from the "bc1_packed_decompress" kernel
+//     encoder.setComputePipelineState(pipeline);   // pipeline built from the "bcp_decompress_bc1" kernel
 //     encoder.setBytes(&args, sizeof(args), 2);
 //     encoder.setBuffer(stream_buffer, NULL, 0, 0);
 //     encoder.setBuffer(output_buffer, NULL, 1, 0);
 //     encoder.dispatchThreads(threadgrid(64, 1, 1));
 //
-// buffer(0): device const uint8_t*  the compressed stream (output of bc1_packed_compress)
+// buffer(0): device const uint8_t*  the compressed stream (output of bcp_compress_bc1)
 // buffer(1): device uint8_t*        output BC1 blocks, width/4 * height/4 * 8 bytes
 // buffer(2): constant bc1_decode_args_t
 //
-// The stream layout parsed here mirrors bc1_packed_compress / bc1_packed_decompress:
+// The stream layout parsed here mirrors bcp_compress_bc1 / bcp_decompress_bc1:
 //   [17 static models][top table size u8][4-align][strip seed u32][strip predictor u64][strip dict enable u64]
 //   [top table u32s][2-align][63 strip offsets u16, deltas in dword units][4-align][strip bitstreams]
 //
@@ -234,8 +234,8 @@ void write_block(device uint8_t* output, uint block_index, uint16_t color0, uint
 }
 
 //-----------------------------------------------------------------------------------------------------------------------------
-// mirror of bc1_packed_decompress: decode one strip of blocks
-kernel void bc1_packed_decompress(const device uint8_t* input [[buffer(0)]],
+// mirror of bcp_decompress_bc1: decode one strip of blocks
+kernel void bcp_decompress_bc1(const device uint8_t* input [[buffer(0)]],
                                   device uint8_t* output [[buffer(1)]],
                                   constant bc1_decode_args_t& args [[buffer(2)]],
                                   uint3 grid_pos [[thread_position_in_grid]])
@@ -363,7 +363,7 @@ kernel void bc1_packed_decompress(const device uint8_t* input [[buffer(0)]],
     const device uint32_t* output_colors32 = (const device uint32_t*)output; // already offset by run_id
 
     // thread-local sliding dictionary of the last 256 decoded endpoint color pairs of the zigzag chain:
-    // a fixed ring buffer keyed by chain position (mirrors COLOR_DICT_SIZE in src/bc1_packed.c)
+    // a fixed ring buffer keyed by chain position (mirrors COLOR_DICT_SIZE in src/bc_packed.c)
     uint32_t dict[256];
     for (uint i = 0; i < 256; ++i)
         dict[i] = 0;

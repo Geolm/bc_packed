@@ -15,23 +15,23 @@ const uint16_t cyan  = 0x07FF;
 TEST roundtrip(const bc1_block* bc1_image, uint32_t width, uint32_t height)
 {
     const size_t num_blocks = (width/4) * (height/4);
-    bc1_packed_context* ctx = bc1_packed_init(NULL);
+    bcp_context* ctx = bcp_init(NULL);
     ASSERT(ctx != NULL);
 
-    size_t compressed_buffer_size = bc1_packed_maxsize(width,  height);
+    size_t compressed_buffer_size = packed_bc1_maxsize(width,  height);
     void* compressed_buffer = malloc(compressed_buffer_size);
     ASSERT(compressed_buffer != NULL);
 
-    size_t compressed_buffer_length = bc1_packed_compress(ctx, bc1_image, width, height, compressed_buffer, compressed_buffer_size);
+    size_t compressed_buffer_length = bcp_compress_bc1(ctx, bc1_image, width, height, compressed_buffer, compressed_buffer_size);
     ASSERT(compressed_buffer_length != 0);
     ASSERT(compressed_buffer_length <= compressed_buffer_size);
 
     bc1_block* decompressed_bc1_image = malloc(num_blocks * sizeof(bc1_block));
     ASSERT(decompressed_bc1_image != NULL);
 
-    for(uint32_t i=0; i<BC1_PACKED_NUM_STRIPS; ++i)
+    for(uint32_t i=0; i<BCP_NUM_STRIPS; ++i)
     {
-        ASSERT(bc1_packed_decompress(ctx, compressed_buffer, compressed_buffer_length, width, height, decompressed_bc1_image, i));
+        ASSERT(bcp_decompress_bc1(ctx, compressed_buffer, compressed_buffer_length, width, height, decompressed_bc1_image, i));
     }
 
     for(uint32_t i=0; i<num_blocks; ++i)
@@ -41,7 +41,7 @@ TEST roundtrip(const bc1_block* bc1_image, uint32_t width, uint32_t height)
         ASSERT_EQ(decompressed_bc1_image[i].indices, bc1_image[i].indices);
     }
 
-    bc1_packed_terminate(ctx);
+    bcp_terminate(ctx);
 
     free(compressed_buffer);
     free(decompressed_bc1_image);
@@ -209,20 +209,20 @@ TEST stats_constant_image(void)
             .indices = 0x33333333
         };
 
-    bc1_packed_context* ctx = bc1_packed_init(NULL);
+    bcp_context* ctx = bcp_init(NULL);
     ASSERT(ctx != NULL);
 
-    size_t compressed_buffer_size = bc1_packed_maxsize(width, height);
+    size_t compressed_buffer_size = packed_bc1_maxsize(width, height);
     void* compressed_buffer = malloc(compressed_buffer_size);
     ASSERT(compressed_buffer != NULL);
 
-    size_t stream_size = bc1_packed_compress(ctx, image, width, height, compressed_buffer, compressed_buffer_size);
+    size_t stream_size = bcp_compress_bc1(ctx, image, width, height, compressed_buffer, compressed_buffer_size);
     ASSERT(stream_size != 0);
     ASSERT(stream_size <= compressed_buffer_size);
 
     // the reported payload components are parts of the stream, so their sum fits the stream
-    bc1_packed_stats stats;
-    bc1_packed_get_stats(ctx, &stats);
+    bcp_stats stats;
+    bcp_get_stats(ctx, &stats);
     const uint64_t payload = (uint64_t)stats.colors_bytes + stats.reference_bytes + stats.mask_bytes + stats.difference_bytes;
     ASSERT(payload <= (uint64_t)stream_size);
 
@@ -230,9 +230,9 @@ TEST stats_constant_image(void)
     bc1_block* decompressed = malloc(num_blocks * sizeof(bc1_block));
     ASSERT(decompressed != NULL);
 
-    for(uint32_t i=0; i<BC1_PACKED_NUM_STRIPS; ++i)
+    for(uint32_t i=0; i<BCP_NUM_STRIPS; ++i)
     {
-        ASSERT(bc1_packed_decompress(ctx, compressed_buffer, stream_size, width, height, decompressed, i));
+        ASSERT(bcp_decompress_bc1(ctx, compressed_buffer, stream_size, width, height, decompressed, i));
     }
 
     for(uint32_t i=0; i<num_blocks; ++i)
@@ -240,7 +240,7 @@ TEST stats_constant_image(void)
         ASSERT_EQ(decompressed[i].indices, 0x33333333);
     }
 
-    bc1_packed_terminate(ctx);
+    bcp_terminate(ctx);
 
     free(compressed_buffer);
     free(decompressed);
@@ -311,12 +311,12 @@ TEST strip_uniform_colors(void)
     const uint32_t width = TEST_IMAGE_WIDTH;
     const uint32_t height = TEST_IMAGE_HEIGHT;
     const uint32_t width_blocks = width / 4;
-    const uint32_t strip_width = (height / 4) / BC1_PACKED_NUM_STRIPS;
+    const uint32_t strip_width = (height / 4) / BCP_NUM_STRIPS;
 
     bc1_block image[TEST_IMAGE_SIZE];
 
     uint32_t rng_state = 0x1B2C3D4Eu;
-    for (uint32_t strip = 0; strip < BC1_PACKED_NUM_STRIPS; ++strip)
+    for (uint32_t strip = 0; strip < BCP_NUM_STRIPS; ++strip)
     {
         uint32_t r = splitmix32(&rng_state);
         uint16_t c0 = (uint16_t)(r & 0xFFFF);
@@ -377,7 +377,7 @@ TEST row_varying_colors(void)
     const uint32_t width_blocks = width / 4;
     const uint32_t height_blocks = height / 4;
 
-    ASSERT(height_blocks == BC1_PACKED_NUM_STRIPS * 2); // two scanlines per strip, so every prediction is reachable
+    ASSERT(height_blocks == BCP_NUM_STRIPS * 2); // two scanlines per strip, so every prediction is reachable
 
     bc1_block image[TEST_IMAGE_SIZE];
 
