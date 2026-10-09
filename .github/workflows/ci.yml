@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            config: Release
+          - os: macos-latest
+            config: Release
+          - os: windows-latest
+            config: Release
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -B build -S . -DCMAKE_BUILD_TYPE=${{ matrix.config }}
+
+      - name: Build
+        run: cmake --build build --config ${{ matrix.config }}
+
+      # Run from the project root: the image and benchmark tests load ./images.
+      - name: Test (Unix)
+        if: runner.os != 'Windows'
+        run: ./build/unit_tests
+
+      - name: Test (Windows)
+        if: runner.os == 'Windows'
+        run: .\build\${{ matrix.config }}\unit_tests.exe
