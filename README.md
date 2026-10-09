@@ -2,7 +2,7 @@
 
 An asymmetric lossless compressor for BC1 textures, designed for fast GPU decompression.
 
-The compressor works directly on a standard BC1 texture: 8 bytes per 4×4 block (two 16-bit 565 endpoint colors + one 32-bit word of 2-bit indices). At runtime, the compressed stream is uploaded to the GPU, decompressed with a compute shader, and written directly back to standard BC1 texture memory. The resulting textures can then be sampled normally.
+The compressor works directly on a standard BC1 texture: 8 bytes per 4×4 block (two 16-bit 565 endpoint colors + one 32-bit word of 2-bit indices). At runtime, the compressed stream is uploaded to the GPU, decompressed with a compute shader, and written directly back to standard BC1 texture memory.
 
 The compressor is CPU-side and can use significantly more computation than the decompressor.
 
@@ -16,6 +16,18 @@ The compressor is CPU-side and can use significantly more computation than the d
 Average compression ratio for 74 images in test is **1:47:1**
 
 Note: AI disclaimer, although everything is based on my ideas and my previous libraries, almost all the code was written by a LLM. It wouldn't have been possible with my fulltime job otherwise.
+
+## Library
+
+One c and one header, that's it, no dependency.
+
+Check the API in the header [bc_packed.h](src/bc_packed.h) it's well documented.
+
+[GPU decompression shader](src/bc_decompress.metal) is written in Metal Shader Language because I don't have a Windows computer at home. It should be easily translated in HLSL. 
+
+The format is designed to allow decompression (CPU or GPU) on multiple threads.
+
+**Note:** everything is unit tested, including the shader (only on macOS obviously)
 
 ## Design goals
 
@@ -214,31 +226,3 @@ Within a strip, the blocks are traversed in the zigzag row order. For each block
 
 See Color-pair dictionary. The six color deltas, the top-table reference, the mask, and the difference bytes are all encoded with Rice-Golomb using one of the 17 static models; each red/blue uses the model of its (channel, endpoint, context) — the three-bucket green delta described in Endpoints — and each green uses its endpoint's uncontexted model. The dictionary flag and reference are raw bits, not Rice-Golomb symbols.
 
-## Status
-
-The stream matches the format documented above, and both `bcp_compress_bc1` and `bcp_decompress_bc1` are implemented. All 17 models are image-wide: one `k` (the Rice parameter, or the raw flag + width in raw mode, see Rice-Golomb model) and one `q_escape` per model, no per-strip model state. The per-block color context (the three-bucket green delta) selects among the red/blue models; the color predictor flag (8 bytes in the header, see Per-strip predictor) selects between two predictors, it does not change any model. The color-pair dictionary (see Color-pair dictionary) adds a 1-bit flag + a variable-width reference per block of the enabled strips (the per-strip enable word, 8 header bytes); it is a breaking change against the previous format — both the CPU and the GPU decoders must read the enable word, the flag, and the reference.
-
-The 17-model header is a breaking change against the previous 9-model format (exp 19 in `failed_experiments.md`): the GPU decoder must load 17 models and select the red/blue model by context. Measured on the 74-image suite: +1.0% stream size (74/74 images improved, worst +0.19%) at neutral CPU decompression throughput (ground.png 1024², 18 threads, ≈3065 → ≈2970 MiB/s, inside run-to-run noise).
-
-* Both `bcp_compress_bc1` and `bcp_decompress_bc1` require `width >= 16` and `height >= 256` (pixels, multiples of 4), i.e. at least 4x64 blocks: smaller textures are rejected (0 returned / false returned).
-* CPU decompression (`bcp_decompress_bc1`) decodes one strip at a time; the unit tests decompress every strip and compare byte-exact against the input.
-* Unit tests (`tests/`) cover synthetic textures, a real-image roundtrip suite over `images/` (loaded with `stb_image.h`, converted with `stb_dxt.h` from `third_party/`, which the library itself does not depend on), and a multithreaded decompression benchmark.
-* Textures whose height in blocks is not a multiple of 64 (i.e. height not a multiple of 256) silently drop the trailing block rows.
-* GPU decoding is not part of this tree; the compute-shader decoder described in Design goals is the intended consumer of this stream (the static Rice-Golomb models are what keep it cheap to port).
-
-## Validation 
-
-Everything must be validated on CPU, on multiple images
-
-* Load a power-of-two image (third_party/stb_image.h)
-* Compress the image into standard BC1 (third_party/stb_dxt.h); this is both the input and the reference texture
-* bcp_compress_bc1; per-image stats (ratio, model parameters, payload bytes) are logged as a CSV to `logs/`
-* Compute the compression ratio against the standard BC1 size (8 bytes per 4x4 block)
-* bcp_decompress_bc1, compare the output, should be byte-exact with the input BC1
-* Gather total compression ratio
-* Proceed the next image
-
-
-To be interesting the ratio should be higher than 1.4x; the current 74-image suite averages ~1.46x without the color-pair dictionary and ~1.455x with it (the dictionary is a net win on structured textures and a small loss on feature-rich ones; see `failed_experiments.md`).
-
-Compression is expected to be a lot slower than decompression (the compressor scans the 256-entry color-pair dictionary of the previous blocks for every block).

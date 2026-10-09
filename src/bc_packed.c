@@ -1418,7 +1418,7 @@ size_t packed_bc1_maxsize(uint32_t width, uint32_t height)
 //-----------------------------------------------------------------------------------------------------------------------------
 size_t bcp_compress_bc1(bcp_context* ctx, const void* bc1_image, uint32_t width, uint32_t height, uint8_t* output, size_t output_length, uint32_t* num_strips)
 {
-    if (width < 16 || height < 256 || !bc1_image || !ctx || !output)
+    if (width < 16 || height < 256 || !bc1_image || !ctx || !output || !num_strips)
         return 0;
 
     *num_strips = 64;   // for now, could depend on the resolution in the future
