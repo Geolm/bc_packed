@@ -11,8 +11,13 @@ if(MSVC)
     set(CMAKE_C_FLAGS_DEBUG "/Zi /Od /DDEBUG /W4")
     set(CMAKE_C_FLAGS_RELEASE "/O2 /W4")
 else()
-    set(CMAKE_C_FLAGS_DEBUG "-g -O0 -DDEBUG -Wpedantic -Werror -Wall -Wextra -Wstrict-prototypes -Wgnu-empty-initializer -Wnewline-eof")
-    set(CMAKE_C_FLAGS_RELEASE "-O3 -Wpedantic -Werror -Wall -Wextra -Wstrict-prototypes -Wgnu-empty-initializer -Wnewline-eof")
+    set(CMAKE_C_FLAGS_DEBUG "-g -O0 -DDEBUG -Wpedantic -Werror -Wall -Wextra -Wstrict-prototypes")
+    set(CMAKE_C_FLAGS_RELEASE "-O3 -Wpedantic -Werror -Wall -Wextra -Wstrict-prototypes")
+    # These two diagnostics are Clang-only and are unknown to GCC.
+    if(CMAKE_C_COMPILER_ID MATCHES "Clang|AppleClang")
+        set(CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG} -Wgnu-empty-initializer -Wnewline-eof")
+        set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -Wgnu-empty-initializer -Wnewline-eof")
+    endif()
 endif()
 
 add_executable(unit_tests
