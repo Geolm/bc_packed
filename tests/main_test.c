@@ -9,7 +9,9 @@
 
 // Forward declaration for test suites
 void suite_synthetic(void);
+#ifdef HAS_IMAGE_TESTS
 void suite_image(void);
+#endif
 void suite_benchmark(void);
 
 #ifdef HAS_GPU_TESTS
@@ -29,7 +31,9 @@ int main(int argc, char **argv)
 {
     GREATEST_MAIN_BEGIN();
     RUN_SUITE(suite_synthetic);
+#ifdef HAS_IMAGE_TESTS
     RUN_SUITE(suite_image);
+#endif
     RUN_SUITE(suite_benchmark);
 #ifdef HAS_GPU_TESTS
     RUN_SUITE(suite_gpu);

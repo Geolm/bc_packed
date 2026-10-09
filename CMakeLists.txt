@@ -18,10 +18,14 @@ endif()
 add_executable(unit_tests
     ./src/bc_packed.c
     ./tests/benchmark_test.c
-    ./tests/image_tests.c
     ./tests/main_test.c
     ./tests/synthetic_tests.c
 )
+
+if(NOT WIN32)
+    target_compile_definitions(unit_tests PRIVATE HAS_IMAGE_TESTS)
+    target_sources(unit_tests PRIVATE ./tests/image_tests.c)
+endif()
 
 target_include_directories(unit_tests PRIVATE ./src ./third_party)
 
