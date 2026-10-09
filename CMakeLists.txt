@@ -45,5 +45,5 @@ if(APPLE)
 endif()
 
 if(UNIX AND NOT APPLE)
-    target_link_libraries(test m)
+    target_link_libraries(unit_tests PRIVATE m)
 endif()
