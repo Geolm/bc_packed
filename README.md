@@ -1,5 +1,7 @@
 # BC packed
 
+[![Build Status](https://github.com/Geolm/bc_crunch/actions/workflows/c.yml/badge.svg)](https://github.com/geolm/bc_packed/actions)
+
 An asymmetric lossless compressor for BC1 textures, designed for fast GPU decompression.
 
 The compressor works directly on a standard BC1 texture: 8 bytes per 4×4 block (two 16-bit 565 endpoint colors + one 32-bit word of 2-bit indices). At runtime, the compressed stream is uploaded to the GPU, decompressed with a compute shader, and written directly back to standard BC1 texture memory.
