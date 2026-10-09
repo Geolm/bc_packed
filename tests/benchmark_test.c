@@ -5,14 +5,14 @@
 
 
 // Single-header implementations, compiled only in this file.
-// sched.h's SCHED_ALIGNOF uses null pointer arithmetic, ignored here to keep -Werror clean.
+// enki_sched.h's SCHED_ALIGNOF uses null pointer arithmetic, ignored here to keep -Werror clean.
 #ifdef __clang__
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wnull-pointer-subtraction"
 #endif
 #define SCHED_STATIC
 #define SCHED_IMPLEMENTATION
-#include "sched.h"
+#include "enki_sched.h"
 #ifdef __clang__
 #pragma clang diagnostic pop
 #endif
