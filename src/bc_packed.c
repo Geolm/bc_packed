@@ -7,9 +7,6 @@
 #if defined(__aarch64__) || defined(_M_ARM64) || defined(__ARM_NEON)
     #include <arm_neon.h>
     #define BCP_NEON
-#else
-    #include <immintrin.h>
-    #define BCP_SSE
 #endif
 
 #if defined(_MSC_VER)
@@ -317,8 +314,8 @@ static inline void le_static_model_init(le_model *model, const uint32_t* histogr
         uint32_t max_q_escape = max_q + 1;
         if (max_q_escape > 31)
             max_q_escape = 31;
-        if (max_q_escape > 32 - candidate_k)
-            max_q_escape = 32 - candidate_k;
+        if (max_q_escape > 32u - candidate_k)
+            max_q_escape = 32u - candidate_k;
 
         uint64_t prefix = 0; // bits of the ranks with q < current Q, written with normal rice
         for (uint32_t q = 1; q <= max_q_escape; ++q)
@@ -847,44 +844,13 @@ uint32_t nearest32(const uint32_t* table, uint32_t table_size, uint32_t bitfield
         uint16x8_t half = vpaddlq_u8(vmulq_u8(nz_bytes, weight_bytes));
         vst1q_u32(&masks[i], vpaddlq_u16(half));
     }
-#else
-    const __m128i bf_vec   = _mm_set1_epi32(bitfield);
-    const __m128i mask_low = _mm_set1_epi8(0x0F);
-    const __m128i lookup   = _mm_setr_epi8(0,1,1,2,1,2,2,3,1,2,2,3,2,3,3,4);
-    const __m128i zero16   = _mm_setzero_si128();
-    const __m128i one8     = _mm_set1_epi8(1);
-    const __m128i weights  = _mm_setr_epi8(1,2,4,8, 1,2,4,8, 1,2,4,8, 1,2,4,8);
-    const __m128i one16    = _mm_set1_epi16(1);
 
-    for (; i + 3 < table_size; i += 4) 
-    {
-        __m128i x = _mm_xor_si128(_mm_loadu_si128((const __m128i*)&table[i]), bf_vec);
-
-        __m128i low  = _mm_and_si128(x, mask_low);
-        __m128i high = _mm_and_si128(_mm_srli_epi32(x, 4), mask_low); 
-        __m128i cnt  = _mm_add_epi8(_mm_shuffle_epi8(lookup, low), 
-                                    _mm_shuffle_epi8(lookup, high));
-
-        __m128i lo_words = _mm_and_si128(cnt, _mm_set1_epi16(0x00FF));
-        __m128i hi_words = _mm_srli_epi16(cnt, 8);
-        __m128i sums = _mm_add_epi16(lo_words, hi_words);
-        __m128i final = _mm_madd_epi16(sums, one16);
-
-        _mm_storeu_si128((__m128i*)&scores[i], final);
-
-        // differing-byte mask per entry: 1 per differing byte, weighted {1, 2, 4, 8} inside the entry then summed
-        __m128i nz_bytes = _mm_and_si128(_mm_cmpgt_epi8(cnt, zero16), one8);
-        __m128i half = _mm_maddubs_epi16(nz_bytes, weights);
-        _mm_storeu_si128((__m128i*)&masks[i], _mm_madd_epi16(half, one16));
-    }
-#endif
-
-    // tail (or whole array on x64)
+    // tail after the vector loop
     for (; i < table_size; ++i)
     {
         uint32_t difference = table[i] ^ bitfield;
         uint32_t score = popcount(difference);
-        if (score == 0) 
+        if (score == 0)
             return (0 << 16) | (i & 0xffff);
         scores[i] = score;
 
@@ -895,6 +861,24 @@ uint32_t nearest32(const uint32_t* table, uint32_t table_size, uint32_t bitfield
         if ((difference & 0xFF000000) != 0) mask |= 8;
         masks[i] = mask;
     }
+#else
+    // No vector ISA assumed: plain scalar loop over the whole table
+    for (; i < table_size; ++i)
+    {
+        uint32_t difference = table[i] ^ bitfield;
+        uint32_t score = popcount(difference);
+        if (score == 0)
+            return (0 << 16) | (i & 0xffff);
+        scores[i] = score;
+
+        uint32_t mask = 0;
+        if ((difference & 0x000000FF) != 0) mask |= 1;
+        if ((difference & 0x0000FF00) != 0) mask |= 2;
+        if ((difference & 0x00FF0000) != 0) mask |= 4;
+        if ((difference & 0xFF000000) != 0) mask |= 8;
+        masks[i] = mask;
+    }
+#endif
 
     // find best: lowest popcount, then fewest differing bytes, then the largest table value
     uint32_t best_index = 0;
