@@ -97,17 +97,6 @@ typedef struct le_model
     uint16_t num_symbols;
 } le_model;
 
-// compact model for small alphabets (the 8-symbol bc4/bc5 index models): the same fields as
-// le_model with rank tables sized at the alphabet, 20 bytes retained instead of 516
-typedef struct le_model8
-{
-    uint8_t alphabet[8];
-    uint8_t index[8];
-    uint8_t k;          // rice k-value
-    uint8_t q_escape;
-    uint8_t num_symbols; // 1 to 8 (0 → all-zero histogram, saved as a single dummy entry)
-} le_model8;
-
 //-----------------------------------------------------------------------------------------------------------------------------
 // pull bytes into the reservoir until it's full enough for any standard read
 static inline void le_refill(le_stream* s)
@@ -384,23 +373,6 @@ static inline void le_static_model_load(le_model *model, const uint8_t* alphabet
 }
 
 //-----------------------------------------------------------------------------------------------------------------------------
-// Fits a compact 8-symbol model: the full model builder is reused through a temporary, then the
-// rank tables are reduced to 8 entries (the builder always fills all 256 alphabet slots, so the
-// first 8 are always valid values even when num_symbols < 8)
-static inline void le_static_model_init8(le_model8 *model, const uint32_t* histogram, uint32_t num_symbols)
-{
-    le_model tmp;
-
-    le_static_model_init(&tmp, histogram, num_symbols);
-
-    memcpy(model->alphabet, tmp.alphabet, 8);
-    memcpy(model->index, tmp.index, 8);
-    model->k = tmp.k;
-    model->q_escape = tmp.q_escape;
-    model->num_symbols = (uint8_t)tmp.num_symbols;
-}
-
-//-----------------------------------------------------------------------------------------------------------------------------
 static inline void rice_encode(le_stream *s, uint32_t value, uint8_t k, uint8_t q_escape) 
 {
     uint32_t q = value >> k;
@@ -481,34 +453,6 @@ static inline uint8_t le_decode_symbol(le_stream *restrict s, le_model *restrict
         index = le_read_bits(s, (uint8_t)(model->k & 0x7f));
     else
         index = rice_decode(s, model->k, model->q_escape);
-
-    return model->alphabet[index];
-}
-
-//-----------------------------------------------------------------------------------------------------------------------------
-// le_encode_symbol for 8-symbol models: same raw / rice dispatch, the rank maps through the
-// 8-entry index table
-static inline void le_encode_symbol8(le_stream *s, le_model8 *model, uint8_t value)
-{
-    uint32_t index = model->index[value];
-
-    if (model->k & LE_K_RAW)
-        le_write_bits(s, index, (uint8_t)(model->k & 0x7f));
-    else
-        rice_encode(s, index, model->k, model->q_escape);
-}
-
-//-----------------------------------------------------------------------------------------------------------------------------
-// le_decode_symbol for 8-symbol models. On a corrupt stream a rice rank can exceed the 8-entry
-// alphabet, so it is masked back into range (the raw mode is structurally in range, width ≤ 3)
-static inline uint8_t le_decode_symbol8(le_stream *s, le_model8 *model)
-{
-    uint8_t index;
-
-    if (model->k & LE_K_RAW)
-        index = le_read_bits(s, (uint8_t)(model->k & 0x7f));
-    else
-        index = (uint8_t)rice_decode(s, model->k, model->q_escape) & 7;
 
     return model->alphabet[index];
 }
@@ -599,9 +543,10 @@ struct bcp_context
     uint64_t colors_bits, reference_bits, mask_bits, difference_bits;
 
     // bc4/bc5: per-channel static models — the 2 endpoint models (256 symbols) and the 24
-    // compact index models (8 symbols each, 3 endpoint-range families x 8 prediction values)
+    // index models (8 symbols each, 3 endpoint-range families x 8 prediction values); each
+    // retains the full 516-byte le_model in memory, the stream only stores num_symbols entries
     le_model bc4_endpoint_model[BCP_MAX_CHANNELS][2]; // [channel][endpoint]
-    le_model8 bc4_index_model[BCP_MAX_CHANNELS][BC4_INDEX_CONTEXTS];
+    le_model bc4_index_model[BCP_MAX_CHANNELS][BC4_INDEX_CONTEXTS];
     uint8_t bc4_strip_seed[BCP_MAX_CHANNELS][2]; // [channel][endpoint]
     uint64_t bc4_endpoint_bits, bc4_index_bits;
 };
@@ -1449,65 +1394,6 @@ static inline bool load_static_model(le_model* model, byte_stream* stream)
     return true;
 }
 
-//-----------------------------------------------------------------------------------------------------------------------------
-// save_static_model for 8-symbol models: identical stream layout (count - 1, k, q_escape,
-// rank table), the tables are simply smaller
-static inline bool save_static_model8(const le_model8* model, byte_stream* stream)
-{
-    uint32_t num_symbols = (model->num_symbols > 0) ? model->num_symbols : 1;
-
-    size_t model_size = 3 + num_symbols;
-
-    if (stream->pos + model_size > stream->length)
-        return false;
-
-    stream->buffer[stream->pos++] = (uint8_t)(num_symbols - 1); // minus 1 to store 8 symbols count on uint8_t
-    stream->buffer[stream->pos++] = model->k;
-    stream->buffer[stream->pos++] = model->q_escape;
-
-    for(uint32_t i=0; i<num_symbols; ++i)
-        stream->buffer[stream->pos++] = model->alphabet[i];
-
-    return true;
-}
-
-//-----------------------------------------------------------------------------------------------------------------------------
-// load_static_model8: mirror of save_static_model8, with an in-range guard on the rank table
-// entries (a corrupt entry ≥ 8 would overflow the 8-entry index table)
-static inline bool load_static_model8(le_model8* model, byte_stream* stream)
-{
-    if (stream->pos + 3 > stream->length)
-        return false;
-
-    uint32_t num_symbols = stream->buffer[stream->pos++] + 1;
-    uint8_t k = stream->buffer[stream->pos++];
-    uint8_t q_escape = stream->buffer[stream->pos++];
-
-    // k stores the raw-mode flag in bit 7 and a width / Rice parameter (≤ LE_MAX_K) in the lower bits
-    if ((k & 0x7f) > LE_MAX_K)
-        k = (uint8_t)((k & 0x80) | LE_MAX_K);
-
-    if ((num_symbols > 8) || (stream->pos + num_symbols > stream->length))
-        return false;
-
-    *model = (le_model8) {0};
-
-    for(uint32_t i=0; i<num_symbols; ++i)
-    {
-        uint8_t sym = stream->buffer[stream->pos++];
-
-        model->alphabet[i] = sym;
-        if (sym < 8)
-            model->index[sym] = (uint8_t)i;
-    }
-
-    model->k = k;
-    model->q_escape = q_escape;
-    model->num_symbols = (uint8_t)num_symbols;
-
-    return true;
-}
-
 
 //-----------------------------------------------------------------------------------------------------------------------------
 // BC4 / BC5
@@ -1691,7 +1577,7 @@ static void bc4_init_models(bcp_context* ctx, const void* image, uint32_t width_
         for(uint32_t e=0; e<2; ++e)
             le_static_model_init(&ctx->bc4_endpoint_model[c][e], &hist[c].endpoint[e][0], 256);
         for(uint32_t i=0; i<BC4_INDEX_CONTEXTS; ++i)
-            le_static_model_init8(&ctx->bc4_index_model[c][i], &hist[c].index[i][0], 8);
+            le_static_model_init(&ctx->bc4_index_model[c][i], &hist[c].index[i][0], 8);
     }
 }
 
@@ -1724,7 +1610,7 @@ static size_t bcp_compress_bc45(bcp_context* ctx, const void* image, uint32_t wi
             if (!save_static_model(&ctx->bc4_endpoint_model[c][e], &stream))
                 return 0;
         for(uint32_t i=0; i<BC4_INDEX_CONTEXTS; ++i)
-            if (!save_static_model8(&ctx->bc4_index_model[c][i], &stream))
+            if (!save_static_model(&ctx->bc4_index_model[c][i], &stream))
                 return 0;
     }
 
@@ -1822,7 +1708,7 @@ static size_t bcp_compress_bc45(bcp_context* ctx, const void* image, uint32_t wi
                     {
                         uint8_t p = ((i & 3) == 0) ? idx[i-4] : idx[i-1];
 
-                        le_encode_symbol8(&compressed_stream, &ctx->bc4_index_model[c][family * 8 + p], p ^ idx[i]);
+                        le_encode_symbol(&compressed_stream, &ctx->bc4_index_model[c][family * 8 + p], p ^ idx[i]);
                     }
                     stream_bits_since(&bit_pos, &compressed_stream, &ctx->bc4_index_bits);
 
@@ -1872,7 +1758,7 @@ static bool bcp_decompress_bc45(bcp_context* ctx, const void* input, size_t inpu
             if (!load_static_model(&ctx->bc4_endpoint_model[c][e], &stream))
                 return false;
         for(uint32_t i=0; i<BC4_INDEX_CONTEXTS; ++i)
-            if (!load_static_model8(&ctx->bc4_index_model[c][i], &stream))
+            if (!load_static_model(&ctx->bc4_index_model[c][i], &stream))
                 return false;
     }
 
@@ -1959,7 +1845,7 @@ static bool bcp_decompress_bc45(bcp_context* ctx, const void* input, size_t inpu
                 {
                     uint8_t p = ((i & 3) == 0) ? idx[i-4] : idx[i-1];
 
-                    idx[i] = (uint8_t)(p ^ le_decode_symbol8(&compressed_stream, &ctx->bc4_index_model[c][family * 8 + p]));
+                    idx[i] = (uint8_t)(p ^ le_decode_symbol(&compressed_stream, &ctx->bc4_index_model[c][family * 8 + p]));
                 }
 
                 bc4_pack_indices(idx, b);
