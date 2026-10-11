@@ -78,6 +78,51 @@ void bcp_get_stats(bcp_context* ctx, bcp_stats* stats);
 // Returns false on error otherwise true
 bool bcp_decompress_bc1(bcp_context* ctx, const void* input, size_t input_length, uint32_t width, uint32_t height, uint32_t num_strips, void* output, uint32_t strip_index);
 
+//----------------------------------------------------------------------------------------------------------------------------
+// Maximum size of the compressed stream for a given BC4 / BC5 texture, in bytes:
+// 2x the standard block size, 16 bytes per 4x4 block for BC4 and 32 for BC5.
+// The [output] buffer of bcp_compress_bc4 / bcp_compress_bc5 must be at least this large.
+size_t packed_bc4_maxsize(uint32_t width, uint32_t height);
+size_t packed_bc5_maxsize(uint32_t width, uint32_t height);
+
+//----------------------------------------------------------------------------------------------------------------------------
+// Compresses a BC4 / BC5 texture (width x height pixels, must be a multiple of 4) into [output].
+// [bc4_image] holds (width/4) * (height/4) standard BC4 blocks of 8 bytes each: two 8-bit
+// endpoints followed by the little-endian 48-bit field of the 16 3-bit indices (raster order).
+// [bc5_image] holds the standard 16-byte BC5 blocks: the red BC4 block followed by the green one.
+// [num_strips] receives the number of strips used for the compressed stream.
+// Returns the size of the compressed stream in bytes, or 0 on failure.
+size_t bcp_compress_bc4(bcp_context* ctx, const void* bc4_image, uint32_t width, uint32_t height, uint8_t* output, size_t output_length, uint32_t* num_strips);
+size_t bcp_compress_bc5(bcp_context* ctx, const void* bc5_image, uint32_t width, uint32_t height, uint8_t* output, size_t output_length, uint32_t* num_strips);
+
+//----------------------------------------------------------------------------------------------------------------------------
+// Extracts statistics after a successful bcp_compress_bc5: the *_bytes fields are the size in
+// bytes of each range-coded payload component, the stream additionally carries the static header.
+// pair_bytes is the whole index payload; dict_bytes is reserved for a future index dictionary
+// and is currently always 0.
+typedef struct bcp_stats_bc5
+{
+    uint32_t endpoint_bytes; // 4 endpoint delta symbols per block (2 endpoints x 2 channels)
+    uint32_t pair_bytes;     // index payload: 3 raw bits + 15 contextual symbols per channel block
+    uint32_t dict_bytes;     // reserved, always 0 for now
+} bcp_stats_bc5;
+
+void bcp_get_stats_bc5(bcp_context* ctx, bcp_stats_bc5* stats);
+
+//----------------------------------------------------------------------------------------------------------------------------
+// CPU decompression, for unit tests and validation.
+//
+// Decompress one strip of the image, for a complete image this function should be called [num_strips] times
+//      [input]         compressed data (output of bcp_compress_bc4 / bcp_compress_bc5)
+//      [input_length]  size in byte of the compressed data
+//      [width, height] dimensions of the output BC4 / BC5 image
+//      [num_strips]    number of strips, as returned by bcp_compress_bc4 / bcp_compress_bc5
+//      [output]        must be big enough to contain a BC4 / BC5 image of width x height
+//      [strip_index]   index of the strip, must be in [0; num_strips[
+// Returns false on error otherwise true
+bool bcp_decompress_bc4(bcp_context* ctx, const void* input, size_t input_length, uint32_t width, uint32_t height, uint32_t num_strips, void* output, uint32_t strip_index);
+bool bcp_decompress_bc5(bcp_context* ctx, const void* input, size_t input_length, uint32_t width, uint32_t height, uint32_t num_strips, void* output, uint32_t strip_index);
+
 #ifdef __cplusplus
 }
 #endif

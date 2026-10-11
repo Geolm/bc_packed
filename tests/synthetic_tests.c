@@ -548,10 +548,163 @@ TEST periodic_color_pairs(void)
 }
 
 //-----------------------------------------------------------------------------------------------------------------------------
+// BC4 / BC5 synthetic roundtrips, 256 x 256 = 4 x 64 blocks (the minimum supported image)
+#define TEST_BC45_WIDTH (256)
+#define TEST_BC45_HEIGHT (256)
+#define TEST_BC45_BLOCKS ((TEST_BC45_WIDTH/4) * (TEST_BC45_HEIGHT/4))
+
+//-----------------------------------------------------------------------------------------------------------------------------
+// helper function to validate a bc4/bc5 roundtrip: the compressed stream fits the documented
+// maxsize and decompressing all strips reproduces the input byte-exact
+TEST bc45_roundtrip(const void* image, uint32_t width, uint32_t height, uint32_t num_channels)
+{
+    const size_t block_bytes = num_channels * sizeof(bc4_block);
+    const size_t num_blocks = (size_t)(width / 4) * (height / 4);
+
+    bcp_context* ctx = bcp_init(NULL);
+    ASSERT(ctx != NULL);
+
+    size_t compressed_buffer_size = (num_channels == 1) ? packed_bc4_maxsize(width, height) : packed_bc5_maxsize(width, height);
+    void* compressed_buffer = malloc(compressed_buffer_size);
+    ASSERT(compressed_buffer != NULL);
+
+    uint32_t num_strips = 0;
+    size_t compressed_buffer_length = (num_channels == 1) ? bcp_compress_bc4(ctx, image, width, height, compressed_buffer, compressed_buffer_size, &num_strips)
+                                                          : bcp_compress_bc5(ctx, image, width, height, compressed_buffer, compressed_buffer_size, &num_strips);
+    ASSERT(compressed_buffer_length != 0);
+    ASSERT(compressed_buffer_length <= compressed_buffer_size);
+
+    uint8_t* decompressed = malloc(num_blocks * block_bytes);
+    ASSERT(decompressed != NULL);
+
+    for(uint32_t i=0; i<num_strips; ++i)
+    {
+        bool ok = (num_channels == 1) ? bcp_decompress_bc4(ctx, compressed_buffer, compressed_buffer_length, width, height, num_strips, decompressed, i)
+                                       : bcp_decompress_bc5(ctx, compressed_buffer, compressed_buffer_length, width, height, num_strips, decompressed, i);
+        ASSERT(ok);
+    }
+
+    for(size_t i=0; i<num_blocks * block_bytes; ++i)
+        ASSERT_EQ(decompressed[i], ((const uint8_t*)image)[i]);
+
+    bcp_terminate(ctx);
+
+    free(compressed_buffer);
+    free(decompressed);
+
+    PASS();
+}
+
+//-----------------------------------------------------------------------------------------------------------------------------
+// runs the image through both formats: 1 channel (BC4) and 2 channels (BC5, red + green)
+static greatest_test_res bc45_both(const bc4_block* image, uint32_t width, uint32_t height)
+{
+    // an assertion fails by returning, so propagate the result instead of discarding it
+    greatest_test_res res = bc45_roundtrip(image, width, height, 1);
+    if (res != GREATEST_TEST_RES_PASS)
+        return res;
+    return bc45_roundtrip(image, width, height, 2);
+}
+
+//-----------------------------------------------------------------------------------------------------------------------------
+// one solid block value: identical endpoints (range 0, family 0) and constant indices,
+// the degenerate single-symbol models
+TEST bc45_flat(void)
+{
+    bc4_block image[TEST_BC45_BLOCKS];
+
+    for(uint32_t i=0; i<TEST_BC45_BLOCKS; ++i)
+    {
+        image[i].endpoint[0] = 0xC0;
+        image[i].endpoint[1] = 0xC0;
+        for(uint32_t j=0; j<6; ++j)
+            image[i].indices[j] = 0x1B; // 3, 5, 3, 5, ... as 3-bit values
+    }
+
+    return bc45_both(image, TEST_BC45_WIDTH, TEST_BC45_HEIGHT);
+}
+
+//-----------------------------------------------------------------------------------------------------------------------------
+// alternating endpoint pairs (range 8, family 1) and index patterns across the block grid
+TEST bc45_checkerboard(void)
+{
+    bc4_block image[TEST_BC45_BLOCKS];
+    uint32_t blocks_per_row = TEST_BC45_WIDTH / 4;
+
+    for(uint32_t i=0; i<TEST_BC45_BLOCKS; ++i)
+    {
+        uint32_t bx = i % blocks_per_row;
+        uint32_t by = i / blocks_per_row;
+
+        if ((bx + by) % 2 == 0)
+        {
+            image[i].endpoint[0] = 0x30;
+            image[i].endpoint[1] = 0x28; // range 8 → family 1
+            for(uint32_t j=0; j<6; ++j)
+                image[i].indices[j] = (uint8_t)((bx + by + j) * 0x55);
+        }
+        else
+        {
+            image[i].endpoint[0] = 0x28;
+            image[i].endpoint[1] = 0x30;
+            for(uint32_t j=0; j<6; ++j)
+                image[i].indices[j] = (uint8_t)((bx * 3 + by * 5 + j) * 0x69);
+        }
+    }
+
+    return bc45_both(image, TEST_BC45_WIDTH, TEST_BC45_HEIGHT);
+}
+
+//-----------------------------------------------------------------------------------------------------------------------------
+// smooth endpoint gradient (wide ranges, family 2) with position-derived indices
+TEST bc45_gradient(void)
+{
+    bc4_block image[TEST_BC45_BLOCKS];
+    uint32_t blocks_per_row = TEST_BC45_WIDTH / 4;
+
+    for(uint32_t i=0; i<TEST_BC45_BLOCKS; ++i)
+    {
+        uint32_t bx = i % blocks_per_row;
+        uint32_t by = i / blocks_per_row;
+
+        image[i].endpoint[0] = (uint8_t)((bx * 3 + by) & 0xFF);
+        image[i].endpoint[1] = (uint8_t)((by * 5 + bx) & 0xFF);
+        for(uint32_t j=0; j<6; ++j)
+            image[i].indices[j] = (uint8_t)((bx ^ (by + j)) * 0x11);
+    }
+
+    return bc45_both(image, TEST_BC45_WIDTH, TEST_BC45_HEIGHT);
+}
+
+//-----------------------------------------------------------------------------------------------------------------------------
+// pseudo-random blocks: all families, near-uniform symbols (the raw-mode fallback) and full
+// 24-context usage in a single image
+TEST bc45_random_splitmix32(void)
+{
+    bc4_block image[TEST_BC45_BLOCKS];
+    uint32_t rng_state = 0x85EBCA6Bu;
+
+    for(uint32_t i=0; i<TEST_BC45_BLOCKS; ++i)
+    {
+        image[i].endpoint[0] = (uint8_t)splitmix32(&rng_state);
+        image[i].endpoint[1] = (uint8_t)splitmix32(&rng_state);
+        for(uint32_t j=0; j<6; ++j)
+            image[i].indices[j] = (uint8_t)splitmix32(&rng_state);
+    }
+
+    return bc45_both(image, TEST_BC45_WIDTH, TEST_BC45_HEIGHT);
+}
+
+
+//-----------------------------------------------------------------------------------------------------------------------------
 SUITE(suite_synthetic)
 {
     (void)flat;
     (void)checkerboard;
+    (void)bc45_flat;
+    (void)bc45_checkerboard;
+    (void)bc45_gradient;
+    (void)bc45_random_splitmix32;
     (void)gradient;
     (void)random_splitmix32;
     (void)color0_le_color1;
@@ -569,6 +722,10 @@ SUITE(suite_synthetic)
     RUN_TEST(checkerboard);
     RUN_TEST(gradient);
     RUN_TEST(random_splitmix32);
+    RUN_TEST(bc45_flat);
+    RUN_TEST(bc45_checkerboard);
+    RUN_TEST(bc45_gradient);
+    RUN_TEST(bc45_random_splitmix32);
     RUN_TEST(color0_le_color1);
     RUN_TEST(identical_colors);
     RUN_TEST(stats_constant_image);
