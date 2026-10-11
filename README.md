@@ -1,6 +1,6 @@
 # BC packed
 
-[![Build Status](https://github.com/Geolm/bc_packed/actions/workflows/c.yml/badge.svg)](https://github.com/geolm/bc_packed/actions)
+[![Build Status](https://github.com/Geolm/bc_packed/actions/workflows/ci.yml/badge.svg)](https://github.com/geolm/bc_packed/actions)
 
 An asymmetric lossless compressor for BC1, BC4 and BC5 textures. BC1 is designed for fast GPU decompression; BC4 and BC5 currently ship a CPU decoder only (see the BC4 / BC5 section) — the GPU support is a follow-up task.
 
