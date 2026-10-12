@@ -2,20 +2,20 @@
 
 [![Build Status](https://github.com/Geolm/bc_packed/actions/workflows/ci.yml/badge.svg)](https://github.com/geolm/bc_packed/actions)
 
-An asymmetric lossless compressor for BC1, BC4 and BC5 textures. BC1 is designed for fast GPU decompression; BC4 and BC5 currently ship a CPU decoder only (see the BC4 / BC5 section) — the GPU support is a follow-up task.
+An asymmetric lossless compressor for BC1, BC4 and BC5 textures, all three designed for fast GPU decompression (BC4 / BC5 reuse the BC1 machinery, see the BC4 / BC5 section).
 
 The compressor works directly on a standard BC1 texture: 8 bytes per 4×4 block (two 16-bit 565 endpoint colors + one 32-bit word of 2-bit indices). At runtime, the compressed stream is uploaded to the GPU, decompressed with a compute shader, and written directly back to standard BC1 texture memory.
 
 The compressor is CPU-side and can use significantly more computation than the decompressor.
 
-| Hardware |  Processor | Throughput                |
+| Hardware |  Processor | BC1 throughput                |
 |:-----: | :------------: | ----- |
 |      M5 Pro | CPU 18 cores | 2500 MiB/s      |
 |      M5 Pro | GPU | 15300 MiB/s      |
 |      M2 Max | CPU 12 cores | 1300 MiB/s      |
 |      M2 Max | GPU | 11850 MiB/s      |
 
-Average compression ratio for 74 images in test is **1.46:1**
+Average BC1 compression ratio for 74 images in test is **1.46:1**
 
 Note: AI disclaimer, although everything is based on my ideas and my previous libraries, almost all the code was written by a LLM. It wouldn't have been possible with my fulltime job otherwise.
 
@@ -297,16 +297,18 @@ For BC5 the red channel's models and seed come first, then the green channel's, 
 
 ### Status
 
-* CPU roundtrip only: `bcp_compress_bc4/bc5` and `bcp_decompress_bc4/bc5` are implemented and tested; a GPU decoder for BC4 / BC5 is a follow-up task.
+* CPU + GPU: `bcp_compress_bc4/bc5` and `bcp_decompress_bc4/bc5` are implemented and tested; the GPU decoders are the `bcp_decompress_bc4` / `bcp_decompress_bc5` compute kernels of [src/bc_decompress.metal](src/bc_decompress.metal): one thread per strip, bit-identical to the CPU. Measured on the M5 Pro (1024×1024, 1000 runs): **14540 MiB/s** for BC4, **7868 MiB/s** for BC5.
 * `width >= 16` and `height >= 256` are required (multiples of 4, as BC1); textures whose height in blocks is not a multiple of 64 silently drop the trailing block rows.
 * The output buffer must be at least `packed_bc4_maxsize` / `packed_bc5_maxsize` — 2× the standard block size (16 / 32 bytes per 4×4 block), the BC1 convention.
 * `bcp_get_stats_bc5` reports the range-coded payload after a successful `bcp_compress_bc5`: `endpoint_bytes`, `pair_bytes` (the whole index payload), and `dict_bytes` (reserved for a future index dictionary, currently 0).
 
 ### Validation
 
-Everything is validated on CPU, byte-exact roundtrips over all 64 strips:
+Everything is validated byte-exact over all 64 strips, on CPU and GPU:
 
-* 8 synthetic 256×256 roundtrips (flat, checkerboard, gradient, SplitMix32 random, each as BC4 and BC5): the random pattern forces the raw-mode fallback and the full 24-context usage.
-* 4 AO maps (`images/bc4`) and 4 normal maps (`images/bc5`), 1024×1024, converted per block with stb_dxt: the per-image ratio is printed to stdout (no CSV) and the suite average must stay above 1:1. Measured: **1.1244:1** average for BC4 (1.0868 – 1.1680 per image) and **1.0756:1** for BC5 (1.0466 – 1.0990 per image).
+* GPU roundtrips: the `bcp_decompress_bc4` / `bcp_decompress_bc5` Metal kernels decode the brick AO / normal maps (1024×1024, `images/bc4` / `images/bc5`) and the result is verified byte-identical to the stb-built textures, the same way the BC1 kernel is tested.
+
+* CPU: 8 synthetic 256×256 roundtrips (flat, checkerboard, gradient, SplitMix32 random, each as BC4 and BC5): the random pattern forces the raw-mode fallback and the full 24-context usage.
+* CPU: 4 AO maps (`images/bc4`) and 4 normal maps (`images/bc5`), 1024×1024, converted per block with stb_dxt: the per-image ratio is printed to stdout (no CSV) and the suite average must stay above 1:1. Measured: **1.1244:1** average for BC4 (1.0868 – 1.1680 per image) and **1.0756:1** for BC5 (1.0466 – 1.0990 per image). BC5 compression ratio looks modest but zlib only achieves 1.010563:1 for the same images.
 
 The 8-bit formats leave less headroom than BC1: the indices of these maps sit close to 3 near-uniform bits each, so most of the gain comes from the endpoint deltas.
