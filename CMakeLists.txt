@@ -6,6 +6,8 @@ if(CMAKE_GENERATOR STREQUAL "Xcode")
     set(CMAKE_OSX_DEPLOYMENT_TARGET "15.0")
 endif()
 
+option(BC_PACKED_ADDRESS_SANITIZER "Build with AddressSanitizer (ASan)" OFF)
+
 set(CMAKE_C_STANDARD 11)
 if(MSVC)
     set(CMAKE_C_FLAGS_DEBUG "/Zi /Od /DDEBUG /W4")
@@ -33,6 +35,18 @@ if(NOT WIN32)
 endif()
 
 target_include_directories(unit_tests PRIVATE ./src ./third_party)
+
+if(BC_PACKED_ADDRESS_SANITIZER)
+    if(MSVC)
+        set(ASAN_FLAGS /fsanitize=address)
+    else()
+        # -fno-omit-frame-pointer improves ASan stack traces.
+        set(ASAN_FLAGS -fsanitize=address -fno-omit-frame-pointer)
+    endif()
+    # Applied to all configurations so the option works in Debug and Release.
+    target_compile_options(unit_tests PRIVATE ${ASAN_FLAGS})
+    target_link_options(unit_tests PRIVATE ${ASAN_FLAGS})
+endif()
 
 if(APPLE)
     # Metal is only available on Apple platforms, so the GPU tests are macOS-only.

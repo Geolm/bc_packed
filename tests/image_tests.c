@@ -163,9 +163,145 @@ TEST test_all_images_in_folder(const char *dir_path)
 }
 
 
+//-----------------------------------------------------------------------------------------------------------------------------
+// BC4 / BC5 image roundtrips on the hardcoded sets of images/bc4 (AO maps) and images/bc5
+// (normal maps, red + green channels). the filenames are hardcoded, the folder is not scanned,
+// and the per-image ratios are printed to stdout (no CSV): the average must stay above 1:1
+static const char* const bc4_image_filenames[] =
+{
+    "images/bc4/grey_roof_tiles_02_ao_1k.png",
+    "images/bc4/patterned_cobblestone_ao_1k.png",
+    "images/bc4/red_brick_ao_1k.png",
+    "images/bc4/rough_wood_ao_1k.png"
+};
+
+static const char* const bc5_image_filenames[] =
+{
+    "images/bc5/grey_roof_tiles_02_nor_dx_1k.png",
+    "images/bc5/patterned_cobblestone_nor_dx_1k.png",
+    "images/bc5/red_brick_nor_dx_1k.png",
+    "images/bc5/rough_wood_nor_dx_1k.png"
+};
+
+static greatest_test_res run_bc_image_suite(bool bc5)
+{
+    const char* const* filenames = bc5 ? bc5_image_filenames : bc4_image_filenames;
+    const uint32_t num_filenames = sizeof(bc4_image_filenames) / sizeof(bc4_image_filenames[0]);
+
+    bcp_context* ctx = bcp_init(NULL);
+    ASSERT(ctx != NULL);
+
+    float global_ratio = 0.f;
+    uint32_t num_images = 0;
+
+    for(uint32_t i=0; i<num_filenames; ++i)
+    {
+        // load the source image and convert to the standard bc4 / bc5 blocks with stb_dxt
+        uint32_t width, height, num_channels;
+        uint8_t* rgba = stbi_load(filenames[i], (int*)&width, (int*)&height, (int*)&num_channels, 4);
+        ASSERT(rgba != NULL);
+
+        uint32_t width_blocks = width / 4;
+        uint32_t height_blocks = height / 4;
+        uint32_t num_blocks = width_blocks * height_blocks;
+        const size_t block_bytes = bc5 ? 16 : 8;
+
+        uint8_t* bc_image = malloc(num_blocks * block_bytes);
+        uint8_t* decompressed = malloc(num_blocks * block_bytes);
+        ASSERT(bc_image != NULL && decompressed != NULL);
+
+        for(uint32_t by=0; by<height_blocks; ++by)
+        {
+            for(uint32_t bx=0; bx<width_blocks; ++bx)
+            {
+                uint8_t block_image[32]; // bc4: 16 bytes of one channel, bc5: 32 interleaved red + green
+
+                for(uint32_t j=0; j<4; ++j)
+                {
+                    for(uint32_t k=0; k<4; ++k)
+                    {
+                        const uint8_t* px = &rgba[((by * 4 + j) * width + (bx * 4 + k)) * 4];
+                        uint8_t* dst = &block_image[(j * 4 + k) * (bc5 ? 2 : 1)];
+
+                        dst[0] = px[0];
+                        if (bc5)
+                            dst[1] = px[1]; // red and green channels of the normal map
+                    }
+                }
+
+                if (bc5)
+                    stb_compress_bc5_block(&bc_image[(by * width_blocks + bx) * 16], block_image);
+                else
+                    stb_compress_bc4_block(&bc_image[(by * width_blocks + bx) * 8], block_image);
+            }
+        }
+
+        // compress the bc4 / bc5 image and report the ratio against the standard block size
+        size_t compressed_buffer_size = bc5 ? packed_bc5_maxsize(width, height) : packed_bc4_maxsize(width, height);
+        uint8_t* compressed_buffer = malloc(compressed_buffer_size);
+        ASSERT(compressed_buffer != NULL);
+
+        uint32_t num_strips = 0;
+        size_t compressed_buffer_length = bc5 ? bcp_compress_bc5(ctx, bc_image, width, height, compressed_buffer, compressed_buffer_size, &num_strips)
+                                              : bcp_compress_bc4(ctx, bc_image, width, height, compressed_buffer, compressed_buffer_size, &num_strips);
+        ASSERT(compressed_buffer_length != 0);
+        ASSERT(compressed_buffer_length <= compressed_buffer_size);
+
+        const float compression_ratio = (float)(num_blocks * block_bytes) / (float)compressed_buffer_length;
+        fprintf(stdout, "%s: %u x %u, %s ratio %.4f:1 (stream %zu bytes)\n",
+            filenames[i], width, height, bc5 ? "bc5" : "bc4", compression_ratio, compressed_buffer_length);
+
+        global_ratio += compression_ratio;
+        num_images++;
+
+        // roundtrip test: decompress every strip, byte-exact against the standard blocks
+        for(uint32_t s=0; s<num_strips; ++s)
+        {
+            bool ok = bc5 ? bcp_decompress_bc5(ctx, compressed_buffer, compressed_buffer_length, width, height, num_strips, decompressed, s)
+                          : bcp_decompress_bc4(ctx, compressed_buffer, compressed_buffer_length, width, height, num_strips, decompressed, s);
+            ASSERT(ok);
+        }
+
+        for(size_t j=0; j<num_blocks * block_bytes; ++j)
+            ASSERT_EQ(decompressed[j], bc_image[j]);
+
+        stbi_image_free(rgba);
+        free(bc_image);
+        free(decompressed);
+        free(compressed_buffer);
+    }
+
+    const float average_compression_ratio = global_ratio / (float)num_images;
+
+    fprintf(stdout, "==> %s: %u images, average compression ratio : %2.4f:1\n\n", bc5 ? "bc5" : "bc4", num_images, average_compression_ratio);
+
+    bcp_terminate(ctx);
+
+    ASSERT(average_compression_ratio >= 1.0f);
+
+    PASS();
+}
+
+//-----------------------------------------------------------------------------------------------------------------------------
+TEST bc4_images(void)
+{
+    // an assertion fails by returning, so propagate the result
+    return run_bc_image_suite(false);
+}
+
+//-----------------------------------------------------------------------------------------------------------------------------
+TEST bc5_images(void)
+{
+    // an assertion fails by returning, so propagate the result
+    return run_bc_image_suite(true);
+}
+
+
 SUITE(suite_image)
 {
     RUN_TEST1(test_all_images_in_folder, "./images/");
+    RUN_TEST(bc4_images);
+    RUN_TEST(bc5_images);
 }
 
 

@@ -2,20 +2,20 @@
 
 [![Build Status](https://github.com/Geolm/bc_packed/actions/workflows/ci.yml/badge.svg)](https://github.com/geolm/bc_packed/actions)
 
-An asymmetric lossless compressor for BC1 textures, designed for fast GPU decompression.
+An asymmetric lossless compressor for BC1, BC4 and BC5 textures, all three designed for fast GPU decompression (BC4 / BC5 reuse the BC1 machinery, see the BC4 / BC5 section).
 
 The compressor works directly on a standard BC1 texture: 8 bytes per 4×4 block (two 16-bit 565 endpoint colors + one 32-bit word of 2-bit indices). At runtime, the compressed stream is uploaded to the GPU, decompressed with a compute shader, and written directly back to standard BC1 texture memory.
 
 The compressor is CPU-side and can use significantly more computation than the decompressor.
 
-| Hardware |  Processor | Throughput                |
+| Hardware |  Processor | BC1 throughput                |
 |:-----: | :------------: | ----- |
 |      M5 Pro | CPU 18 cores | 2500 MiB/s      |
 |      M5 Pro | GPU | 15300 MiB/s      |
 |      M2 Max | CPU 12 cores | 1300 MiB/s      |
 |      M2 Max | GPU | 11850 MiB/s      |
 
-Average compression ratio for 74 images in test is **1:47:1**
+Average BC1 compression ratio for 74 images in test is **1.46:1**
 
 Note: AI disclaimer, although everything is based on my ideas and my previous libraries, almost all the code was written by a LLM. It wouldn't have been possible with my fulltime job otherwise.
 
@@ -229,11 +229,95 @@ Within a strip, the blocks are traversed in the zigzag row order. For each block
 See Color-pair dictionary. The six color deltas, the top-table reference, the mask, and the difference bytes are all encoded with Rice-Golomb using one of the 17 static models; each red/blue uses the model of its (channel, endpoint, context) — the three-bucket green delta described in Endpoints — and each green uses its endpoint's uncontexted model. The dictionary flag and reference are raw bits, not Rice-Golomb symbols.
 
 
+=======
+## BC4 / BC5
+
+BC4 (one 8-bit channel) and BC5 (red + green channels) reuse the BC1 machinery: static Rice-Golomb models fitted from a histogram pre-pass, 64 independent strips, and a self-describing byte stream. The entry points are `packed_bc4_maxsize` / `packed_bc5_maxsize`, `bcp_compress_bc4` / `bcp_compress_bc5`, `bcp_get_stats_bc5`, and `bcp_decompress_bc4` / `bcp_decompress_bc5` (see `src/bc_packed.h`), with the same signature shape as their BC1 counterparts.
+
+### Blocks
+
+The standard D3D layout, consumed and reproduced byte-exact:
+
+```c
+// 8 bytes per 4x4 block
+uint8_t endpoint[2]; // [0] = max endpoint, [1] = min endpoint (as stb writes them)
+uint8_t indices[6];  // little-endian 48-bit field: the 16 x 3-bit indices in raster order, index 0 = top-left
+```
+
+A BC5 block is the red BC4 block followed by the green one (16 bytes). The library does not depend on stb; the unit tests build these blocks from images with `stb_compress_bc4_block` / `stb_compress_bc5_block` from `third_party/`.
+
+### Endpoints
+
+Each channel carries two 8-bit endpoints per block. The encoder predicts the current endpoint from the strip chain and stores the wrapped 8-bit delta (`curr - pred`, decoded as `pred + delta`, modulo 256) with one static 256-symbol Rice-Golomb model per (channel, endpoint).
+
+The predictor is fixed — no per-strip flag, unlike the BC1 per-strip choice:
+
+```text
+first row of a strip:   pred = previous              (the strip seed for the strip's first block)
+start of a row:         pred = top
+other blocks:           pred = previous + top - top_previous   (mod 256)
+```
+
+`previous` is the chain-previous block in the BC1 zigzag order, `top` the block of the row above at the same column, `top_previous` the block above the chain-previous. All references stay inside the strip, so the 64 strips remain independent. The strip seed is the per-endpoint average of the first block of each strip, stored in the stream header like the BC1 color seed.
+
+### Indices
+
+The 16 3-bit indices of a block are encoded in raster order:
+
+```text
+index 0:   3 raw bits (no model)
+index i:   symbol = prediction XOR index[i], encoded with a static 8-symbol Rice-Golomb model
+           prediction = index[i-1]   (left)
+                       index[i-4]    (directly above, for the rows at offset 4, 8, 12)
+           context    = family * 8 + prediction
+```
+
+That is 3 endpoint-range families x 8 prediction values = 24 index models per channel. The family is derived from the block's own, already decoded endpoints, so the model selection costs no stream bits:
+
+```text
+family = |endpoint0 - endpoint1|  (unsigned range in [0; 255])
+         < 8  → 0,  < 16 → 1,  else → 2
+```
+
+The 8-symbol models use a compact rank table (8 entries instead of 256): `3 + num_symbols ≤ 11` bytes each in the stream. The family thresholds (8 / 16) are the design values; refining them (for example into more range buckets) is the obvious tuning lever if the ratio needs more headroom.
+
+### Compressed stream
+
+As BC1, the stream does not include width, height or format: the BC4 / BC5 decompressors are separate entry points and know their own header.
+
+```text
+* 2 endpoint models per channel — 256-symbol static models, 3 + num_symbols bytes each, no padding (max 259).
+* 24 index models per channel — 8-symbol static models, 3 + num_symbols bytes each, no padding (max 11).
+* Strip seed: 2 bytes per channel (endpoint 0, endpoint 1).
+* Padded to a 2-byte boundary.
+* 63 strip offsets (uint16_t each), relative deltas in dword units. Strip 0 always starts the strip data; its offset is zero and not stored.
+* Padded to a 4-byte boundary.
+* 64 strip bitstreams, each 4-byte aligned, each flushed independently.
+```
+
+For BC5 the red channel's models and seed come first, then the green channel's, then the shared offsets and strips. Within a strip the blocks follow the zigzag row order; per block the payload is the red channel complete, then the green one, and per channel: endpoint 0, endpoint 1, index 0 (3 raw bits), then indices 1..15.
+
+### Status
+
+* CPU + GPU: `bcp_compress_bc4/bc5` and `bcp_decompress_bc4/bc5` are implemented and tested; the GPU decoders are the `bcp_decompress_bc4` / `bcp_decompress_bc5` compute kernels of [src/bc_decompress.metal](src/bc_decompress.metal): one thread per strip, bit-identical to the CPU. Measured on the M5 Pro (1024×1024, 1000 runs): **14540 MiB/s** for BC4, **7868 MiB/s** for BC5.
+* `width >= 16` and `height >= 256` are required (multiples of 4, as BC1); textures whose height in blocks is not a multiple of 64 silently drop the trailing block rows.
+* The output buffer must be at least `packed_bc4_maxsize` / `packed_bc5_maxsize` — 2× the standard block size (16 / 32 bytes per 4×4 block), the BC1 convention.
+* `bcp_get_stats_bc5` reports the range-coded payload after a successful `bcp_compress_bc5`: `endpoint_bytes`, `pair_bytes` (the whole index payload), and `dict_bytes` (reserved for a future index dictionary, currently 0).
+
+### Validation
+
+Everything is validated byte-exact over all 64 strips, on CPU and GPU:
+
+* GPU roundtrips: the `bcp_decompress_bc4` / `bcp_decompress_bc5` Metal kernels decode the brick AO / normal maps (1024×1024, `images/bc4` / `images/bc5`) and the result is verified byte-identical to the stb-built textures, the same way the BC1 kernel is tested.
+
+* CPU: 8 synthetic 256×256 roundtrips (flat, checkerboard, gradient, SplitMix32 random, each as BC4 and BC5): the random pattern forces the raw-mode fallback and the full 24-context usage.
+* CPU: 4 AO maps (`images/bc4`) and 4 normal maps (`images/bc5`), 1024×1024, converted per block with stb_dxt: the per-image ratio is printed to stdout (no CSV) and the suite average must stay above 1:1. Measured: **1.1244:1** average for BC4 (1.0868 – 1.1680 per image) and **1.0756:1** for BC5 (1.0466 – 1.0990 per image). BC5 compression ratio looks modest but zlib only achieves 1.010563:1 for the same images.
+
+The 8-bit formats leave less headroom than BC1: the indices of these maps sit close to 3 near-uniform bits each, so most of the gain comes from the endpoint deltas.
+
 ## Images 
 
 The images used in the unit test come from this sources:
 
 https://opengameart.org/content/tiny-texture-pack-2
 https://r0k.us/graphics/kodak/
-
-
