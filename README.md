@@ -1,6 +1,6 @@
 # BC packed
 
-[![Build Status](https://github.com/Geolm/bc_crunch/actions/workflows/c.yml/badge.svg)](https://github.com/geolm/bc_packed/actions)
+[![Build Status](https://github.com/Geolm/bc_packed/actions/workflows/ci.yml/badge.svg)](https://github.com/geolm/bc_packed/actions)
 
 An asymmetric lossless compressor for BC1 textures, designed for fast GPU decompression.
 
