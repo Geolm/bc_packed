@@ -228,3 +228,12 @@ Within a strip, the blocks are traversed in the zigzag row order. For each block
 
 See Color-pair dictionary. The six color deltas, the top-table reference, the mask, and the difference bytes are all encoded with Rice-Golomb using one of the 17 static models; each red/blue uses the model of its (channel, endpoint, context) — the three-bucket green delta described in Endpoints — and each green uses its endpoint's uncontexted model. The dictionary flag and reference are raw bits, not Rice-Golomb symbols.
 
+
+## Images 
+
+The images used in the unit test come from this sources:
+
+https://opengameart.org/content/tiny-texture-pack-2
+https://r0k.us/graphics/kodak/
+
+
