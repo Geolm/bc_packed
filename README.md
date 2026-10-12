@@ -320,4 +320,5 @@ The 8-bit formats leave less headroom than BC1: the indices of these maps sit cl
 The images used in the unit test come from this sources:
 
 https://opengameart.org/content/tiny-texture-pack-2
+
 https://r0k.us/graphics/kodak/
