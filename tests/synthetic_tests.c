@@ -191,66 +191,6 @@ TEST identical_colors(void)
 }
 
 //-----------------------------------------------------------------------------------------------------------------------------
-// Stats on a constant image. the assertions are cross-output invariants documented by the
-// public API only: the stream fits the reported maxsize, and the sum of the reported
-// payload components never exceeds the stream size (the stream additionally carries the
-// static header). no assumption is made about how the payload is coded internally;
-// the roundtrip must stay exact
-TEST stats_constant_image(void)
-{
-    const uint32_t width = TEST_IMAGE_WIDTH;
-    const uint32_t height = TEST_IMAGE_HEIGHT;
-    const uint32_t num_blocks = (width / 4) * (height / 4);
-
-    bc1_block image[TEST_IMAGE_SIZE];
-    for(uint32_t i=0; i<num_blocks; ++i)
-        image[i] = (bc1_block)
-        {
-            .color = {red, cyan},
-            .indices = 0x33333333
-        };
-
-    bcp_context* ctx = bcp_init(NULL);
-    ASSERT(ctx != NULL);
-
-    size_t compressed_buffer_size = packed_bc1_maxsize(width, height);
-    void* compressed_buffer = malloc(compressed_buffer_size);
-    ASSERT(compressed_buffer != NULL);
-
-    uint32_t num_strips = 0;
-    size_t stream_size = bcp_compress_bc1(ctx, image, width, height, compressed_buffer, compressed_buffer_size, &num_strips);
-    ASSERT(stream_size != 0);
-    ASSERT(stream_size <= compressed_buffer_size);
-
-    // the reported payload components are parts of the stream, so their sum fits the stream
-    bcp_stats stats;
-    bcp_get_stats(ctx, &stats);
-    const uint64_t payload = (uint64_t)stats.colors_bytes + stats.reference_bytes + stats.mask_bytes + stats.difference_bytes;
-    ASSERT(payload <= (uint64_t)stream_size);
-
-    // roundtrip
-    bc1_block* decompressed = malloc(num_blocks * sizeof(bc1_block));
-    ASSERT(decompressed != NULL);
-
-    for(uint32_t i=0; i<num_strips; ++i)
-    {
-        ASSERT(bcp_decompress_bc1(ctx, compressed_buffer, stream_size, width, height, num_strips, decompressed, i));
-    }
-
-    for(uint32_t i=0; i<num_blocks; ++i)
-    {
-        ASSERT_EQ(decompressed[i].indices, 0x33333333);
-    }
-
-    bcp_terminate(ctx);
-
-    free(compressed_buffer);
-    free(decompressed);
-
-    PASS();
-}
-
-//-----------------------------------------------------------------------------------------------------------------------------
 // Multi-resolution roundtrip testing with SplitMix32 random blocks
 TEST variable_resolutions_random(void)
 {
@@ -738,6 +678,163 @@ TEST bc45_random_splitmix32(void)
 
 
 //-----------------------------------------------------------------------------------------------------------------------------
+// helper function to validate a bc3 roundtrip: the compressed stream fits the documented
+// maxsize and decompressing all strips reproduces the input byte-exact
+// [image] is the standard 16-byte BC3 layout: a bc1_block followed by a bc4_block, 16 bytes per block
+TEST bc3_roundtrip(const bc3_block* image, uint32_t width, uint32_t height)
+{
+    const size_t num_blocks = (width/4) * (height/4);
+    bcp_context* ctx = bcp_init(NULL);
+    ASSERT(ctx != NULL);
+
+    size_t compressed_buffer_size = packed_bc3_maxsize(width, height);
+    void* compressed_buffer = malloc(compressed_buffer_size);
+    ASSERT(compressed_buffer != NULL);
+
+    uint32_t num_strips = 0;
+    size_t compressed_buffer_length = bcp_compress_bc3(ctx, image, width, height, compressed_buffer, compressed_buffer_size, &num_strips);
+    ASSERT(compressed_buffer_length != 0);
+    ASSERT(compressed_buffer_length <= compressed_buffer_size);
+
+    uint8_t* decompressed = malloc(num_blocks * sizeof(bc3_block));
+    ASSERT(decompressed != NULL);
+
+    for(uint32_t i=0; i<num_strips; ++i)
+    {
+        ASSERT(bcp_decompress_bc3(ctx, compressed_buffer, compressed_buffer_length, width, height, num_strips, decompressed, i));
+    }
+
+    for(size_t i=0; i<num_blocks * sizeof(bc3_block); ++i)
+        ASSERT_EQ(decompressed[i], ((const uint8_t*)image)[i]);
+
+    bcp_terminate(ctx);
+
+    free(compressed_buffer);
+    free(decompressed);
+
+    PASS();
+}
+
+
+//-----------------------------------------------------------------------------------------------------------------------------
+// one solid color + one solid alpha: the degenerate single-symbol models of both halves
+TEST bc3_flat(void)
+{
+    bc3_block image[TEST_BC45_BLOCKS];
+
+    for(uint32_t i=0; i<TEST_BC45_BLOCKS; ++i)
+    {
+        image[i].color.color[0] = red;
+        image[i].color.color[1] = cyan;
+        image[i].color.indices = 0x33333333;
+
+        image[i].alpha.endpoint[0] = 0xC0;
+        image[i].alpha.endpoint[1] = 0xC0;
+        for(uint32_t j=0; j<6; ++j)
+            image[i].alpha.indices[j] = 0x1B;
+    }
+
+    return bc3_roundtrip(image, TEST_BC45_WIDTH, TEST_BC45_HEIGHT);
+}
+
+
+//-----------------------------------------------------------------------------------------------------------------------------
+// alternating color and alpha patterns across the block grid
+TEST bc3_checkerboard(void)
+{
+    bc3_block image[TEST_BC45_BLOCKS];
+    uint32_t blocks_per_row = TEST_BC45_WIDTH / 4;
+
+    for(uint32_t i=0; i<TEST_BC45_BLOCKS; ++i)
+    {
+        uint32_t bx = i % blocks_per_row;
+        uint32_t by = i / blocks_per_row;
+
+        if ((bx + by) % 2 == 0)
+        {
+            image[i].color.color[0] = red;
+            image[i].color.color[1] = cyan;
+            image[i].color.indices = 0x33333333;
+
+            image[i].alpha.endpoint[0] = 0x30;
+            image[i].alpha.endpoint[1] = 0x28;
+            for(uint32_t j=0; j<6; ++j)
+                image[i].alpha.indices[j] = (uint8_t)((bx + by + j) * 0x55);
+        }
+        else
+        {
+            image[i].color.color[0] = cyan;
+            image[i].color.color[1] = red;
+            image[i].color.indices = 0xCCCCCCCC;
+
+            image[i].alpha.endpoint[0] = 0x28;
+            image[i].alpha.endpoint[1] = 0x30;
+            for(uint32_t j=0; j<6; ++j)
+                image[i].alpha.indices[j] = (uint8_t)((bx * 3 + by * 5 + j) * 0x69);
+        }
+    }
+
+    return bc3_roundtrip(image, TEST_BC45_WIDTH, TEST_BC45_HEIGHT);
+}
+
+
+//-----------------------------------------------------------------------------------------------------------------------------
+// smooth gradients in both halves: the endpoint deltas of the color and the alpha stay small
+TEST bc3_gradient(void)
+{
+    bc3_block image[TEST_BC45_BLOCKS];
+    uint32_t blocks_per_row = TEST_BC45_WIDTH / 4;
+    uint32_t num_rows = TEST_BC45_HEIGHT / 4;
+
+    for(uint32_t i=0; i<TEST_BC45_BLOCKS; ++i)
+    {
+        uint32_t bx = i % blocks_per_row;
+        uint32_t by = i / blocks_per_row;
+
+        image[i].color.color[0] = (uint16_t)(((bx * 31) / blocks_per_row) << 11) | (uint16_t)(((by * 63) / num_rows) << 5);
+        image[i].color.color[1] = (uint16_t)(((by * 31) / num_rows) << 11) | (uint16_t)((((blocks_per_row - 1 - bx) * 31) / blocks_per_row));
+        image[i].color.indices = (bx * 0x11111111u) ^ (by * 0x22222222u);
+
+        image[i].alpha.endpoint[0] = (uint8_t)((bx * 3 + by) & 0xFF);
+        image[i].alpha.endpoint[1] = (uint8_t)((by * 5 + bx) & 0xFF);
+        for(uint32_t j=0; j<6; ++j)
+            image[i].alpha.indices[j] = (uint8_t)((bx ^ (by + j)) * 0x11);
+    }
+
+    return bc3_roundtrip(image, TEST_BC45_WIDTH, TEST_BC45_HEIGHT);
+}
+
+
+//-----------------------------------------------------------------------------------------------------------------------------
+// pseudo-random blocks in both halves: near-uniform symbols (the raw-mode fallback) and full
+// context usage in a single image
+TEST bc3_random_splitmix32(void)
+{
+    bc3_block image[TEST_BC45_BLOCKS];
+    uint32_t rng_state = 0x85EBCA6Bu;
+
+    for(uint32_t i=0; i<TEST_BC45_BLOCKS; ++i)
+    {
+        uint32_t r1 = splitmix32(&rng_state);
+        uint32_t r2 = splitmix32(&rng_state);
+
+        image[i].color = (bc1_block)
+        {
+            .color = {(uint16_t)(r1 & 0xFFFF), (uint16_t)(r1 >> 16)},
+            .indices = r2
+        };
+
+        image[i].alpha.endpoint[0] = (uint8_t)splitmix32(&rng_state);
+        image[i].alpha.endpoint[1] = (uint8_t)splitmix32(&rng_state);
+        for(uint32_t j=0; j<6; ++j)
+            image[i].alpha.indices[j] = (uint8_t)splitmix32(&rng_state);
+    }
+
+    return bc3_roundtrip(image, TEST_BC45_WIDTH, TEST_BC45_HEIGHT);
+}
+
+
+//-----------------------------------------------------------------------------------------------------------------------------
 SUITE(suite_synthetic)
 {
     (void)flat;
@@ -746,11 +843,14 @@ SUITE(suite_synthetic)
     (void)bc45_checkerboard;
     (void)bc45_gradient;
     (void)bc45_random_splitmix32;
+    (void)bc3_flat;
+    (void)bc3_checkerboard;
+    (void)bc3_gradient;
+    (void)bc3_random_splitmix32;
     (void)gradient;
     (void)random_splitmix32;
     (void)color0_le_color1;
     (void)identical_colors;
-    (void)stats_constant_image;
     (void)strip_uniform_colors;
     (void)all_distinct_indices;
     (void)row_varying_colors;
@@ -767,9 +867,12 @@ SUITE(suite_synthetic)
     RUN_TEST(bc45_checkerboard);
     RUN_TEST(bc45_gradient);
     RUN_TEST(bc45_random_splitmix32);
+    RUN_TEST(bc3_flat);
+    RUN_TEST(bc3_checkerboard);
+    RUN_TEST(bc3_gradient);
+    RUN_TEST(bc3_random_splitmix32);
     RUN_TEST(color0_le_color1);
     RUN_TEST(identical_colors);
-    RUN_TEST(stats_constant_image);
     RUN_TEST(strip_uniform_colors);
     RUN_TEST(variable_resolutions_random);
     RUN_TEST(all_distinct_indices);

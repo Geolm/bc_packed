@@ -539,16 +539,12 @@ struct bcp_context
     // matching blocks) pay no flag overhead. see the per-strip dictionary enable in init_static_models
     uint64_t strip_dict_enable;
 
-    // bit counters of the range-coded payload, per component
-    uint64_t colors_bits, reference_bits, mask_bits, difference_bits;
-
     // bc4/bc5: per-channel static models — the 2 endpoint models (256 symbols) and the 24
     // index models (8 symbols each, 3 endpoint-range families x 8 prediction values); each
     // retains the full 516-byte le_model in memory, the stream only stores num_symbols entries
     le_model bc4_endpoint_model[BCP_MAX_CHANNELS][2]; // [channel][endpoint]
     le_model bc4_index_model[BCP_MAX_CHANNELS][BC4_INDEX_CONTEXTS];
     uint8_t bc4_strip_seed[BCP_MAX_CHANNELS][2]; // [channel][endpoint]
-    uint64_t bc4_endpoint_bits, bc4_index_bits;
 };
 
 typedef struct bc1_block
@@ -930,7 +926,7 @@ uint32_t nearest32(const uint32_t* table, uint32_t table_size, uint32_t bitfield
 // [sample_step] to keep the round cheap, and [start_offset] de-aliases consecutive rounds.
 // The bucket feedback drops the skip while the accumulated popcount error is high, so a round
 // adapts between the two: with [sample_step] 1 both branches advance by one block.
-static void vq_refine_round(const void* input, uint32_t num_blocks, uint32_t* centroids, uint32_t num_centroids,
+static void vq_refine_round(const void* input, uint32_t num_blocks, uint32_t block_stride, uint32_t* centroids, uint32_t num_centroids,
                             vq_cluster* clusters, uint32_t sample_step, uint32_t start_offset)
 {
     for(uint32_t i=0; i<num_centroids; ++i)
@@ -947,7 +943,7 @@ static void vq_refine_round(const void* input, uint32_t num_blocks, uint32_t* ce
     // find the best cluster for each sampled block, jittering the first block
     for(uint32_t block_index=start_offset; block_index<num_blocks;)
     {
-        const bc1_block* b = (const bc1_block*) input + block_index;
+        const bc1_block* b = (const bc1_block*) input + block_index * block_stride;
 
         uint32_t result = nearest32(centroids, num_centroids, b->indices);
         uint32_t score = (result >> 16);
@@ -986,7 +982,7 @@ static void vq_refine_round(const void* input, uint32_t num_blocks, uint32_t* ce
 }
 
 //----------------------------------------------------------------------------------------------------------------------------
-void vq_top_table(const void* input, uint32_t num_blocks, uint32_t* output, uint32_t* num_entries)
+void vq_top_table(const void* input, uint32_t num_blocks, uint32_t block_stride, uint32_t* output, uint32_t* num_entries)
 {
     // static array of odd steps to avoid aliasing and branches
     // first iteration is always 1 to ensure 100% initial coverage, and the two final full-assignment
@@ -1003,7 +999,7 @@ void vq_top_table(const void* input, uint32_t num_blocks, uint32_t* output, uint
 
     // multiple iterations to stabilize the clusters
     for(uint32_t iteration=0; iteration<6; ++iteration)
-        vq_refine_round(input, num_blocks, centroids, *num_entries, clusters, steps[iteration], iteration % steps[iteration]);
+        vq_refine_round(input, num_blocks, block_stride, centroids, *num_entries, clusters, steps[iteration], iteration % steps[iteration]);
 
     uint32_t num_clusters = 0;
 
@@ -1017,7 +1013,7 @@ void vq_top_table(const void* input, uint32_t num_blocks, uint32_t* output, uint
 }
 
 //----------------------------------------------------------------------------------------------------------------------------
-void build_top_table(hashmap_entry* hashmap, const void* input, uint32_t num_blocks, uint32_t* output, uint32_t* num_entries)
+void build_top_table(hashmap_entry* hashmap, const void* input, uint32_t num_blocks, uint32_t block_stride, uint32_t* output, uint32_t* num_entries)
 {
     // clear the hashmap
     for(uint32_t i=0; i<HASHMAP_SIZE; ++i)
@@ -1026,7 +1022,7 @@ void build_top_table(hashmap_entry* hashmap, const void* input, uint32_t num_blo
     // insert all blocks indices in the hashmap
     for(uint32_t i=0; i<num_blocks; ++i)
     {
-        const bc1_block* b = (const bc1_block*) input + i;
+        const bc1_block* b = (const bc1_block*) input + i * block_stride;
 
         uint32_t h = hash32(b->indices);
         uint32_t index = h & (HASHMAP_SIZE - 1);
@@ -1090,7 +1086,7 @@ void build_top_table(hashmap_entry* hashmap, const void* input, uint32_t num_blo
             (*num_entries)++;
     }
 
-    vq_top_table(input, num_blocks, output, num_entries);
+    vq_top_table(input, num_blocks, block_stride, output, num_entries);
 
     // an empty top table corrupts the stream (the size is stored as size-1 in a byte, 0 reads back as 256 entries),
     // fall back to the single most frequent exact pattern, the hashmap still holds the exact pattern counts
@@ -1134,7 +1130,7 @@ static inline void init_color_models(bcp_context* ctx, const color_hists* hist)
 }
 
 //-----------------------------------------------------------------------------------------------------------------------------
-void init_static_models(bcp_context* ctx, const void* input, uint32_t width_blocks, uint32_t strip_width, uint32_t num_strips)
+void init_static_models(bcp_context* ctx, const void* input, uint32_t width_blocks, uint32_t strip_width, uint32_t num_strips, uint32_t block_stride)
 {
     color_hists hist;
     uint32_t hist_reference[TOP_TABLE_SIZE];
@@ -1154,7 +1150,7 @@ void init_static_models(bcp_context* ctx, const void* input, uint32_t width_bloc
         uint32_t start_y = strip_index * strip_width;
         uint32_t zigzag_x = (start_y & 1) ? 0 : width_blocks - 1;
 
-        const bc1_block* first = (const bc1_block*) input + (start_y * width_blocks) + zigzag_x;
+        const bc1_block* first = (const bc1_block*) input + ((start_y * width_blocks) + zigzag_x) * block_stride;
 
         for(uint32_t j=0; j<2; ++j)
         {
@@ -1188,11 +1184,11 @@ void init_static_models(bcp_context* ctx, const void* input, uint32_t width_bloc
             for(uint32_t x = 0; x < width_blocks; ++x)
             {
                 uint32_t zigzag_x = (y&1) ? x : width_blocks - x - 1;
-                const bc1_block* current = (const bc1_block*) input + (y * width_blocks) + zigzag_x;
+                const bc1_block* current = (const bc1_block*) input + ((y * width_blocks) + zigzag_x) * block_stride;
 
                 const bc1_block* top = &previous;
                 if (y > start_y)
-                    top = (const bc1_block*) input + (y - 1) * width_blocks + zigzag_x; // same zigzag position, row above
+                    top = (const bc1_block*) input + ((y - 1) * width_blocks + zigzag_x) * block_stride; // same zigzag position, row above
 
                 energy_previous += color_delta_energy(current, &previous);
                 energy_top += color_delta_energy(current, top);
@@ -1223,13 +1219,13 @@ void init_static_models(bcp_context* ctx, const void* input, uint32_t width_bloc
                 // zig-zag pattern delta compression for colors
                 uint32_t zigzag_x = (y&1) ? x : width_blocks - x - 1;
 
-                const bc1_block* current = (const bc1_block*) input + (y * width_blocks) + zigzag_x;
+                const bc1_block* current = (const bc1_block*) input + ((y * width_blocks) + zigzag_x) * block_stride;
 
                 // first scanline of a strip is always predicted from the seed via the zigzag-previous
                 // chain, after that a top-flagged strip is predicted from the row above, same zigzag position
                 const bc1_block* color_reference = &previous;
                 if (use_top && y > start_y)
-                    color_reference = (const bc1_block*) input + (y - 1) * width_blocks + zigzag_x;
+                    color_reference = (const bc1_block*) input + ((y - 1) * width_blocks + zigzag_x) * block_stride;
 
                 color_hists_add(&hist, current, color_reference);
 
@@ -1282,12 +1278,12 @@ void init_static_models(bcp_context* ctx, const void* input, uint32_t width_bloc
                 // zig-zag pattern delta compression for colors
                 uint32_t zigzag_x = (y&1) ? x : width_blocks - x - 1;
 
-                const bc1_block* current = (const bc1_block*) input + (y * width_blocks) + zigzag_x;
+                const bc1_block* current = (const bc1_block*) input + ((y * width_blocks) + zigzag_x) * block_stride;
                 uint32_t position = (y - start_y) * width_blocks + x;
 
                 const bc1_block* color_reference = &previous;
                 if (use_top && y > start_y)
-                    color_reference = (const bc1_block*) input + (y - 1) * width_blocks + zigzag_x;
+                    color_reference = (const bc1_block*) input + ((y - 1) * width_blocks + zigzag_x) * block_stride;
 
                 if (color_dict_match(&dict, position, color_pair(current)) > 0)
                 {
@@ -1335,16 +1331,6 @@ static inline void read_stream_align(byte_stream* stream, size_t power_two_align
 {
     size_t mask = power_two_alignment - 1;
     stream->pos = (stream->pos + mask) & ~(mask);
-}
-
-//-----------------------------------------------------------------------------------------------------------------------------
-// Adds to [count] the bits written to [stream] since the last call, and updates [bit_pos] to the current bit position.
-// [bit_pos] must be initialized to 0 after le_begin_encode.
-static inline void stream_bits_since(uint64_t* bit_pos, const le_stream* stream, uint64_t* count)
-{
-    const uint64_t pos = (uint64_t)stream->position * 8 + stream->bits_available;
-    *count += pos - *bit_pos;
-    *bit_pos = pos;
 }
 
 //-----------------------------------------------------------------------------------------------------------------------------
@@ -1478,7 +1464,7 @@ typedef struct bc4_hists
 // Fits the bc4/bc5 static models from [input]: the per-channel strip seed is the average of the
 // first block of each strip in chain order (as BC1), then one histogram pass with the exact
 // strip predictors of the encoder. there is no per-strip mode decision, so a single fit is final
-static void bc4_init_models(bcp_context* ctx, const void* image, uint32_t width_blocks, uint32_t strip_width, uint32_t num_strips, uint32_t num_channels)
+static void bc4_init_models(bcp_context* ctx, const void* image, uint32_t width_blocks, uint32_t strip_width, uint32_t num_strips, uint32_t num_channels, uint32_t block_stride)
 {
     bc4_hists hist[BCP_MAX_CHANNELS] = { 0 };
     uint32_t sums[BCP_MAX_CHANNELS][2] = { 0 };
@@ -1492,7 +1478,7 @@ static void bc4_init_models(bcp_context* ctx, const void* image, uint32_t width_
 
         for(uint32_t c=0; c<num_channels; ++c)
         {
-            const bc4_block* b = (const bc4_block*)image + (start_y * width_blocks + x0) * num_channels + c;
+            const bc4_block* b = (const bc4_block*)image + (start_y * width_blocks + x0) * block_stride + c;
 
             sums[c][0] += b->endpoint[0];
             sums[c][1] += b->endpoint[1];
@@ -1531,13 +1517,13 @@ static void bc4_init_models(bcp_context* ctx, const void* image, uint32_t width_
 
                 for(uint32_t c=0; c<num_channels; ++c)
                 {
-                    const bc4_block* b = (const bc4_block*)image + (y * width_blocks + zigzag_x) * num_channels + c;
+                    const bc4_block* b = (const bc4_block*)image + (y * width_blocks + zigzag_x) * block_stride + c;
                     uint8_t idx[16];
 
                     if (!first_row)
                     {
                         // the block of the row above, same physical column (within the strip)
-                        const bc4_block* t = (const bc4_block*)image + ((y - 1) * width_blocks + zigzag_x) * num_channels + c;
+                        const bc4_block* t = (const bc4_block*)image + ((y - 1) * width_blocks + zigzag_x) * block_stride + c;
                         top_e[c][0] = t->endpoint[0];
                         top_e[c][1] = t->endpoint[1];
                     }
@@ -1584,22 +1570,18 @@ static void bc4_init_models(bcp_context* ctx, const void* image, uint32_t width_
 //-----------------------------------------------------------------------------------------------------------------------------
 // Compresses a BC4 / BC5 texture: [image] holds (width/4) * (height/4) blocks, each
 // [num_channels] bc4_block (1 for BC4, red + green for BC5). shared by the two formats
-static size_t bcp_compress_bc45(bcp_context* ctx, const void* image, uint32_t width, uint32_t height, uint8_t* output, size_t output_length, uint32_t* num_strips, uint32_t num_channels)
+static size_t bcp_compress_bc45(bcp_context* ctx, const void* image, uint32_t width, uint32_t height, uint8_t* output, size_t output_length, uint32_t* num_strips, uint32_t num_channels, uint32_t block_stride)
 {
     if ((width < 16) || (height < 256) || !image || !ctx || !output || !num_strips || (num_channels < 1) || (num_channels > BCP_MAX_CHANNELS))
         return 0;
 
     *num_strips = 64;   // for now, could depend on the resolution in the future
 
-    // reset stats, they are only valid after a successful compression
-    ctx->bc4_endpoint_bits = 0;
-    ctx->bc4_index_bits = 0;
-
     const uint32_t height_blocks = height / 4;
     const uint32_t width_blocks = width / 4;
     const uint32_t strip_width = height_blocks / *num_strips;
 
-    bc4_init_models(ctx, image, width_blocks, strip_width, *num_strips, num_channels);
+    bc4_init_models(ctx, image, width_blocks, strip_width, *num_strips, num_channels, block_stride);
 
     byte_stream stream = {.buffer = output, .length = output_length, .pos = 0};
 
@@ -1651,8 +1633,6 @@ static size_t bcp_compress_bc45(bcp_context* ctx, const void* image, uint32_t wi
             strips_offset[strip_index - 1] = (uint16_t)((stream.pos - previous_offset) / sizeof(uint32_t));
         previous_offset = stream.pos;
 
-        uint64_t bit_pos = 0; // current bit position, used to measure the per-component stats
-
         uint8_t prev_e[BCP_MAX_CHANNELS][2], top_e[BCP_MAX_CHANNELS][2], top_prev_e[BCP_MAX_CHANNELS][2];
         for(uint32_t c=0; c<num_channels; ++c)
         {
@@ -1677,12 +1657,12 @@ static size_t bcp_compress_bc45(bcp_context* ctx, const void* image, uint32_t wi
 
                 for(uint32_t c=0; c<num_channels; ++c)
                 {
-                    const bc4_block* b = (const bc4_block*)image + (y * width_blocks + zigzag_x) * num_channels + c;
+                    const bc4_block* b = (const bc4_block*)image + (y * width_blocks + zigzag_x) * block_stride + c;
                     uint8_t idx[16];
 
                     if (!first_row)
                     {
-                        const bc4_block* t = (const bc4_block*)image + ((y - 1) * width_blocks + zigzag_x) * num_channels + c;
+                        const bc4_block* t = (const bc4_block*)image + ((y - 1) * width_blocks + zigzag_x) * block_stride + c;
                         top_e[c][0] = t->endpoint[0];
                         top_e[c][1] = t->endpoint[1];
                     }
@@ -1694,7 +1674,6 @@ static size_t bcp_compress_bc45(bcp_context* ctx, const void* image, uint32_t wi
 
                         le_encode_symbol(&compressed_stream, &ctx->bc4_endpoint_model[c][e], delta_encode_wrap(pred, b->endpoint[e]));
                     }
-                    stream_bits_since(&bit_pos, &compressed_stream, &ctx->bc4_endpoint_bits);
 
                     // index payload: the first index in raw 3 bits, then each index xored with its
                     // intra-block prediction, contextual on the family and the prediction value
@@ -1710,7 +1689,6 @@ static size_t bcp_compress_bc45(bcp_context* ctx, const void* image, uint32_t wi
 
                         le_encode_symbol(&compressed_stream, &ctx->bc4_index_model[c][family * 8 + p], p ^ idx[i]);
                     }
-                    stream_bits_since(&bit_pos, &compressed_stream, &ctx->bc4_index_bits);
 
                     if (!first_row)
                     {
@@ -1740,7 +1718,7 @@ static size_t bcp_compress_bc45(bcp_context* ctx, const void* image, uint32_t wi
 //-----------------------------------------------------------------------------------------------------------------------------
 // Decompresses one strip of a BC4 / BC5 stream: the mirror of bcp_compress_bc45, the strip-chain
 // references (top / top_previous) are read back from [output], which holds the decoded rows
-static bool bcp_decompress_bc45(bcp_context* ctx, const void* input, size_t input_length, uint32_t width, uint32_t height, uint32_t num_strips, void* output, uint32_t strip_index, uint32_t num_channels)
+static bool bcp_decompress_bc45(bcp_context* ctx, const void* input, size_t input_length, uint32_t width, uint32_t height, uint32_t num_strips, void* output, uint32_t strip_index, uint32_t num_channels, uint32_t block_stride)
 {
     if ((width < 16) || (height < 256) || !input || !ctx || !output || (num_strips == 0) || (strip_index >= num_strips) || (num_channels < 1) || (num_channels > BCP_MAX_CHANNELS))
         return false;
@@ -1817,12 +1795,12 @@ static bool bcp_decompress_bc45(bcp_context* ctx, const void* input, size_t inpu
 
             for(uint32_t c=0; c<num_channels; ++c)
             {
-                bc4_block* b = (bc4_block*)output + (y * width_blocks + zigzag_x) * num_channels + c;
+                bc4_block* b = (bc4_block*)output + (y * width_blocks + zigzag_x) * block_stride + c;
                 uint8_t idx[16];
 
                 if (!first_row)
                 {
-                    const bc4_block* t = (const bc4_block*)output + ((y - 1) * width_blocks + zigzag_x) * num_channels + c;
+                    const bc4_block* t = (const bc4_block*)output + ((y - 1) * width_blocks + zigzag_x) * block_stride + c;
                     top_e[c][0] = t->endpoint[0];
                     top_e[c][1] = t->endpoint[1];
                 }
@@ -1892,18 +1870,14 @@ size_t packed_bc1_maxsize(uint32_t width, uint32_t height)
 }
 
 //-----------------------------------------------------------------------------------------------------------------------------
-size_t bcp_compress_bc1(bcp_context* ctx, const void* bc1_image, uint32_t width, uint32_t height, uint8_t* output, size_t output_length, uint32_t* num_strips)
+// [block_stride] is the distance between blocks in units of bc1_block: 1 for a plain BC1 grid,
+// 2 for the color half of a BC3 grid (see bcp_compress_bc3)
+static size_t bcp_compress_bc1_impl(bcp_context* ctx, const void* bc1_image, uint32_t block_stride, uint32_t width, uint32_t height, uint8_t* output, size_t output_length, uint32_t* num_strips)
 {
     if (width < 16 || height < 256 || !bc1_image || !ctx || !output || !num_strips)
         return 0;
 
     *num_strips = 64;   // for now, could depend on the resolution in the future
-
-    // reset stats, they are only valid after a successful compression
-    ctx->colors_bits = 0;
-    ctx->reference_bits = 0;
-    ctx->mask_bits = 0;
-    ctx->difference_bits = 0;
 
     const uint32_t num_blocks = (width*height) / 16;
     const uint32_t height_blocks = height / 4;
@@ -1913,8 +1887,8 @@ size_t bcp_compress_bc1(bcp_context* ctx, const void* bc1_image, uint32_t width,
     if (ctx->hashmap == NULL)
         ctx->hashmap = ctx->mem.malloc_fn(sizeof(hashmap_entry) * HASHMAP_SIZE, ctx->mem.user);
 
-    build_top_table(ctx->hashmap, bc1_image, num_blocks, ctx->top_table, &ctx->top_table_size);
-    init_static_models(ctx, bc1_image, width_blocks, strip_width, *num_strips);
+    build_top_table(ctx->hashmap, bc1_image, num_blocks, block_stride, ctx->top_table, &ctx->top_table_size);
+    init_static_models(ctx, bc1_image, width_blocks, strip_width, *num_strips, block_stride);
 
     byte_stream stream = {.buffer = output, .length = output_length, .pos = 0};
 
@@ -1979,8 +1953,6 @@ size_t bcp_compress_bc1(bcp_context* ctx, const void* bc1_image, uint32_t width,
             strips_offset[strip_index - 1] = (uint16_t)((stream.pos - previous_offset) / sizeof(uint32_t));
         previous_offset = stream.pos;
 
-        uint64_t bit_pos = 0; // current bit position, used to measure the per-component stats
-
         bc1_block previous;
         unpack_strip_seed(ctx->strip_seed, &previous);
         color_dict dict;
@@ -1995,7 +1967,7 @@ size_t bcp_compress_bc1(bcp_context* ctx, const void* bc1_image, uint32_t width,
             {
                 // zig-zag pattern delta compression for colors
                 uint32_t zigzag_x = (y&1) ? x : width_blocks - x - 1;
-                const bc1_block* current = (const bc1_block*) bc1_image + (y * width_blocks) + zigzag_x;
+                const bc1_block* current = (const bc1_block*) bc1_image + ((y * width_blocks) + zigzag_x) * block_stride;
 
                 uint32_t position = (y - start_y) * width_blocks + x;
                 uint32_t pair = color_pair(current);
@@ -2016,7 +1988,7 @@ size_t bcp_compress_bc1(bcp_context* ctx, const void* bc1_image, uint32_t width,
                     // chain, after that a top-flagged strip is predicted from the row above, same zigzag position
                     const bc1_block* color_reference = &previous;
                     if (use_top && y > start_y)
-                        color_reference = (const bc1_block*) bc1_image + (y - 1) * width_blocks + zigzag_x;
+                        color_reference = (const bc1_block*) bc1_image + ((y - 1) * width_blocks + zigzag_x) * block_stride;
 
                     for(uint32_t j=0; j<2; ++j)
                     {
@@ -2043,12 +2015,9 @@ size_t bcp_compress_bc1(bcp_context* ctx, const void* bc1_image, uint32_t width,
                         le_encode_symbol(&compressed_stream, &ctx->blue_model[j][chroma_context], dblue + COLOR_DELTA_OFFSET);
                     }
                 }
-                stream_bits_since(&bit_pos, &compressed_stream, &ctx->colors_bits);
-
                 uint8_t reference = nearest32(ctx->top_table, ctx->top_table_size, current->indices) & 0xff;
 
                 le_encode_symbol(&compressed_stream, &ctx->table_reference_model, reference);
-                stream_bits_since(&bit_pos, &compressed_stream, &ctx->reference_bits);
 
                 uint32_t difference = current->indices ^ ctx->top_table[reference];
                 uint32_t mask = 0;
@@ -2058,12 +2027,10 @@ size_t bcp_compress_bc1(bcp_context* ctx, const void* bc1_image, uint32_t width,
                 if ((difference & 0xFF000000) != 0) mask |= 8;
 
                 le_encode_symbol(&compressed_stream, &ctx->mask_model, mask);
-                stream_bits_since(&bit_pos, &compressed_stream, &ctx->mask_bits);
 
                 for(uint32_t j=0; j<4; ++j)
                     if (mask & (1u << j))
                         le_encode_symbol(&compressed_stream, &ctx->table_difference_model, (difference >> (j*8)) & 0xff);
-                stream_bits_since(&bit_pos, &compressed_stream, &ctx->difference_bits);
 
                 dict.entry[position & COLOR_DICT_MASK] = pair;
                 previous = *current;
@@ -2085,7 +2052,15 @@ size_t bcp_compress_bc1(bcp_context* ctx, const void* bc1_image, uint32_t width,
 }
 
 //-----------------------------------------------------------------------------------------------------------------------------
-bool bcp_decompress_bc1(bcp_context* ctx, const void* input, size_t input_length, uint32_t width, uint32_t height, uint32_t num_strips, void* output, uint32_t strip_index)
+size_t bcp_compress_bc1(bcp_context* ctx, const void* bc1_image, uint32_t width, uint32_t height, uint8_t* output, size_t output_length, uint32_t* num_strips)
+{
+    return bcp_compress_bc1_impl(ctx, bc1_image, 1, width, height, output, output_length, num_strips);
+}
+
+//-----------------------------------------------------------------------------------------------------------------------------
+// [block_stride] is the distance between blocks in units of bc1_block: 1 for a plain BC1 grid,
+// 2 for the color half of a BC3 grid (see bcp_decompress_bc3)
+static bool bcp_decompress_bc1_impl(bcp_context* ctx, const void* input, size_t input_length, uint32_t width, uint32_t height, uint32_t num_strips, void* output, uint32_t strip_index, uint32_t block_stride)
 {
     if (width < 16 || height < 256 || !input || !ctx || !output || strip_index >= num_strips)
         return false;
@@ -2177,7 +2152,7 @@ bool bcp_decompress_bc1(bcp_context* ctx, const void* input, size_t input_length
         for(uint32_t x = 0; x < width_blocks; ++x)
         {
             uint32_t zigzag_x = (y&1) ? x : width_blocks - x - 1;
-            bc1_block* current = (bc1_block*) output + (y * width_blocks) + zigzag_x;
+            bc1_block* current = (bc1_block*) output + ((y * width_blocks) + zigzag_x) * block_stride;
 
             uint32_t position = (y - start_y) * width_blocks + x;
 
@@ -2197,7 +2172,7 @@ bool bcp_decompress_bc1(bcp_context* ctx, const void* input, size_t input_length
                 // after that a top-flagged strip is predicted from the row above, same zigzag position
                 const bc1_block* color_reference = &previous;
                 if (use_top && y > start_y)
-                    color_reference = (const bc1_block*) output + (y - 1) * width_blocks + zigzag_x;
+                    color_reference = (const bc1_block*) output + ((y - 1) * width_blocks + zigzag_x) * block_stride;
 
                 for(uint32_t j=0; j<2; ++j)
                 {
@@ -2246,6 +2221,12 @@ bool bcp_decompress_bc1(bcp_context* ctx, const void* input, size_t input_length
 }
 
 //-----------------------------------------------------------------------------------------------------------------------------
+bool bcp_decompress_bc1(bcp_context* ctx, const void* input, size_t input_length, uint32_t width, uint32_t height, uint32_t num_strips, void* output, uint32_t strip_index)
+{
+    return bcp_decompress_bc1_impl(ctx, input, input_length, width, height, num_strips, output, strip_index, 1);
+}
+
+//-----------------------------------------------------------------------------------------------------------------------------
 size_t packed_bc4_maxsize(uint32_t width, uint32_t height)
 {
     // very rough: 2x the standard BC4 block size, the BC1 convention
@@ -2262,58 +2243,99 @@ size_t packed_bc5_maxsize(uint32_t width, uint32_t height)
 //-----------------------------------------------------------------------------------------------------------------------------
 size_t bcp_compress_bc4(bcp_context* ctx, const void* bc4_image, uint32_t width, uint32_t height, uint8_t* output, size_t output_length, uint32_t* num_strips)
 {
-    return bcp_compress_bc45(ctx, bc4_image, width, height, output, output_length, num_strips, 1);
+    return bcp_compress_bc45(ctx, bc4_image, width, height, output, output_length, num_strips, 1, 1);
 }
 
 //-----------------------------------------------------------------------------------------------------------------------------
 size_t bcp_compress_bc5(bcp_context* ctx, const void* bc5_image, uint32_t width, uint32_t height, uint8_t* output, size_t output_length, uint32_t* num_strips)
 {
-    return bcp_compress_bc45(ctx, bc5_image, width, height, output, output_length, num_strips, 2);
-}
-
-//-----------------------------------------------------------------------------------------------------------------------------
-void bcp_get_stats_bc5(bcp_context* ctx, bcp_stats_bc5* stats)
-{
-    *stats = (bcp_stats_bc5)
-    {
-        .endpoint_bytes = (uint32_t)((ctx->bc4_endpoint_bits + 7) / 8),
-        .pair_bytes = (uint32_t)((ctx->bc4_index_bits + 7) / 8),
-        .dict_bytes = 0
-    };
+    return bcp_compress_bc45(ctx, bc5_image, width, height, output, output_length, num_strips, 2, 2);
 }
 
 //-----------------------------------------------------------------------------------------------------------------------------
 bool bcp_decompress_bc4(bcp_context* ctx, const void* input, size_t input_length, uint32_t width, uint32_t height, uint32_t num_strips, void* output, uint32_t strip_index)
 {
-    return bcp_decompress_bc45(ctx, input, input_length, width, height, num_strips, output, strip_index, 1);
+    return bcp_decompress_bc45(ctx, input, input_length, width, height, num_strips, output, strip_index, 1, 1);
 }
 
 //-----------------------------------------------------------------------------------------------------------------------------
 bool bcp_decompress_bc5(bcp_context* ctx, const void* input, size_t input_length, uint32_t width, uint32_t height, uint32_t num_strips, void* output, uint32_t strip_index)
 {
-    return bcp_decompress_bc45(ctx, input, input_length, width, height, num_strips, output, strip_index, 2);
+    return bcp_decompress_bc45(ctx, input, input_length, width, height, num_strips, output, strip_index, 2, 2);
 }
 
 
 //-----------------------------------------------------------------------------------------------------------------------------
-void bcp_get_stats(bcp_context* ctx, bcp_stats* stats)
+// BC3 = a BC1 block + a BC4 block per 4x4 cell (the standard D3D layout, 16 bytes per block).
+// The compressed stream is the composition of the two already validated pipelines: a
+// little-endian u32 prefix with the size of the BC1 substream, then the BC1 stream of the
+// color half, then the BC4 (1 channel) stream of the alpha half. Each substream is
+// self-describing (models, strip seed, strip offsets, strips, as its standalone format) and
+// ends 4-byte aligned, so no new payload logic, model, or context state is needed.
+// The color half is the block at byte offset 0 of a 16-byte superblock and the alpha half the
+// one at byte offset 8, so both views use a block stride of 2.
+
+//-----------------------------------------------------------------------------------------------------------------------------
+size_t packed_bc3_maxsize(uint32_t width, uint32_t height)
 {
-    *stats = (bcp_stats)
-    {
-        // contextual models: report the zero-context (middle bucket) k, the one that carries most of the mass
-        .blue_k = { ctx->blue_model[0][COLOR_DELTA_CONTEXTS/2].k, ctx->blue_model[1][COLOR_DELTA_CONTEXTS/2].k },
-        .difference_k = ctx->table_difference_model.k,
-        .green_k = { ctx->green_model[0].k, ctx->green_model[1].k },
-        .red_k = { ctx->red_model[0][COLOR_DELTA_CONTEXTS/2].k, ctx->red_model[1][COLOR_DELTA_CONTEXTS/2].k },
-        .mask_k = ctx->mask_model.k,
-        .reference_k = ctx->table_reference_model.k,
-        .top_table_size = ctx->top_table_size,
-        .colors_bytes = (uint32_t)((ctx->colors_bits + 7) / 8),
-        .reference_bytes = (uint32_t)((ctx->reference_bits + 7) / 8),
-        .mask_bytes = (uint32_t)((ctx->mask_bits + 7) / 8),
-        .difference_bytes = (uint32_t)((ctx->difference_bits + 7) / 8)
-    };
+    // 2x the standard BC3 block size, the BC1 / BC4 convention, plus the 4-byte prefix
+    return packed_bc1_maxsize(width, height) + packed_bc4_maxsize(width, height) + sizeof(uint32_t);
 }
+
+//-----------------------------------------------------------------------------------------------------------------------------
+size_t bcp_compress_bc3(bcp_context* ctx, const void* bc3_image, uint32_t width, uint32_t height, uint8_t* output, size_t output_length, uint32_t* num_strips)
+{
+    if ((width < 16) || (height < 256) || !bc3_image || !ctx || !output || !num_strips || (output_length < sizeof(uint32_t)))
+        return 0;
+
+    *num_strips = 64;   // for now, could depend on the resolution in the future
+
+    // prefix: the size of the BC1 substream, patched once it is known. The BC1 stream ends 4-byte
+    // aligned (each strip does), so the BC4 substream that follows is 4-byte aligned too.
+    uint32_t bc1_size = 0;
+    output[0] = (uint8_t)(bc1_size & 0xff);
+    output[1] = (uint8_t)((bc1_size >> 8) & 0xff);
+    output[2] = (uint8_t)((bc1_size >> 16) & 0xff);
+    output[3] = (uint8_t)((bc1_size >> 24) & 0xff);
+
+    // color half: the BC1 pipeline on the blocks at byte offset 0, stride 2
+    bc1_size = (uint32_t)bcp_compress_bc1_impl(ctx, bc3_image, 2, width, height, output + sizeof(uint32_t), output_length - sizeof(uint32_t), num_strips);
+    if (bc1_size == 0)
+        return 0;
+
+    output[0] = (uint8_t)(bc1_size & 0xff);
+    output[1] = (uint8_t)((bc1_size >> 8) & 0xff);
+    output[2] = (uint8_t)((bc1_size >> 16) & 0xff);
+    output[3] = (uint8_t)((bc1_size >> 24) & 0xff);
+
+    // alpha half: the single-channel BC4 pipeline on the blocks at byte offset 8, stride 2
+    size_t bc4_size = bcp_compress_bc45(ctx, (const uint8_t*)bc3_image + 8, width, height, output + sizeof(uint32_t) + bc1_size,
+                                        output_length - sizeof(uint32_t) - bc1_size, num_strips, 1, 2);
+    if (bc4_size == 0)
+        return 0;
+
+    return sizeof(uint32_t) + bc1_size + bc4_size;
+}
+
+//-----------------------------------------------------------------------------------------------------------------------------
+bool bcp_decompress_bc3(bcp_context* ctx, const void* input, size_t input_length, uint32_t width, uint32_t height, uint32_t num_strips, void* output, uint32_t strip_index)
+{
+    const uint8_t* in = (const uint8_t*)input;
+
+    if ((width < 16) || (height < 256) || !in || !ctx || !output || (num_strips == 0) || (strip_index >= num_strips) || (input_length < sizeof(uint32_t)))
+        return false;
+
+    uint32_t bc1_size = (uint32_t)in[0] | ((uint32_t)in[1] << 8) | ((uint32_t)in[2] << 16) | ((uint32_t)in[3] << 24);
+    if ((size_t)bc1_size + sizeof(uint32_t) > input_length)
+        return false;
+
+    // color half, then alpha half, each on its own substream of the same strip decomposition
+    bool ok = bcp_decompress_bc1_impl(ctx, in + sizeof(uint32_t), bc1_size, width, height, num_strips, output, strip_index, 2);
+
+    return ok && bcp_decompress_bc45(ctx, in + sizeof(uint32_t) + bc1_size, input_length - sizeof(uint32_t) - bc1_size, width, height, num_strips,
+                                     (uint8_t*)output + 8, strip_index, 1, 2);
+}
+
 
 //-----------------------------------------------------------------------------------------------------------------------------
 void bcp_terminate(bcp_context* ctx)
