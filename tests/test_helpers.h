@@ -25,6 +25,12 @@ typedef struct bc4_block
     uint8_t indices[6];  // 16 x 3-bit indices, little-endian 48-bit field, raster order
 } bc4_block;
 
+// the standard 16-byte BC5 block: the red bc4_block followed by the green one
+typedef struct bc5_block
+{
+    bc4_block channel[2]; // [0] = red, [1] = green
+} bc5_block;
+
 //-----------------------------------------------------------------------------------------------------------------------------
 // SplitMix32 PRNG implementation
 static inline uint32_t splitmix32(uint32_t* state)

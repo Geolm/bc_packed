@@ -2137,7 +2137,7 @@ bool bcp_decompress_bc1(bcp_context* ctx, const void* input, size_t input_length
         ctx->top_table[i] = 0;
     
         for(uint32_t j=0; j<4; ++j)
-            ctx->top_table[i] |= stream.buffer[stream.pos++] << (j*8);
+            ctx->top_table[i] |= (uint32_t)stream.buffer[stream.pos++] << (j*8);
     }
 
     // strip offsets
@@ -2233,7 +2233,7 @@ bool bcp_decompress_bc1(bcp_context* ctx, const void* input, size_t input_length
             uint32_t difference=0;
             for(uint32_t j=0; j<4; ++j)
                 if (mask & (1 << j))
-                    difference = difference | (le_decode_symbol(&compressed_stream, &ctx->table_difference_model) << (j*8));
+                    difference = difference | ((uint32_t)le_decode_symbol(&compressed_stream, &ctx->table_difference_model) << (j*8));
 
             current->indices =  difference ^ ctx->top_table[reference];
 

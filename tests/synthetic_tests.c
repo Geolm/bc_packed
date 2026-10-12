@@ -596,14 +596,16 @@ TEST bc45_roundtrip(const void* image, uint32_t width, uint32_t height, uint32_t
 }
 
 //-----------------------------------------------------------------------------------------------------------------------------
-// runs the image through both formats: 1 channel (BC4) and 2 channels (BC5, red + green)
-static greatest_test_res bc45_both(const bc4_block* image, uint32_t width, uint32_t height)
+// runs the image through both formats: 1 channel (BC4) and 2 channels (BC5, red + green).
+// [image8] is 8 bytes per block (BC4 layout), [image16] 16 bytes per block (BC5 layout):
+// the two formats have different block sizes, so each needs its own fully-sized buffer.
+static greatest_test_res bc45_both(const bc4_block* image8, const bc4_block* image16, uint32_t width, uint32_t height)
 {
     // an assertion fails by returning, so propagate the result instead of discarding it
-    greatest_test_res res = bc45_roundtrip(image, width, height, 1);
+    greatest_test_res res = bc45_roundtrip(image8, width, height, 1);
     if (res != GREATEST_TEST_RES_PASS)
         return res;
-    return bc45_roundtrip(image, width, height, 2);
+    return bc45_roundtrip(image16, width, height, 2);
 }
 
 //-----------------------------------------------------------------------------------------------------------------------------
@@ -612,6 +614,7 @@ static greatest_test_res bc45_both(const bc4_block* image, uint32_t width, uint3
 TEST bc45_flat(void)
 {
     bc4_block image[TEST_BC45_BLOCKS];
+    bc4_block image16[TEST_BC45_BLOCKS * 2]; // 16-byte BC5 block: the red bc4_block followed by the green one
 
     for(uint32_t i=0; i<TEST_BC45_BLOCKS; ++i)
     {
@@ -619,9 +622,17 @@ TEST bc45_flat(void)
         image[i].endpoint[1] = 0xC0;
         for(uint32_t j=0; j<6; ++j)
             image[i].indices[j] = 0x1B; // 3, 5, 3, 5, ... as 3-bit values
+
+        memcpy(&image16[2 * i], &image[i], sizeof(bc4_block)); // red channel
+
+        // green channel: the same constant pattern with different values
+        image16[2 * i + 1].endpoint[0] = (uint8_t)(image[i].endpoint[0] ^ 0x5A);
+        image16[2 * i + 1].endpoint[1] = (uint8_t)(image[i].endpoint[1] ^ 0x5A);
+        for(uint32_t j=0; j<6; ++j)
+            image16[2 * i + 1].indices[j] = (uint8_t)(image[i].indices[j] ^ 0x38);
     }
 
-    return bc45_both(image, TEST_BC45_WIDTH, TEST_BC45_HEIGHT);
+    return bc45_both(image, image16, TEST_BC45_WIDTH, TEST_BC45_HEIGHT);
 }
 
 //-----------------------------------------------------------------------------------------------------------------------------
@@ -652,7 +663,17 @@ TEST bc45_checkerboard(void)
         }
     }
 
-    return bc45_both(image, TEST_BC45_WIDTH, TEST_BC45_HEIGHT);
+    bc4_block image16[TEST_BC45_BLOCKS * 2];
+    for(uint32_t i=0; i<TEST_BC45_BLOCKS; ++i)
+    {
+        memcpy(&image16[2 * i], &image[i], sizeof(bc4_block)); // red channel
+        image16[2 * i + 1].endpoint[0] = (uint8_t)(image[i].endpoint[0] ^ 0x5A);
+        image16[2 * i + 1].endpoint[1] = (uint8_t)(image[i].endpoint[1] ^ 0x5A);
+        for(uint32_t j=0; j<6; ++j)
+            image16[2 * i + 1].indices[j] = (uint8_t)(image[i].indices[j] ^ 0x38);
+    }
+
+    return bc45_both(image, image16, TEST_BC45_WIDTH, TEST_BC45_HEIGHT);
 }
 
 //-----------------------------------------------------------------------------------------------------------------------------
@@ -660,6 +681,7 @@ TEST bc45_checkerboard(void)
 TEST bc45_gradient(void)
 {
     bc4_block image[TEST_BC45_BLOCKS];
+    bc4_block image16[TEST_BC45_BLOCKS * 2];
     uint32_t blocks_per_row = TEST_BC45_WIDTH / 4;
 
     for(uint32_t i=0; i<TEST_BC45_BLOCKS; ++i)
@@ -673,7 +695,16 @@ TEST bc45_gradient(void)
             image[i].indices[j] = (uint8_t)((bx ^ (by + j)) * 0x11);
     }
 
-    return bc45_both(image, TEST_BC45_WIDTH, TEST_BC45_HEIGHT);
+    for(uint32_t i=0; i<TEST_BC45_BLOCKS; ++i)
+    {
+        memcpy(&image16[2 * i], &image[i], sizeof(bc4_block)); // red channel
+        image16[2 * i + 1].endpoint[0] = (uint8_t)(image[i].endpoint[0] ^ 0x5A);
+        image16[2 * i + 1].endpoint[1] = (uint8_t)(image[i].endpoint[1] ^ 0x5A);
+        for(uint32_t j=0; j<6; ++j)
+            image16[2 * i + 1].indices[j] = (uint8_t)(image[i].indices[j] ^ 0x38);
+    }
+
+    return bc45_both(image, image16, TEST_BC45_WIDTH, TEST_BC45_HEIGHT);
 }
 
 //-----------------------------------------------------------------------------------------------------------------------------
@@ -682,6 +713,7 @@ TEST bc45_gradient(void)
 TEST bc45_random_splitmix32(void)
 {
     bc4_block image[TEST_BC45_BLOCKS];
+    bc4_block image16[TEST_BC45_BLOCKS * 2];
     uint32_t rng_state = 0x85EBCA6Bu;
 
     for(uint32_t i=0; i<TEST_BC45_BLOCKS; ++i)
@@ -692,7 +724,16 @@ TEST bc45_random_splitmix32(void)
             image[i].indices[j] = (uint8_t)splitmix32(&rng_state);
     }
 
-    return bc45_both(image, TEST_BC45_WIDTH, TEST_BC45_HEIGHT);
+    for(uint32_t i=0; i<TEST_BC45_BLOCKS; ++i)
+    {
+        memcpy(&image16[i], &image[i], sizeof(bc4_block)); // red channel
+        image16[i].endpoint[0] = (uint8_t)(image[i].endpoint[0] ^ 0x5A);
+        image16[i].endpoint[1] = (uint8_t)(image[i].endpoint[1] ^ 0x5A);
+        for(uint32_t j=0; j<6; ++j)
+            image16[i].indices[j] = (uint8_t)(image[i].indices[j] ^ 0x38);
+    }
+
+    return bc45_both(image, image16, TEST_BC45_WIDTH, TEST_BC45_HEIGHT);
 }
 
 
