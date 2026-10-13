@@ -232,7 +232,7 @@ See Color-pair dictionary. The six color deltas, the top-table reference, the ma
 =======
 ## BC4 / BC5
 
-BC4 (one 8-bit channel) and BC5 (red + green channels) reuse the BC1 machinery: static Rice-Golomb models fitted from a histogram pre-pass, 64 independent strips, and a self-describing byte stream. The entry points are `packed_bc4_maxsize` / `packed_bc5_maxsize`, `bcp_compress_bc4` / `bcp_compress_bc5`, `bcp_get_stats_bc5`, and `bcp_decompress_bc4` / `bcp_decompress_bc5` (see `src/bc_packed.h`), with the same signature shape as their BC1 counterparts.
+BC4 (one 8-bit channel) and BC5 (red + green channels) reuse the BC1 machinery: static Rice-Golomb models fitted from a histogram pre-pass, 64 independent strips, and a self-describing byte stream. The entry points are `packed_bc4_maxsize` / `packed_bc5_maxsize`, `bcp_compress_bc4` / `bcp_compress_bc5`, and `bcp_decompress_bc4` / `bcp_decompress_bc5` (see `src/bc_packed.h`), with the same signature shape as their BC1 counterparts.
 
 ### Blocks
 
@@ -276,10 +276,10 @@ That is 3 endpoint-range families x 8 prediction values = 24 index models per ch
 
 ```text
 family = |endpoint0 - endpoint1|  (unsigned range in [0; 255])
-         < 8  → 0,  < 16 → 1,  else → 2
+         < 5  → 0,  < 40 → 1,  else → 2
 ```
 
-The 8-symbol models use a compact rank table (8 entries instead of 256): `3 + num_symbols ≤ 11` bytes each in the stream. The family thresholds (8 / 16) are the design values; refining them (for example into more range buckets) is the obvious tuning lever if the ratio needs more headroom.
+The 8-symbol models use a compact rank table (8 entries instead of 256): `3 + num_symbols ≤ 11` bytes each in the stream. The family thresholds (5 / 40) are fitted values: the index-XOR distributions drift smoothly with the endpoint contrast, and a sweep of the 3-family splits over the image suite puts the minimum here — every one of the 10 suite images improves and the stream shrinks 0.24% versus the original 8 / 16. Changing the family count instead (2 or 4 families) measured worse.
 
 ### Compressed stream
 
@@ -302,7 +302,6 @@ For BC5 the red channel's models and seed come first, then the green channel's, 
 * CPU + GPU: `bcp_compress_bc4/bc5` and `bcp_decompress_bc4/bc5` are implemented and tested; the GPU decoders are the `bcp_decompress_bc4` / `bcp_decompress_bc5` compute kernels of [src/bc_decompress.metal](src/bc_decompress.metal): one thread per strip, bit-identical to the CPU. Measured on the M5 Pro (1024×1024, 1000 runs): **14540 MiB/s** for BC4, **7868 MiB/s** for BC5.
 * `width >= 16` and `height >= 256` are required (multiples of 4, as BC1); textures whose height in blocks is not a multiple of 64 silently drop the trailing block rows.
 * The output buffer must be at least `packed_bc4_maxsize` / `packed_bc5_maxsize` — 2× the standard block size (16 / 32 bytes per 4×4 block), the BC1 convention.
-* `bcp_get_stats_bc5` reports the range-coded payload after a successful `bcp_compress_bc5`: `endpoint_bytes`, `pair_bytes` (the whole index payload), and `dict_bytes` (reserved for a future index dictionary, currently 0).
 
 ### Validation
 
@@ -315,6 +314,41 @@ Everything is validated byte-exact over all 64 strips, on CPU and GPU:
 
 The 8-bit formats leave less headroom than BC1: the indices of these maps sit close to 3 near-uniform bits each, so most of the gain comes from the endpoint deltas.
 
+
+=======
+## BC3
+
+BC3 combines a BC1 color block and a BC4 alpha block in the standard D3D layout, 16 bytes per 4×4 block. The entry points are `packed_bc3_maxsize`, `bcp_compress_bc3`, and `bcp_decompress_bc3` (see `src/bc_packed.h`), with the same signature shape as their BC1 counterparts.
+
+### Scheme
+
+BC3 is the composition of the two pipelines above, applied to the two halves of the block grid: the BC1 pipeline on the color half, the single-channel BC4 pipeline on the alpha half. No payload logic, model, or context state is new: the strip decomposition, the zigzag chains, the BC1 predictors / top table / color-pair dictionary, and the BC4 endpoint / index models are all the existing ones, fitted on their own half as for the standalone formats.
+
+### Compressed stream
+
+Self-describing, as the other streams (no width, height, or format):
+
+```text
+* u32 little-endian: the size in bytes of the BC1 substream that follows.
+* The BC1 stream of the color half, exactly the [Compressed stream](#compressed-stream) format.
+* The BC4 stream of the alpha half, exactly the [BC4 / BC5 → Compressed stream](#compressed-stream-1) format with 1 channel.
+```
+
+Each substream is self-contained (its own models, strip seed, 63 strip offsets, 64 strips) and ends 4-byte aligned, so the two can be decoded independently; the 64 strips of both halves share the same decomposition, so one `bcp_decompress_bc3` call decodes one strip of both.
+
+### Status
+
+* CPU only: `bcp_compress_bc3` / `bcp_decompress_bc3` are implemented and tested; BC3 is niche, so there is no Metal decoder (the BC1 and BC4 kernels of [src/bc_decompress.metal](src/bc_decompress.metal) cover the two halves, a `bcp_decompress_bc3` kernel is a possible follow-up).
+* `width >= 16` and `height >= 256` are required (multiples of 4, as BC1); textures whose height in blocks is not a multiple of 64 silently drop the trailing block rows.
+* The output buffer must be at least `packed_bc3_maxsize` — 2× the standard BC3 block size (32 bytes per 4×4 block), the BC1 convention, plus the 4-byte prefix.
+
+### Validation
+
+Everything is validated byte-exact over all 64 strips on CPU:
+
+* 4 synthetic 256×256 roundtrips (flat, checkerboard, gradient, SplitMix32 random): the color half and the alpha half each use the corresponding BC1 / BC4 pattern, so the random pattern forces the raw-mode fallback and the full model usage in both halves at once.
+* 2 albedo + alpha maps (`images/bc3`), 1024×1024, converted per block with stb_dxt: the per-image ratio is printed to stdout (no CSV) and the suite average must stay above 1:1. Measured: **2.7149:1** average (2.9445:1 for leak-stain_albedo, 2.4853:1 for leaves). The ratio is dominated by the BC1 color half, which keeps the BC1 headroom; the 8-bit alpha half compresses like a standalone BC4.
+
 ## Images 
 
 The images used in the unit test come from this sources:
@@ -322,3 +356,5 @@ The images used in the unit test come from this sources:
 https://opengameart.org/content/tiny-texture-pack-2
 
 https://r0k.us/graphics/kodak/
+
+The `images/bc3` set (albedo + alpha maps) is used by the BC3 suite; the leak-stain and leaves sources are the project author's own assets.

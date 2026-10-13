@@ -45,6 +45,31 @@ FILE* open_hourly_stats_file(const char *folder_path)
 }
 
 //-----------------------------------------------------------------------------------------------------------------------------
+// All image suites log to the same hourly CSV, each opening it in append mode, so the
+// header is only written for a new file: after fseek to SEEK_END, ftell returns the size
+static void ensure_stats_header(FILE* stats)
+{
+    fseek(stats, 0, SEEK_END);
+    if (ftell(stats) <= 0)
+        fprintf(stats, "format,filename,width,height,compression_ratio\n");
+}
+
+//-----------------------------------------------------------------------------------------------------------------------------
+// one row per image and a comment line summarizing the suite, keeping the CSV self
+// documenting across the bc1, bc4, bc5 and bc3 suites
+static void log_image_stats(FILE* stats, const char* format, const char* file_path, uint32_t width, uint32_t height, float ratio)
+{
+    fprintf(stats, "%s,%s,%" PRIu32 ",%" PRIu32 ",%.6f\n", format, file_path, width, height, ratio);
+    fflush(stats);
+}
+
+static void log_stats_summary(FILE* stats, const char* format, uint32_t num_images, float average_ratio)
+{
+    fprintf(stats, "\n\n# %s: %" PRIu32 " images, average compression ratio : %.4f:1\n\n", format, num_images, average_ratio);
+    fflush(stats);
+}
+
+//-----------------------------------------------------------------------------------------------------------------------------
 TEST test_all_images_in_folder(const char *dir_path) 
 {
     DIR *dir = opendir(dir_path);
@@ -73,7 +98,7 @@ TEST test_all_images_in_folder(const char *dir_path)
     uint8_t* decompressed_bc1 = malloc(max_image_size);
     ASSERT(original_bc1 != NULL && decompressed_bc1 != NULL);
 
-    fprintf(stats, "filename,width,height,compression_ratio, top_table_size, red0_k, red1_k, green0_k, green1_k, blue0_k, blue1_k, reference_k, mask_k, difference_k, colors_bytes, reference_bytes, mask_bytes, difference_bytes\n");
+    ensure_stats_header(stats);
 
     float global_ratio = 0.f;
     uint32_t num_images = 0;
@@ -115,17 +140,7 @@ TEST test_all_images_in_folder(const char *dir_path)
 
         const size_t image_size = (width/4)*(height/4)*sizeof(bc1_block);
         const float compression_ratio = (float) image_size / (float) compressed_buffer_length;
-        fprintf(stats, "%s,%" PRIu32 ",%" PRIu32 ",%.6f,", file_path, width, height, compression_ratio);
-
-        bcp_stats cmp_stats;
-        bcp_get_stats(ctx, &cmp_stats);
-
-        fprintf(stats, "%" PRIu32 ",%" PRIu32 ",%" PRIu32 ",%" PRIu32 ",%" PRIu32 ",%" PRIu32 ",%" PRIu32 ",%" PRIu32 ",%" PRIu32 ",%" PRIu32 ",%" PRIu32 ",%" PRIu32 ",%" PRIu32 ",%" PRIu32 "\n",
-            cmp_stats.top_table_size, cmp_stats.red_k[0], cmp_stats.red_k[1], cmp_stats.green_k[0], cmp_stats.green_k[1], cmp_stats.blue_k[0], cmp_stats.blue_k[1],
-            cmp_stats.reference_k, cmp_stats.mask_k, cmp_stats.difference_k,
-            cmp_stats.colors_bytes, cmp_stats.reference_bytes, cmp_stats.mask_bytes, cmp_stats.difference_bytes);
-
-        fflush(stats);
+        log_image_stats(stats, "bc1", file_path, width, height, compression_ratio);
 
         global_ratio += compression_ratio;
         num_images++;
@@ -146,7 +161,7 @@ TEST test_all_images_in_folder(const char *dir_path)
 
     const float average_compression_ratio = global_ratio / (float) num_images;
 
-    fprintf(stats, "\n\n# %u images, average compression ratio : %2.4f:1\n\n", num_images, average_compression_ratio);
+    log_stats_summary(stats, "bc1", num_images, average_compression_ratio);
 
     closedir(dir);
     free(original_bc1);
@@ -166,7 +181,8 @@ TEST test_all_images_in_folder(const char *dir_path)
 //-----------------------------------------------------------------------------------------------------------------------------
 // BC4 / BC5 image roundtrips on the hardcoded sets of images/bc4 (AO maps) and images/bc5
 // (normal maps, red + green channels). the filenames are hardcoded, the folder is not scanned,
-// and the per-image ratios are printed to stdout (no CSV): the average must stay above 1:1
+// the per-image ratios are logged to the hourly CSV and printed to stdout: the average must
+// stay above 1:1
 static const char* const bc4_image_filenames[] =
 {
     "images/bc4/grey_roof_tiles_02_ao_1k.png",
@@ -185,11 +201,21 @@ static const char* const bc5_image_filenames[] =
 
 static greatest_test_res run_bc_image_suite(bool bc5)
 {
+    const char* format = bc5 ? "bc5" : "bc4";
     const char* const* filenames = bc5 ? bc5_image_filenames : bc4_image_filenames;
     const uint32_t num_filenames = sizeof(bc4_image_filenames) / sizeof(bc4_image_filenames[0]);
 
     bcp_context* ctx = bcp_init(NULL);
     ASSERT(ctx != NULL);
+
+    FILE* stats = open_hourly_stats_file("./logs");
+    if (!stats)
+    {
+        fprintf(stderr, "Unable to create stats file\n");
+        FAIL();
+    }
+
+    ensure_stats_header(stats);
 
     float global_ratio = 0.f;
     uint32_t num_images = 0;
@@ -248,6 +274,7 @@ static greatest_test_res run_bc_image_suite(bool bc5)
         ASSERT(compressed_buffer_length <= compressed_buffer_size);
 
         const float compression_ratio = (float)(num_blocks * block_bytes) / (float)compressed_buffer_length;
+        log_image_stats(stats, format, filenames[i], width, height, compression_ratio);
         fprintf(stdout, "%s: %u x %u, %s ratio %.4f:1 (stream %zu bytes)\n",
             filenames[i], width, height, bc5 ? "bc5" : "bc4", compression_ratio, compressed_buffer_length);
 
@@ -273,11 +300,14 @@ static greatest_test_res run_bc_image_suite(bool bc5)
 
     const float average_compression_ratio = global_ratio / (float)num_images;
 
+    log_stats_summary(stats, format, num_images, average_compression_ratio);
+    fclose(stats);
+
     fprintf(stdout, "==> %s: %u images, average compression ratio : %2.4f:1\n\n", bc5 ? "bc5" : "bc4", num_images, average_compression_ratio);
 
     bcp_terminate(ctx);
 
-    ASSERT(average_compression_ratio >= 1.0f);
+    ASSERT(average_compression_ratio >= 1.05f);
 
     PASS();
 }
@@ -296,12 +326,133 @@ TEST bc5_images(void)
     return run_bc_image_suite(true);
 }
 
+//-----------------------------------------------------------------------------------------------------------------------------
+// BC3 image roundtrips on the hardcoded set of images/bc3 (albedo + alpha maps): the filenames
+// are hardcoded, the folder is not scanned, the per-image ratios are logged to the hourly CSV
+// and printed to stdout, and the average must stay above 1:1
+static const char* const bc3_image_filenames[] =
+{
+    "images/bc3/leak-stain_albedo.png",
+    "images/bc3/leaves.png"
+};
+
+TEST bc3_images(void)
+{
+    const uint32_t num_filenames = sizeof(bc3_image_filenames) / sizeof(bc3_image_filenames[0]);
+
+    bcp_context* ctx = bcp_init(NULL);
+    ASSERT(ctx != NULL);
+
+    FILE* stats = open_hourly_stats_file("./logs");
+    if (!stats)
+    {
+        fprintf(stderr, "Unable to create stats file\n");
+        FAIL();
+    }
+
+    ensure_stats_header(stats);
+
+    float global_ratio = 0.f;
+    uint32_t num_images = 0;
+
+    for(uint32_t i=0; i<num_filenames; ++i)
+    {
+        // load the source image and convert to the standard bc3 blocks with stb_dxt
+        uint32_t width, height, num_channels;
+        uint8_t* rgba = stbi_load(bc3_image_filenames[i], (int*)&width, (int*)&height, (int*)&num_channels, 4);
+        ASSERT(rgba != NULL);
+
+        uint32_t width_blocks = width / 4;
+        uint32_t height_blocks = height / 4;
+        uint32_t num_blocks = width_blocks * height_blocks;
+
+        uint8_t* bc_image = malloc(num_blocks * 16);
+        uint8_t* decompressed = malloc(num_blocks * 16);
+        ASSERT(bc_image != NULL && decompressed != NULL);
+
+        for(uint32_t by=0; by<height_blocks; ++by)
+        {
+            for(uint32_t bx=0; bx<width_blocks; ++bx)
+            {
+                uint8_t block_rgba[64]; // 16 pixels x (r + g + b + a)
+                uint8_t block_alpha[16];
+
+                for(uint32_t j=0; j<4; ++j)
+                {
+                    for(uint32_t k=0; k<4; ++k)
+                    {
+                        const uint8_t* px = &rgba[((by * 4 + j) * width + (bx * 4 + k)) * 4];
+                        uint8_t* dst = &block_rgba[(j * 4 + k) * 4];
+
+                        dst[0] = px[0];
+                        dst[1] = px[1];
+                        dst[2] = px[2];
+                        dst[3] = px[3];
+                        block_alpha[j * 4 + k] = px[3];
+                    }
+                }
+
+                // stb_compress_dxt_block with alpha = 1 writes the alpha block before the color one,
+                // the opposite of the D3D bc3 order, so build the two halves separately
+                stb_compress_dxt_block(&bc_image[(by * width_blocks + bx) * 16], block_rgba, 0, STB_DXT_HIGHQUAL); // color, bytes 0..7
+                stb_compress_bc4_block(&bc_image[(by * width_blocks + bx) * 16 + 8], block_alpha);                // alpha, bytes 8..15
+            }
+        }
+
+        // compress the bc3 image and report the ratio against the standard block size
+        size_t compressed_buffer_size = packed_bc3_maxsize(width, height);
+        uint8_t* compressed_buffer = malloc(compressed_buffer_size);
+        ASSERT(compressed_buffer != NULL);
+
+        uint32_t num_strips = 0;
+        size_t compressed_buffer_length = bcp_compress_bc3(ctx, bc_image, width, height, compressed_buffer, compressed_buffer_size, &num_strips);
+        ASSERT(compressed_buffer_length != 0);
+        ASSERT(compressed_buffer_length <= compressed_buffer_size);
+
+        const float compression_ratio = (float)(num_blocks * 16) / (float)compressed_buffer_length;
+        log_image_stats(stats, "bc3", bc3_image_filenames[i], width, height, compression_ratio);
+        fprintf(stdout, "%s: %u x %u, bc3 ratio %.4f:1 (stream %zu bytes)\n",
+            bc3_image_filenames[i], width, height, compression_ratio, compressed_buffer_length);
+
+        global_ratio += compression_ratio;
+        num_images++;
+
+        // roundtrip test: decompress every strip, byte-exact against the standard blocks
+        for(uint32_t s=0; s<num_strips; ++s)
+        {
+            ASSERT(bcp_decompress_bc3(ctx, compressed_buffer, compressed_buffer_length, width, height, num_strips, decompressed, s));
+        }
+
+        for(size_t j=0; j<num_blocks * 16; ++j)
+            ASSERT_EQ(decompressed[j], bc_image[j]);
+
+        stbi_image_free(rgba);
+        free(bc_image);
+        free(decompressed);
+        free(compressed_buffer);
+    }
+
+    const float average_compression_ratio = global_ratio / (float)num_images;
+
+    log_stats_summary(stats, "bc3", num_images, average_compression_ratio);
+    fclose(stats);
+
+    fprintf(stdout, "==> bc3: %u images, average compression ratio : %2.4f:1\n\n", num_images, average_compression_ratio);
+
+    bcp_terminate(ctx);
+
+    ASSERT(average_compression_ratio >= 2.7f);
+
+    PASS();
+}
+
 
 SUITE(suite_image)
 {
     RUN_TEST1(test_all_images_in_folder, "./images/");
     RUN_TEST(bc4_images);
     RUN_TEST(bc5_images);
+    RUN_TEST(bc3_images);
 }
 
 

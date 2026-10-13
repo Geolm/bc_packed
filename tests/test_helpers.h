@@ -31,6 +31,13 @@ typedef struct bc5_block
     bc4_block channel[2]; // [0] = red, [1] = green
 } bc5_block;
 
+// the standard 16-byte BC3 block: the bc1_block color half followed by the bc4_block alpha half
+typedef struct bc3_block
+{
+    bc1_block color;
+    bc4_block alpha;
+} bc3_block;
+
 //-----------------------------------------------------------------------------------------------------------------------------
 // SplitMix32 PRNG implementation
 static inline uint32_t splitmix32(uint32_t* state)

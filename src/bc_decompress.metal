@@ -552,9 +552,9 @@ uint8_t bc4_index_family(uint8_t e0, uint8_t e1)
 {
     uint32_t range = (e0 >= e1) ? (uint32_t)(e0 - e1) : (uint32_t)(e1 - e0);
 
-    if (range < 8)
+    if (range < 5)
         return 0;
-    if (range < 16)
+    if (range < 40)
         return 1;
 
     return 2;
