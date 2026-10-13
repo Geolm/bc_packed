@@ -307,7 +307,7 @@ static greatest_test_res run_bc_image_suite(bool bc5)
 
     bcp_terminate(ctx);
 
-    ASSERT(average_compression_ratio >= 1.0f);
+    ASSERT(average_compression_ratio >= 1.05f);
 
     PASS();
 }
@@ -441,7 +441,7 @@ TEST bc3_images(void)
 
     bcp_terminate(ctx);
 
-    ASSERT(average_compression_ratio >= 1.0f);
+    ASSERT(average_compression_ratio >= 2.7f);
 
     PASS();
 }
