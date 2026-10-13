@@ -276,10 +276,10 @@ That is 3 endpoint-range families x 8 prediction values = 24 index models per ch
 
 ```text
 family = |endpoint0 - endpoint1|  (unsigned range in [0; 255])
-         < 8  → 0,  < 16 → 1,  else → 2
+         < 5  → 0,  < 40 → 1,  else → 2
 ```
 
-The 8-symbol models use a compact rank table (8 entries instead of 256): `3 + num_symbols ≤ 11` bytes each in the stream. The family thresholds (8 / 16) are the design values; refining them (for example into more range buckets) is the obvious tuning lever if the ratio needs more headroom.
+The 8-symbol models use a compact rank table (8 entries instead of 256): `3 + num_symbols ≤ 11` bytes each in the stream. The family thresholds (5 / 40) are fitted values: the index-XOR distributions drift smoothly with the endpoint contrast, and a sweep of the 3-family splits over the image suite puts the minimum here — every one of the 10 suite images improves and the stream shrinks 0.24% versus the original 8 / 16. Changing the family count instead (2 or 4 families) measured worse.
 
 ### Compressed stream
 

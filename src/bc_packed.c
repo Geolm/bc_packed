@@ -1400,14 +1400,16 @@ static inline uint8_t delta_decode_wrap(uint8_t prev, uint8_t delta)
 
 //-----------------------------------------------------------------------------------------------------------------------------
 // Index context family from the endpoint range |e0 - e1| (unsigned, the true contrast of the 8
-// interpolated colors): range < 8 → family 0, range < 16 → family 1, else family 2
+// interpolated colors): range < 5 → family 0, range < 40 → family 1, else family 2. The index
+// XOR distributions drift smoothly with the contrast, and these fitted thresholds minimize the
+// index payload on the image suite (exp 21): 10/10 images improved, -0.24% stream over 8 / 16
 static inline uint8_t bc4_index_family(uint8_t e0, uint8_t e1)
 {
     uint32_t range = (e0 >= e1) ? (uint32_t)(e0 - e1) : (uint32_t)(e1 - e0);
 
-    if (range < 8)
+    if (range < 5)
         return 0;
-    if (range < 16)
+    if (range < 40)
         return 1;
     return 2;
 }
