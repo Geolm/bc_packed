@@ -493,10 +493,10 @@ static inline uint32_t le_symbol_cost(const le_model* model, uint8_t value)
 #define COLOR_DICT_SIZE         (256U)
 #define COLOR_DICT_MASK         (COLOR_DICT_SIZE - 1U)
 
-// bc4/bc5 contextual index models: 3 endpoint-range families x 8 prediction values, and the
-// channel count (BC4 = 1 channel, BC5 = red + green)
-#define BC4_INDEX_FAMILIES      (3)
-#define BC4_INDEX_CONTEXTS      (BC4_INDEX_FAMILIES * 8)
+// bc4/bc5 contextual index models: an 8 x 8 [left][top] matrix keyed on the decoded 3-bit
+// indices of the two neighbors of the pixel, and the channel count (BC4 = 1 channel, BC5 = red + green)
+#define BC4_INDEX_DIM           (8)
+#define BC4_INDEX_CONTEXTS      (BC4_INDEX_DIM * BC4_INDEX_DIM)
 #define BCP_MAX_CHANNELS        (2)
 
 
@@ -539,9 +539,9 @@ struct bcp_context
     // matching blocks) pay no flag overhead. see the per-strip dictionary enable in init_static_models
     uint64_t strip_dict_enable;
 
-    // bc4/bc5: per-channel static models — the 2 endpoint models (256 symbols) and the 24
-    // index models (8 symbols each, 3 endpoint-range families x 8 prediction values); each
-    // retains the full 516-byte le_model in memory, the stream only stores num_symbols entries
+    // bc4/bc5: per-channel static models — the 2 endpoint models (256 symbols) and the 64
+    // index models (8 symbols each, 8 x 8 [left][top] matrix); each retains the full 516-byte
+    // le_model in memory, the stream only stores num_symbols entries
     le_model bc4_endpoint_model[BCP_MAX_CHANNELS][2]; // [channel][endpoint]
     le_model bc4_index_model[BCP_MAX_CHANNELS][BC4_INDEX_CONTEXTS];
     uint8_t bc4_strip_seed[BCP_MAX_CHANNELS][2]; // [channel][endpoint]
@@ -1399,19 +1399,12 @@ static inline uint8_t delta_decode_wrap(uint8_t prev, uint8_t delta)
 }
 
 //-----------------------------------------------------------------------------------------------------------------------------
-// Index context family from the endpoint range |e0 - e1| (unsigned, the true contrast of the 8
-// interpolated colors): range < 5 → family 0, range < 40 → family 1, else family 2. The index
-// XOR distributions drift smoothly with the contrast, and these fitted thresholds minimize the
-// index payload on the image suite (exp 21): 10/10 images improved, -0.24% stream over 8 / 16
-static inline uint8_t bc4_index_family(uint8_t e0, uint8_t e1)
+// Index context: the 8 x 8 [left][top] matrix of the decoded 3-bit indices — the left neighbor
+// of the pixel (a row start has none) and the pixel directly above (the first row has none),
+// the missing neighbor defaulting to 0
+static inline uint8_t bc4_index_context(uint8_t left, uint8_t top)
 {
-    uint32_t range = (e0 >= e1) ? (uint32_t)(e0 - e1) : (uint32_t)(e1 - e0);
-
-    if (range < 5)
-        return 0;
-    if (range < 40)
-        return 1;
-    return 2;
+    return (uint8_t)(left * BC4_INDEX_DIM + top);
 }
 
 //-----------------------------------------------------------------------------------------------------------------------------
@@ -1455,7 +1448,7 @@ static inline void bc4_pack_indices(const uint8_t idx[16], bc4_block* b)
 
 //-----------------------------------------------------------------------------------------------------------------------------
 // Per-channel histogram of the bc4/bc5 payload symbols: 2 endpoint models (256 symbols) +
-// 24 index models (8 symbols each)
+// 64 index models (8 symbols each)
 typedef struct bc4_hists
 {
     uint32_t endpoint[2][256];
@@ -1538,14 +1531,15 @@ static void bc4_init_models(bcp_context* ctx, const void* image, uint32_t width_
                     }
 
                     bc4_unpack_indices(b, idx);
-                    uint8_t family = bc4_index_family(b->endpoint[0], b->endpoint[1]);
 
                     for(uint32_t i=1; i<16; ++i)
                     {
-                        // intra-block predictor: the pixel above at a row start, the left pixel otherwise
-                        uint8_t p = ((i & 3) == 0) ? idx[i-4] : idx[i-1];
+                        // the missing neighbor of the pixel (first row, row start) defaults to 0
+                        uint8_t left = ((i & 3) == 0) ? 0 : idx[i-1];
+                        uint8_t top = (i < 4) ? 0 : idx[i-4];
+                        uint8_t p = ((i & 3) == 0) ? top : left;
 
-                        hist[c].index[family * 8 + p][p ^ idx[i]]++;
+                        hist[c].index[bc4_index_context(left, top)][p ^ idx[i]]++;
                     }
 
                     if (!first_row)
@@ -1587,7 +1581,7 @@ static size_t bcp_compress_bc45(bcp_context* ctx, const void* image, uint32_t wi
 
     byte_stream stream = {.buffer = output, .length = output_length, .pos = 0};
 
-    // store models: per channel, the 2 endpoint models (256 symbols) then the 24 index models (8 symbols)
+    // store models: per channel, the 2 endpoint models (256 symbols) then the 64 index models (8 symbols)
     for(uint32_t c=0; c<num_channels; ++c)
     {
         for(uint32_t e=0; e<2; ++e)
@@ -1678,18 +1672,19 @@ static size_t bcp_compress_bc45(bcp_context* ctx, const void* image, uint32_t wi
                     }
 
                     // index payload: the first index in raw 3 bits, then each index xored with its
-                    // intra-block prediction, contextual on the family and the prediction value
+                    // intra-block prediction, contextual on the 8 x 8 [left][top] matrix
                     bc4_unpack_indices(b, idx);
 
                     le_write_bits(&compressed_stream, idx[0], 3);
 
-                    uint8_t family = bc4_index_family(b->endpoint[0], b->endpoint[1]);
-
                     for(uint32_t i=1; i<16; ++i)
                     {
-                        uint8_t p = ((i & 3) == 0) ? idx[i-4] : idx[i-1];
+                        // the missing neighbor of the pixel (first row, row start) defaults to 0
+                        uint8_t left = ((i & 3) == 0) ? 0 : idx[i-1];
+                        uint8_t top = (i < 4) ? 0 : idx[i-4];
+                        uint8_t p = ((i & 3) == 0) ? top : left;
 
-                        le_encode_symbol(&compressed_stream, &ctx->bc4_index_model[c][family * 8 + p], p ^ idx[i]);
+                        le_encode_symbol(&compressed_stream, &ctx->bc4_index_model[c][bc4_index_context(left, top)], p ^ idx[i]);
                     }
 
                     if (!first_row)
@@ -1731,7 +1726,7 @@ static bool bcp_decompress_bc45(bcp_context* ctx, const void* input, size_t inpu
 
     byte_stream stream = {.buffer = (uint8_t*)input, .length = input_length, .pos = 0};
 
-    // load models: per channel, the 2 endpoint models then the 24 index models
+    // load models: per channel, the 2 endpoint models then the 64 index models
     for(uint32_t c=0; c<num_channels; ++c)
     {
         for(uint32_t e=0; e<2; ++e)
@@ -1816,16 +1811,16 @@ static bool bcp_decompress_bc45(bcp_context* ctx, const void* input, size_t inpu
                 }
 
                 // index payload: the first index in raw 3 bits, then each index xored with its
-                // intra-block prediction, contextual on the family and the prediction value
+                // intra-block prediction, contextual on the 8 x 8 [left][top] matrix
                 idx[0] = le_read_bits(&compressed_stream, 3);
-
-                uint8_t family = bc4_index_family(b->endpoint[0], b->endpoint[1]);
 
                 for(uint32_t i=1; i<16; ++i)
                 {
-                    uint8_t p = ((i & 3) == 0) ? idx[i-4] : idx[i-1];
+                    uint8_t left = ((i & 3) == 0) ? 0 : idx[i-1];
+                    uint8_t top = (i < 4) ? 0 : idx[i-4];
+                    uint8_t p = ((i & 3) == 0) ? top : left;
 
-                    idx[i] = (uint8_t)(p ^ le_decode_symbol(&compressed_stream, &ctx->bc4_index_model[c][family * 8 + p]));
+                    idx[i] = (uint8_t)(p ^ le_decode_symbol(&compressed_stream, &ctx->bc4_index_model[c][bc4_index_context(left, top)]));
                 }
 
                 bc4_pack_indices(idx, b);
