@@ -15,7 +15,14 @@ The compressor is CPU-side and can use significantly more computation than the d
 |      M2 Max | CPU 12 cores | 1300 MiB/s      |
 |      M2 Max | GPU | 11850 MiB/s      |
 
-Average BC1 compression ratio for 74 images in test is **1.46:1**
+
+| Block type |  Average compression from the image suite | 
+|:-----: | :------------: 
+| BC1 | 1.46:1  
+| BC4 | 1.13:1
+| BC5 | 1.1:1  
+
+All compression ratio are better than zlib.
 
 Note: AI disclaimer, although everything is based on my ideas and my previous libraries, almost all the code was written by a LLM. It wouldn't have been possible with my fulltime job otherwise.
 
