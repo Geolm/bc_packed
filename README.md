@@ -15,7 +15,14 @@ The compressor is CPU-side and can use significantly more computation than the d
 |      M2 Max | CPU 12 cores | 1300 MiB/s      |
 |      M2 Max | GPU | 11850 MiB/s      |
 
-Average BC1 compression ratio for 74 images in test is **1.46:1**
+
+| Block type |  Average compression from the image suite | 
+|:-----: | :------------: 
+| BC1 | 1.46:1  
+| BC4 | 1.13:1
+| BC5 | 1.1:1  
+
+All compression ratio are better than zlib.
 
 Note: AI disclaimer, although everything is based on my ideas and my previous libraries, almost all the code was written by a LLM. It wouldn't have been possible with my fulltime job otherwise.
 
@@ -269,17 +276,15 @@ index 0:   3 raw bits (no model)
 index i:   symbol = prediction XOR index[i], encoded with a static 8-symbol Rice-Golomb model
            prediction = index[i-1]   (left)
                        index[i-4]    (directly above, for the rows at offset 4, 8, 12)
-           context    = family * 8 + prediction
+           context    = left * 8 + top, the 8 x 8 matrix of the decoded neighbor indices:
+                       left = index[i-1] (a row start has no left neighbor),
+                       top  = index[i-4] (the first row has no top neighbor),
+                       the missing neighbor defaulting to 0
 ```
 
-That is 3 endpoint-range families x 8 prediction values = 24 index models per channel. The family is derived from the block's own, already decoded endpoints, so the model selection costs no stream bits:
+That is an 8 x 8 matrix = 64 index models per channel. The context is derived from the already decoded indices themselves, so the model selection costs no stream bits.
 
-```text
-family = |endpoint0 - endpoint1|  (unsigned range in [0; 255])
-         < 5  → 0,  < 40 → 1,  else → 2
-```
-
-The 8-symbol models use a compact rank table (8 entries instead of 256): `3 + num_symbols ≤ 11` bytes each in the stream. The family thresholds (5 / 40) are fitted values: the index-XOR distributions drift smoothly with the endpoint contrast, and a sweep of the 3-family splits over the image suite puts the minimum here — every one of the 10 suite images improves and the stream shrinks 0.24% versus the original 8 / 16. Changing the family count instead (2 or 4 families) measured worse.
+The 8-symbol models use a compact rank table (8 entries instead of 256): `3 + num_symbols ≤ 11` bytes each in the stream.
 
 ### Compressed stream
 
@@ -287,7 +292,7 @@ As BC1, the stream does not include width, height or format: the BC4 / BC5 decom
 
 ```text
 * 2 endpoint models per channel — 256-symbol static models, 3 + num_symbols bytes each, no padding (max 259).
-* 24 index models per channel — 8-symbol static models, 3 + num_symbols bytes each, no padding (max 11).
+* 64 index models per channel — 8-symbol static models, 3 + num_symbols bytes each, no padding (max 11).
 * Strip seed: 2 bytes per channel (endpoint 0, endpoint 1).
 * Padded to a 2-byte boundary.
 * 63 strip offsets (uint16_t each), relative deltas in dword units. Strip 0 always starts the strip data; its offset is zero and not stored.
@@ -309,8 +314,8 @@ Everything is validated byte-exact over all 64 strips, on CPU and GPU:
 
 * GPU roundtrips: the `bcp_decompress_bc4` / `bcp_decompress_bc5` Metal kernels decode the brick AO / normal maps (1024×1024, `images/bc4` / `images/bc5`) and the result is verified byte-identical to the stb-built textures, the same way the BC1 kernel is tested.
 
-* CPU: 8 synthetic 256×256 roundtrips (flat, checkerboard, gradient, SplitMix32 random, each as BC4 and BC5): the random pattern forces the raw-mode fallback and the full 24-context usage.
-* CPU: 4 AO maps (`images/bc4`) and 4 normal maps (`images/bc5`), 1024×1024, converted per block with stb_dxt: the per-image ratio is printed to stdout (no CSV) and the suite average must stay above 1:1. Measured: **1.1244:1** average for BC4 (1.0868 – 1.1680 per image) and **1.0756:1** for BC5 (1.0466 – 1.0990 per image). BC5 compression ratio looks modest but zlib only achieves 1.010563:1 for the same images.
+* CPU: 8 synthetic 256×256 roundtrips (flat, checkerboard, gradient, SplitMix32 random, each as BC4 and BC5): the random pattern forces the raw-mode fallback and the full 64-context usage.
+* CPU: 4 AO maps (`images/bc4`) and 4 normal maps (`images/bc5`), 1024×1024, converted per block with stb_dxt: the per-image ratio is printed to stdout (no CSV) and the suite average must stay above 1:1. Measured: **1.1342:1** average for BC4 (1.0932 – 1.1577 per image) and **1.0995:1** for BC5 (1.0642 – 1.1334 per image). BC5 compression ratio looks modest but zlib only achieves 1.010563:1 for the same images.
 
 The 8-bit formats leave less headroom than BC1: the indices of these maps sit close to 3 near-uniform bits each, so most of the gain comes from the endpoint deltas.
 
@@ -347,7 +352,7 @@ Each substream is self-contained (its own models, strip seed, 63 strip offsets, 
 Everything is validated byte-exact over all 64 strips on CPU:
 
 * 4 synthetic 256×256 roundtrips (flat, checkerboard, gradient, SplitMix32 random): the color half and the alpha half each use the corresponding BC1 / BC4 pattern, so the random pattern forces the raw-mode fallback and the full model usage in both halves at once.
-* 2 albedo + alpha maps (`images/bc3`), 1024×1024, converted per block with stb_dxt: the per-image ratio is printed to stdout (no CSV) and the suite average must stay above 1:1. Measured: **2.7149:1** average (2.9445:1 for leak-stain_albedo, 2.4853:1 for leaves). The ratio is dominated by the BC1 color half, which keeps the BC1 headroom; the 8-bit alpha half compresses like a standalone BC4.
+* 2 albedo + alpha maps (`images/bc3`), 1024×1024, converted per block with stb_dxt: the per-image ratio is printed to stdout (no CSV) and the suite average must stay above 1:1. Measured: **2.8030:1** average (3.1231:1 for leak-stain_albedo, 2.4828:1 for leaves). The ratio is dominated by the BC1 color half, which keeps the BC1 headroom; the 8-bit alpha half compresses like a standalone BC4.
 
 ## Images 
 

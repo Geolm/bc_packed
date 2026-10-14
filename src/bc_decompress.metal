@@ -27,7 +27,7 @@
 // The stream layout parsed here mirrors the CPU compressors / decompressors:
 //   BC1       [17 static models][top table size u8][4-align][strip seed u32][strip predictor u64][strip dict enable u64]
 //             [top table u32s][2-align][63 strip offsets u16, deltas in dword units][4-align][strip bitstreams]
-//   BC4 / BC5 [2 endpoint models per channel][24 index models per channel][strip seed, 2 bytes per channel]
+//   BC4 / BC5 [2 endpoint models per channel][64 index models per channel][strip seed, 2 bytes per channel]
 //             [2-align][63 strip offsets u16, deltas in dword units][4-align][strip bitstreams]
 //
 // On a corrupted stream the decode runs to completion and the output is garbage, mirroring the
@@ -42,7 +42,8 @@ constant uint NUM_STRIPS = 64; // 64 independent strips, one decoded thread per 
 constant uint TOP_TABLE_SIZE = 256;
 constant uint LE_ALPHABET_SIZE = 256;
 constant uint BC4_INDEX_ALPHABET_SIZE = 8; // bc4/bc5 index models: 8 prediction values
-constant uint BC4_INDEX_CONTEXTS = 24;     // bc4/bc5 index models: 3 endpoint-range families x 8
+constant uint BC4_INDEX_DIM = 8;           // bc4/bc5 index context: the 8 x 8 [left][top] matrix
+constant uint BC4_INDEX_CONTEXTS = BC4_INDEX_DIM * BC4_INDEX_DIM;
 constant uint LE_MAX_K = 8;
 constant int COLOR_DELTA_OFFSET = 1 << 6; // 64: bias of the signed color deltas
 
@@ -547,17 +548,11 @@ uint8_t bc4_endpoint_predict(bool first_row, bool row_start, uint8_t prev, uint8
     return (uint8_t)(prev + top - top_prev);
 }
 
-// mirror of bc4_index_family (src/bc_packed.c): 3 families from the endpoint range |e0 - e1|
-uint8_t bc4_index_family(uint8_t e0, uint8_t e1)
+// mirror of bc4_index_context (src/bc_packed.c): the 8 x 8 [left][top] matrix context, a
+// missing neighbor (first row, row start) defaults to 0
+uint8_t bc4_index_context(uint8_t left, uint8_t top)
 {
-    uint32_t range = (e0 >= e1) ? (uint32_t)(e0 - e1) : (uint32_t)(e1 - e0);
-
-    if (range < 5)
-        return 0;
-    if (range < 40)
-        return 1;
-
-    return 2;
+    return (uint8_t)(left * BC4_INDEX_DIM + top);
 }
 
 template <uint NumChannels>
@@ -582,7 +577,7 @@ void bc45_decode_strip(const device uint8_t* input,
     output += (uint64_t)grid_pos.y * image_size;
 
     //-------------------------------------------------------------------------------------------------------------------------
-    // load the static models: per channel, the 2 endpoint models (256 symbols) then the 24
+    // load the static models: per channel, the 2 endpoint models (256 symbols) then the 64
     // compact index models (8 symbols)
     model_t endpoint[NumChannels][2];
     model8_t index[NumChannels][BC4_INDEX_CONTEXTS];
@@ -689,16 +684,17 @@ void bc45_decode_strip(const device uint8_t* input,
                 }
 
                 // index payload: the first index in raw 3 bits, then each index xored with its
-                // intra-block prediction, contextual on the family and the prediction value
+                // intra-block prediction, contextual on the 8 x 8 [left][top] matrix
                 idx[0] = bs_read_bits(&compressed_stream, 3);
-
-                uint8_t family = bc4_index_family(e[0], e[1]);
 
                 for (uint i = 1; i < 16; ++i)
                 {
-                    uint8_t p = ((i & 3) == 0) ? idx[i - 4] : idx[i - 1];
+                    // the missing neighbor of the pixel (first row, row start) defaults to 0
+                    uint8_t left = ((i & 3) == 0) ? 0 : idx[i - 1];
+                    uint8_t top = (i < 4) ? 0 : idx[i - 4];
+                    uint8_t p = ((i & 3) == 0) ? top : left;
 
-                    idx[i] = (uint8_t)(p ^ decode_symbol8(&compressed_stream, &index[c][family * 8 + p]));
+                    idx[i] = (uint8_t)(p ^ decode_symbol8(&compressed_stream, &index[c][bc4_index_context(left, top)]));
                 }
 
                 // the standard block: two endpoints + the 48-bit little-endian index field, as two aligned u32 words

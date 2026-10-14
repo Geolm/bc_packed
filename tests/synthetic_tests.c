@@ -549,8 +549,8 @@ static greatest_test_res bc45_both(const bc4_block* image8, const bc4_block* ima
 }
 
 //-----------------------------------------------------------------------------------------------------------------------------
-// one solid block value: identical endpoints (range 0, family 0) and constant indices,
-// the degenerate single-symbol models
+// one solid block value: identical endpoints and constant indices, the degenerate
+// single-symbol models
 TEST bc45_flat(void)
 {
     bc4_block image[TEST_BC45_BLOCKS];
@@ -576,7 +576,7 @@ TEST bc45_flat(void)
 }
 
 //-----------------------------------------------------------------------------------------------------------------------------
-// alternating endpoint pairs (range 8, family 1) and index patterns across the block grid
+// alternating endpoint pairs and index patterns across the block grid
 TEST bc45_checkerboard(void)
 {
     bc4_block image[TEST_BC45_BLOCKS];
@@ -590,7 +590,7 @@ TEST bc45_checkerboard(void)
         if ((bx + by) % 2 == 0)
         {
             image[i].endpoint[0] = 0x30;
-            image[i].endpoint[1] = 0x28; // range 8 → family 1
+            image[i].endpoint[1] = 0x28;
             for(uint32_t j=0; j<6; ++j)
                 image[i].indices[j] = (uint8_t)((bx + by + j) * 0x55);
         }
@@ -617,7 +617,7 @@ TEST bc45_checkerboard(void)
 }
 
 //-----------------------------------------------------------------------------------------------------------------------------
-// smooth endpoint gradient (wide ranges, family 2) with position-derived indices
+// smooth endpoint gradient (wide ranges) with position-derived indices
 TEST bc45_gradient(void)
 {
     bc4_block image[TEST_BC45_BLOCKS];
@@ -648,8 +648,8 @@ TEST bc45_gradient(void)
 }
 
 //-----------------------------------------------------------------------------------------------------------------------------
-// pseudo-random blocks: all families, near-uniform symbols (the raw-mode fallback) and full
-// 24-context usage in a single image
+// pseudo-random blocks: near-uniform symbols (the raw-mode fallback) and full
+// 64-context usage in a single image
 TEST bc45_random_splitmix32(void)
 {
     bc4_block image[TEST_BC45_BLOCKS];
