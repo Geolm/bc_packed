@@ -18,7 +18,7 @@ The compressor is CPU-side and can use significantly more computation than the d
 
 | Block type |  Average compression from the image suite | 
 |:-----: | :------------: 
-| BC1 | 1.46:1  
+| BC1 | 1.47:1  
 | BC4 | 1.13:1
 | BC5 | 1.1:1  
 
@@ -55,7 +55,7 @@ The techniques are adapted to make GPU decompression fast and simple:
 * **Static symbol ranking.** Symbols are remapped so that the most frequently used symbols have the lowest indices. The rank table is generated from a histogram during compression.
 * **Parallel decompression.** The texture is divided into 64 independent strips. 64 GPU threads decompress the strips in parallel, with no dependency between threads.
 
-Multiple independent Rice-Golomb models are used for the different data: endpoint color deltas (one set of red, green, blue per endpoint, red and blue each with one model per green-delta context bucket — 14 color models, see Endpoints), top-table references, difference masks, and residual difference bytes (17 models in total).
+Multiple independent Rice-Golomb models are used for the different data: endpoint color deltas (one set of red, green, blue per endpoint, red and blue each with one model per green-delta context bucket, and the second endpoint's green also contextual on the sign of the first endpoint's green — 16 color models, see Endpoints), top-table references, difference masks, and residual difference bytes (19 models in total).
 
 ### Rice-Golomb model
 
@@ -99,14 +99,14 @@ As the decompression happens on the GPU we need to decompress in parallel multip
 
 For example for a 1024x1024 texture : each thread will decode 256 blocks (in width) x 4 blocks (in height).
 
-As the models are static, each thread just loads the same 17 models from the stream (`le_static_model_load`); the color context is derived from the current block's own decoded green delta, so there is no adaptive state to keep in sync between threads.
+As the models are static, each thread just loads the same 19 models from the stream (`le_static_model_load`); the color context is derived from the current block's own decoded green delta, so there is no adaptive state to keep in sync between threads.
 
 As Rice encoding output is non-fixed, we stored in the stream 63 offsets (uint16_t), each a delta in dword units relative to the previous strip, so each thread knows where to start (strip 0 always starts the strip data, its implicit zero offset is not stored).
 
 ### Endpoints
 
 BC1 endpoints are predicted from the previous block's endpoints.
-One set of three independent Rice-Golomb models is used per endpoint for the R, G, and B components; red and blue additionally carry one model per context bucket — 14 color models in total. Each (channel, endpoint, context) model is fitted to the color deltas that occur in its context, so every block is priced by a model that matches its own regime.
+One set of three independent Rice-Golomb models is used per endpoint for the R, G, and B components; red and blue each carry one model per context bucket, and the second endpoint's green does as well (keyed on the sign of the first endpoint's green delta) — 16 color models in total. Each (channel, endpoint, context) model is fitted to the color deltas that occur in its context, so every block is priced by a model that matches its own regime.
 
 For each endpoint of each block:
 
@@ -118,7 +118,7 @@ blue_delta  = (current_blue  - previous_blue) - green_delta / 2
 
 BC1 colors are R5G6B5, so the deltas always fit in 7 bits. Each delta is stored as an unsigned value offset by 64, and encoded with its static Rice-Golomb model.
 
-The red and blue deltas are contextual: the context is three value buckets of the endpoint's own 6-bit green delta (negative / zero / positive). The decorrelation removes the *linear* luminance component of the chroma deltas, but the residual chroma still scales with the local luminance energy, so a model fitted per luminance-delta regime prices each block tighter than a single image-wide model. The green deltas are encoded uncontexted. The context is derived from a value that is already decoded, so the model selection costs no stream bits.
+The red and blue deltas are contextual: the context is three value buckets of the endpoint's own 6-bit green delta (negative / zero / positive). The decorrelation removes the *linear* luminance component of the chroma deltas, but the residual chroma still scales with the local luminance energy, so a model fitted per luminance-delta regime prices each block tighter than a single image-wide model. The first endpoint's green delta is encoded uncontexted; the second endpoint's green delta is contextual on the sign of the first endpoint's green delta (negative / zero / positive). The context is derived from a value that is already decoded, so the model selection costs no stream bits.
 
 The blocks are traversed in a zigzag order to avoid a discontinuity at the end of each scanline:
 
@@ -204,7 +204,7 @@ Note : the stream does not include width, height or format, only the compressed 
 The output buffer must be at least `packed_bc1_maxsize(width, height)` bytes. This is a very rough bound: `(width/4) * (height/4) * 16`, i.e. 2× the standard BC1 texture size. In practice the stream is much smaller.
 
 ```text
-* 17 static models, in order: for each endpoint (0, 1): red (3 context buckets), green, blue (3 context buckets) — 14 color models — then top-table reference, difference mask, table difference.
+* 19 static models, in order: for each endpoint (0, 1): red (3 context buckets), green (3 context buckets), blue (3 context buckets) — 16 color models — then top-table reference, difference mask, table difference.
   Each is 3 + num_symbols bytes, no padding (max 259 bytes).
 * Top table size: one uint8_t (number of entries − 1), padded to a 4-byte boundary.
 * Strip seed: one uint32_t (little-endian) — the two endpoint colors of the "previous block" used to predict the first block of each strip, averaged over the 64 strips at compression time. Low 16 bits = color[0], high 16 bits = color[1].
@@ -233,7 +233,7 @@ Within a strip, the blocks are traversed in the zigzag row order. For each block
 * One difference byte per set mask bit.
 ```
 
-See Color-pair dictionary. The six color deltas, the top-table reference, the mask, and the difference bytes are all encoded with Rice-Golomb using one of the 17 static models; each red/blue uses the model of its (channel, endpoint, context) — the three-bucket green delta described in Endpoints — and each green uses its endpoint's uncontexted model. The dictionary flag and reference are raw bits, not Rice-Golomb symbols.
+See Color-pair dictionary. The six color deltas, the top-table reference, the mask, and the difference bytes are all encoded with Rice-Golomb using one of the 19 static models; each red/blue uses the model of its (channel, endpoint, context) — the three-bucket green delta described in Endpoints — and each green uses the model of its (endpoint, context), the first endpoint uncontexted and the second contextual on the sign of the first endpoint's green delta. The dictionary flag and reference are raw bits, not Rice-Golomb symbols.
 
 
 =======

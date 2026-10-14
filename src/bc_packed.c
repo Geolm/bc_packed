@@ -515,8 +515,9 @@ struct bcp_context
     bcp_mem_interface mem;
 
     // contextual color models: red/blue carry one model per green-delta context bucket (the chroma deltas
-    // scale with the endpoint's own luminance delta); the green models stay uncontexted
-    le_model red_model[2][COLOR_DELTA_CONTEXTS], green_model[2], blue_model[2][COLOR_DELTA_CONTEXTS];
+    // scale with the endpoint's own luminance delta). The first endpoint's green model is uncontexted,
+    // the second is contextual on the sign of the first endpoint's green delta (negative / zero / positive)
+    le_model red_model[2][COLOR_DELTA_CONTEXTS], green_model[2][COLOR_DELTA_CONTEXTS], blue_model[2][COLOR_DELTA_CONTEXTS];
     le_model mask_model; // 4 bits
     le_model table_reference_model;
     le_model table_difference_model;
@@ -673,11 +674,11 @@ static inline uint8_t color_ref_bits(uint32_t position)
 
 //----------------------------------------------------------------------------------------------------------------------------
 // Histogram of the six color-delta symbols: one bucket per (endpoint, context) model, mirroring
-// the layout of the models themselves (14 models of 2^COLOR_DELTA_NUM_BITS symbols)
+// the layout of the models themselves (16 models of 2^COLOR_DELTA_NUM_BITS symbols)
 typedef struct color_hists
 {
     uint32_t red[2][COLOR_DELTA_CONTEXTS][1<<COLOR_DELTA_NUM_BITS];
-    uint32_t green[2][1<<COLOR_DELTA_NUM_BITS];
+    uint32_t green[2][COLOR_DELTA_CONTEXTS][1<<COLOR_DELTA_NUM_BITS];
     uint32_t blue[2][COLOR_DELTA_CONTEXTS][1<<COLOR_DELTA_NUM_BITS];
 } color_hists;
 
@@ -742,6 +743,7 @@ static inline uint8_t color_delta_context(int dgreen)
 static inline uint32_t color_delta_cost(const bcp_context* ctx, const bc1_block* current, const bc1_block* reference)
 {
     uint32_t cost = 0;
+    int first_green_delta = 0;
 
     for(uint32_t j=0; j<2; ++j)
     {
@@ -755,7 +757,11 @@ static inline uint32_t color_delta_cost(const bcp_context* ctx, const bc1_block*
         int dgreen = current_green - reference_green;
         int dblue = current_blue - reference_blue;
 
-        cost += le_symbol_cost(&ctx->green_model[j], (uint8_t)(dgreen + COLOR_DELTA_OFFSET));
+        uint8_t green_context = (j == 0) ? 0 : color_delta_context(first_green_delta);
+        cost += le_symbol_cost(&ctx->green_model[j][green_context], (uint8_t)(dgreen + COLOR_DELTA_OFFSET));
+
+        if (j == 0)
+            first_green_delta = dgreen;
 
         // the red/blue deltas scale with the endpoint's own green delta, bucket it before halving
         uint8_t chroma_context = color_delta_context(dgreen);
@@ -776,6 +782,8 @@ static inline uint32_t color_delta_cost(const bcp_context* ctx, const bc1_block*
 // the encoder writes per block, mirroring its delta computation
 static inline void color_hists_add(color_hists* h, const bc1_block* current, const bc1_block* reference)
 {
+    int first_green_delta = 0;
+
     for(uint32_t j=0; j<2; ++j)
     {
         uint8_t current_red, current_green, current_blue;
@@ -788,7 +796,11 @@ static inline void color_hists_add(color_hists* h, const bc1_block* current, con
         int dgreen = current_green - reference_green;
         int dblue = current_blue - reference_blue;
 
-        h->green[j][dgreen + COLOR_DELTA_OFFSET]++;
+        uint8_t green_context = (j == 0) ? 0 : color_delta_context(first_green_delta);
+        h->green[j][green_context][dgreen + COLOR_DELTA_OFFSET]++;
+
+        if (j == 0)
+            first_green_delta = dgreen;
 
         // the red/blue deltas scale with the endpoint's own green delta, bucket it before halving
         uint8_t chroma_context = color_delta_context(dgreen);
@@ -815,8 +827,9 @@ static inline void color_hists_sub(color_hists* h, const color_hists* m)
                 h->blue[j][c][i] -= m->blue[j][c][i];
             }
 
-        for(uint32_t i=0; i<(1<<COLOR_DELTA_NUM_BITS); ++i)
-            h->green[j][i] -= m->green[j][i];
+        for(uint32_t c=0; c<COLOR_DELTA_CONTEXTS; ++c)
+            for(uint32_t i=0; i<(1<<COLOR_DELTA_NUM_BITS); ++i)
+                h->green[j][c][i] -= m->green[j][c][i];
     }
 }
 
@@ -1113,16 +1126,15 @@ void build_top_table(hashmap_entry* hashmap, const void* input, uint32_t num_blo
 }
 
 //-----------------------------------------------------------------------------------------------------------------------------
-// fits the 14 color models (3 contextual red / blue per endpoint + 1 uncontexted green per endpoint)
-// from [hist]
+// fits the 16 color models (3 contextual red / blue per endpoint + the green models: endpoint 0
+// uncontexted, endpoint 1 contextual on the sign of endpoint 0's green delta) from [hist]
 static inline void init_color_models(bcp_context* ctx, const color_hists* hist)
 {
     for(uint32_t j=0; j<2; ++j)
     {
-        le_static_model_init(&ctx->green_model[j], hist->green[j], 1<<COLOR_DELTA_NUM_BITS);
-
         for(uint32_t c=0; c<COLOR_DELTA_CONTEXTS; ++c)
         {
+            le_static_model_init(&ctx->green_model[j][c], &hist->green[j][c][0], 1<<COLOR_DELTA_NUM_BITS);
             le_static_model_init(&ctx->red_model[j][c], &hist->red[j][c][0], 1<<COLOR_DELTA_NUM_BITS);
             le_static_model_init(&ctx->blue_model[j][c], &hist->blue[j][c][0], 1<<COLOR_DELTA_NUM_BITS);
         }
@@ -1889,13 +1901,14 @@ static size_t bcp_compress_bc1_impl(bcp_context* ctx, const void* bc1_image, uin
 
     byte_stream stream = {.buffer = output, .length = output_length, .pos = 0};
 
-    // store models: contextual red/blue per endpoint (3 contexts each) + one uncontexted green per
-    // endpoint (14 color models), then the index models
+    // store models: per endpoint, the contextual red, green, and blue models (3 contexts each) —
+    // 16 color models — then the index models
     for(uint32_t j=0; j<2; ++j)
     {
         for(uint32_t c=0; c<COLOR_DELTA_CONTEXTS; ++c)
             if (!save_static_model(&ctx->red_model[j][c], &stream)) return 0;
-        if (!save_static_model(&ctx->green_model[j], &stream)) return 0;
+        for(uint32_t c=0; c<COLOR_DELTA_CONTEXTS; ++c)
+            if (!save_static_model(&ctx->green_model[j][c], &stream)) return 0;
         for(uint32_t c=0; c<COLOR_DELTA_CONTEXTS; ++c)
             if (!save_static_model(&ctx->blue_model[j][c], &stream)) return 0;
     }
@@ -1987,6 +2000,7 @@ static size_t bcp_compress_bc1_impl(bcp_context* ctx, const void* bc1_image, uin
                     if (use_top && y > start_y)
                         color_reference = (const bc1_block*) bc1_image + ((y - 1) * width_blocks + zigzag_x) * block_stride;
 
+                    int first_green_delta = 0;
                     for(uint32_t j=0; j<2; ++j)
                     {
                         uint8_t current_red, current_green, current_blue;
@@ -1999,7 +2013,12 @@ static size_t bcp_compress_bc1_impl(bcp_context* ctx, const void* bc1_image, uin
                         int dgreen = current_green - reference_green;
                         int dblue = current_blue - reference_blue;
 
-                        le_encode_symbol(&compressed_stream, &ctx->green_model[j], dgreen + COLOR_DELTA_OFFSET);
+                        // endpoint 0's green is uncontexted, endpoint 1's is contextual on the sign of endpoint 0's
+                        uint8_t green_context = (j == 0) ? 0 : color_delta_context(first_green_delta);
+                        le_encode_symbol(&compressed_stream, &ctx->green_model[j][green_context], dgreen + COLOR_DELTA_OFFSET);
+
+                        if (j == 0)
+                            first_green_delta = dgreen;
 
                         // the red/blue deltas scale with the endpoint's own green delta, bucket it before halving
                         uint8_t chroma_context = color_delta_context(dgreen);
@@ -2068,13 +2087,14 @@ static bool bcp_decompress_bc1_impl(bcp_context* ctx, const void* input, size_t 
 
     byte_stream stream = {.buffer = (uint8_t *) input, .length = input_length, .pos = 0};
 
-    // load models: contextual red/blue per endpoint (3 contexts each) + one uncontexted green per
-    // endpoint (14 color models), then the index models
+    // load models: per endpoint, the contextual red, green, and blue models (3 contexts each) —
+    // 16 color models — then the index models
     for(uint32_t j=0; j<2; ++j)
     {
         for(uint32_t c=0; c<COLOR_DELTA_CONTEXTS; ++c)
             if (!load_static_model(&ctx->red_model[j][c], &stream)) return false;
-        if (!load_static_model(&ctx->green_model[j], &stream)) return false;
+        for(uint32_t c=0; c<COLOR_DELTA_CONTEXTS; ++c)
+            if (!load_static_model(&ctx->green_model[j][c], &stream)) return false;
         for(uint32_t c=0; c<COLOR_DELTA_CONTEXTS; ++c)
             if (!load_static_model(&ctx->blue_model[j][c], &stream)) return false;
     }
@@ -2171,15 +2191,20 @@ static bool bcp_decompress_bc1_impl(bcp_context* ctx, const void* input, size_t 
                 if (use_top && y > start_y)
                     color_reference = (const bc1_block*) output + ((y - 1) * width_blocks + zigzag_x) * block_stride;
 
+                int first_green_delta = 0;
                 for(uint32_t j=0; j<2; ++j)
                 {
                     uint8_t reference_red, reference_green, reference_blue;
                     bc1_extract_565(color_reference->color[j], &reference_red, &reference_green, &reference_blue);
 
-                    uint8_t green_symbol = le_decode_symbol(&compressed_stream, &ctx->green_model[j]);
+                    // endpoint 0's green is uncontexted, endpoint 1's is contextual on the sign of endpoint 0's
+                    uint8_t green_context = (j == 0) ? 0 : color_delta_context(first_green_delta);
+                    uint8_t green_symbol = le_decode_symbol(&compressed_stream, &ctx->green_model[j][green_context]);
 
                     // red and blue delta are based on green delta
                     int dgreen_orig = (int)green_symbol - COLOR_DELTA_OFFSET;
+                    if (j == 0)
+                        first_green_delta = dgreen_orig;
                     uint8_t chroma_context = color_delta_context(dgreen_orig);
 
                     uint8_t delta_red = le_decode_symbol(&compressed_stream, &ctx->red_model[j][chroma_context]);

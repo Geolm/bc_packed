@@ -25,7 +25,7 @@
 // buffer(2): constant decode_args_t
 //
 // The stream layout parsed here mirrors the CPU compressors / decompressors:
-//   BC1       [17 static models][top table size u8][4-align][strip seed u32][strip predictor u64][strip dict enable u64]
+//   BC1       [19 static models][top table size u8][4-align][strip seed u32][strip predictor u64][strip dict enable u64]
 //             [top table u32s][2-align][63 strip offsets u16, deltas in dword units][4-align][strip bitstreams]
 //   BC4 / BC5 [2 endpoint models per channel][64 index models per channel][strip seed, 2 bytes per channel]
 //             [2-align][63 strip offsets u16, deltas in dword units][4-align][strip bitstreams]
@@ -328,9 +328,9 @@ kernel void bcp_decompress_bc1(const device uint8_t* input [[buffer(0)]],
     output += (uint64_t)grid_pos.y * image_size;
 
     //-------------------------------------------------------------------------------------------------------------------------
-    // load the static models: contextual red/blue per endpoint (3 contexts each) + one uncontexted
-    // green per endpoint (14 color models), then the index models
-    model_t red[6], green[2], blue[6];
+    // load the static models: contextual red, green, and blue per endpoint (3 contexts each) —
+    // 16 color models — then the index models
+    model_t red[6], green[6], blue[6];
     model_t reference_model, mask_model, difference_model;
 
     thread uint64_t pos = 0;
@@ -340,8 +340,9 @@ kernel void bcp_decompress_bc1(const device uint8_t* input [[buffer(0)]],
             if (!load_model(input, length, &pos, &red[j * 3 + c]))
                 return;
 
-        if (!load_model(input, length, &pos, &green[j]))
-            return;
+        for (uint c = 0; c < 3; ++c)
+            if (!load_model(input, length, &pos, &green[j * 3 + c]))
+                return;
 
         for (uint c = 0; c < 3; ++c)
             if (!load_model(input, length, &pos, &blue[j * 3 + c]))
@@ -473,6 +474,7 @@ kernel void bcp_decompress_bc1(const device uint8_t* input [[buffer(0)]],
                     reference_color1 = (uint16_t)(previous_colors >> 16);
                 }
 
+                int first_green_delta = 0;
                 for (uint j = 0; j < 2; ++j)
                 {
                     uint16_t reference_color = (j == 0) ? reference_color0 : reference_color1;
@@ -481,10 +483,14 @@ kernel void bcp_decompress_bc1(const device uint8_t* input [[buffer(0)]],
                     uint8_t reference_green = (uint8_t)((reference_color >> 5) & 0x3F);
                     uint8_t reference_blue = (uint8_t)(reference_color & 0x1F);
 
-                    uint8_t green_symbol = decode_symbol(&compressed_stream, &green[j]);
+                    // endpoint 0's green is uncontexted, endpoint 1's is contextual on the sign of endpoint 0's
+                    uint8_t green_context = (j == 0) ? 0 : ((first_green_delta < 0) ? 0 : ((first_green_delta > 0) ? 1 : 2));
+                    uint8_t green_symbol = decode_symbol(&compressed_stream, &green[j * 3 + green_context]);
 
                     // red and blue delta are based on green delta
                     int dgreen_orig = (int)green_symbol - COLOR_DELTA_OFFSET;
+                    if (j == 0)
+                        first_green_delta = dgreen_orig;
                     uint8_t chroma_context = (dgreen_orig < 0) ? 0 : ((dgreen_orig > 0) ? 1 : 2);
 
                     uint8_t delta_red = decode_symbol(&compressed_stream, &red[j * 3 + chroma_context]);
