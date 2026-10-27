@@ -14,6 +14,7 @@ The compressor is CPU-side and can use significantly more computation than the d
 |      M5 Pro | GPU | 15300 MiB/s      |
 |      M2 Max | CPU 12 cores | 1300 MiB/s      |
 |      M2 Max | GPU | 11850 MiB/s      |
+|      AMD Threadripper | CPU 24 cores | 1322 MiB/s |
 
 
 | Block type |  Average compression from the image suite | 
