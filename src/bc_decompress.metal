@@ -86,20 +86,20 @@ uint tile_grid_x(uint width_blocks)
 // block bounds of tile [strip_index] of the 64-tile grid, x1 / y1 one past. the even split of
 // the block grid covers the image exactly, so images whose block count is not a multiple of
 // the tile size lose no rows or columns (the old strip truncation dropped the trailing rows)
-typedef struct tile_bounds_t
+typedef struct tile_bounds
 {
     uint x0, x1;
     uint y0, y1;
-} tile_bounds_t;
+} tile_bounds;
 
-tile_bounds_t tile_bounds(uint strip_index, uint width_blocks, uint height_blocks)
+tile_bounds tile_bounds_get(uint strip_index, uint width_blocks, uint height_blocks)
 {
     uint gx = tile_grid_x(width_blocks);
     uint gy = NUM_STRIPS / gx;
     uint tx = strip_index % gx;
     uint ty = strip_index / gx;
 
-    return tile_bounds_t { .x0 = (tx * width_blocks) / gx, .x1 = ((tx + 1) * width_blocks) / gx,
+    return tile_bounds { .x0 = (tx * width_blocks) / gx, .x1 = ((tx + 1) * width_blocks) / gx,
                            .y0 = (ty * height_blocks) / gy, .y1 = ((ty + 1) * height_blocks) / gy };
 }
 
@@ -456,7 +456,7 @@ kernel void bcp_decompress_bc1(const device uint8_t* input [[buffer(0)]],
     uint16_t previous_color1 = (uint16_t)(strip_seed >> 16);
     const bool use_top = ((strip_predictor >> strip_id) & 1) != 0;
     const bool dict_enabled = ((strip_dict_enable >> strip_id) & 1) != 0;
-    const tile_bounds_t tb = tile_bounds(strip_id, width_blocks, height_blocks);
+    const tile_bounds tb = tile_bounds_get(strip_id, width_blocks, height_blocks);
     const uint tile_width = tb.x1 - tb.x0;
 
     // the output is read back for the top prediction: the two endpoint colors of a block are packed in one u32
@@ -681,7 +681,7 @@ void bc45_decode_strip(const device uint8_t* input,
         }
     }
 
-    const tile_bounds_t tb = tile_bounds(strip_id, width_blocks, height_blocks);
+    const tile_bounds tb = tile_bounds_get(strip_id, width_blocks, height_blocks);
     const uint tile_width = tb.x1 - tb.x0;
 
     // the output is read back for the top prediction: the two endpoints of a channel block

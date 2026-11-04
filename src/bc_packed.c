@@ -1156,20 +1156,20 @@ static inline uint32_t tile_grid_x(uint32_t width_blocks)
 // block bounds of tile [strip_index] of the 64-tile grid, x1 / y1 one past. the even split of
 // the block grid covers the image exactly, so images whose block count is not a multiple of
 // the tile size lose no rows or columns (the old strip truncation dropped the trailing rows)
-typedef struct tile_bounds_t
+typedef struct tile_bounds
 {
     uint32_t x0, x1;
     uint32_t y0, y1;
-} tile_bounds_t;
+} tile_bounds;
 
-static inline tile_bounds_t tile_bounds(uint32_t strip_index, uint32_t width_blocks, uint32_t height_blocks, uint32_t num_strips)
+static inline tile_bounds tile_bounds_get(uint32_t strip_index, uint32_t width_blocks, uint32_t height_blocks, uint32_t num_strips)
 {
     uint32_t gx = tile_grid_x(width_blocks);
     uint32_t gy = num_strips / gx;
     uint32_t tx = strip_index % gx;
     uint32_t ty = strip_index / gx;
 
-    return (tile_bounds_t) { .x0 = (tx * width_blocks) / gx, .x1 = ((tx + 1) * width_blocks) / gx,
+    return (tile_bounds) { .x0 = (tx * width_blocks) / gx, .x1 = ((tx + 1) * width_blocks) / gx,
                            .y0 = (ty * height_blocks) / gy, .y1 = ((ty + 1) * height_blocks) / gy };
 }
 
@@ -1191,7 +1191,7 @@ void init_static_models(bcp_context* ctx, const void* input, uint32_t width_bloc
 
     for(uint32_t strip_index=0; strip_index<num_strips; ++strip_index)
     {
-        tile_bounds_t tb = tile_bounds(strip_index, width_blocks, height_blocks, num_strips);
+        tile_bounds tb = tile_bounds_get(strip_index, width_blocks, height_blocks, num_strips);
         uint32_t zigzag_x = (tb.y0 & 1) ? tb.x0 : tb.x1 - 1;
 
         const bc1_block* first = (const bc1_block*) input + ((tb.y0 * width_blocks) + zigzag_x) * block_stride;
@@ -1222,7 +1222,7 @@ void init_static_models(bcp_context* ctx, const void* input, uint32_t width_bloc
         bc1_block previous;
         unpack_strip_seed(ctx->strip_seed, &previous);
 
-        tile_bounds_t tb = tile_bounds(strip_index, width_blocks, height_blocks, num_strips);
+        tile_bounds tb = tile_bounds_get(strip_index, width_blocks, height_blocks, num_strips);
         uint32_t tile_width = tb.x1 - tb.x0;
 
         for(uint32_t y = tb.y0; y < tb.y1; ++y)
@@ -1256,7 +1256,7 @@ void init_static_models(bcp_context* ctx, const void* input, uint32_t width_bloc
         bc1_block previous;
         unpack_strip_seed(ctx->strip_seed, &previous);
         const bool use_top = ((ctx->strip_predictor >> strip_index) & 1) != 0;
-        tile_bounds_t tb = tile_bounds(strip_index, width_blocks, height_blocks, num_strips);
+        tile_bounds tb = tile_bounds_get(strip_index, width_blocks, height_blocks, num_strips);
         uint32_t tile_width = tb.x1 - tb.x0;
 
         for(uint32_t y = tb.y0; y < tb.y1; ++y)
@@ -1313,7 +1313,7 @@ void init_static_models(bcp_context* ctx, const void* input, uint32_t width_bloc
         memset(&dict, 0, sizeof(dict));
         memset(&matched, 0, sizeof(matched));
         const bool use_top = ((ctx->strip_predictor >> strip_index) & 1) != 0;
-        tile_bounds_t tb = tile_bounds(strip_index, width_blocks, height_blocks, num_strips);
+        tile_bounds tb = tile_bounds_get(strip_index, width_blocks, height_blocks, num_strips);
         uint32_t tile_width = tb.x1 - tb.x0;
 
         int64_t savings = 0;
@@ -1516,7 +1516,7 @@ static void bc4_init_models(bcp_context* ctx, const void* image, uint32_t width_
     // pass 1: tile seeds, the average of the first block of each tile in chain order
     for(uint32_t strip_index=0; strip_index<num_strips; ++strip_index)
     {
-        tile_bounds_t tb = tile_bounds(strip_index, width_blocks, height_blocks, num_strips);
+        tile_bounds tb = tile_bounds_get(strip_index, width_blocks, height_blocks, num_strips);
         uint32_t x0 = (tb.y0 & 1) ? tb.x0 : tb.x1 - 1;
 
         for(uint32_t c=0; c<num_channels; ++c)
@@ -1547,7 +1547,7 @@ static void bc4_init_models(bcp_context* ctx, const void* image, uint32_t width_
             }
         }
 
-        tile_bounds_t tb = tile_bounds(strip_index, width_blocks, height_blocks, num_strips);
+        tile_bounds tb = tile_bounds_get(strip_index, width_blocks, height_blocks, num_strips);
         uint32_t tile_width = tb.x1 - tb.x0;
 
         for(uint32_t y = tb.y0; y < tb.y1; ++y)
@@ -1688,7 +1688,7 @@ static size_t bcp_compress_bc45(bcp_context* ctx, const void* image, uint32_t wi
             }
         }
 
-        tile_bounds_t tb = tile_bounds(strip_index, width_blocks, height_blocks, *num_strips);
+        tile_bounds tb = tile_bounds_get(strip_index, width_blocks, height_blocks, *num_strips);
         uint32_t tile_width = tb.x1 - tb.x0;
 
         for(uint32_t y = tb.y0; y < tb.y1; ++y)
@@ -1827,7 +1827,7 @@ static bool bcp_decompress_bc45(bcp_context* ctx, const void* input, size_t inpu
         }
     }
 
-    tile_bounds_t tb = tile_bounds(strip_index, width_blocks, height_blocks, num_strips);
+    tile_bounds tb = tile_bounds_get(strip_index, width_blocks, height_blocks, num_strips);
     uint32_t tile_width = tb.x1 - tb.x0;
 
     for(uint32_t y = tb.y0; y < tb.y1; ++y)
@@ -2005,7 +2005,7 @@ static size_t bcp_compress_bc1_impl(bcp_context* ctx, const void* bc1_image, uin
         memset(&dict, 0, sizeof(dict));
         const bool use_top = ((ctx->strip_predictor >> strip_index) & 1) != 0;
         const bool dict_enabled = ((ctx->strip_dict_enable >> strip_index) & 1) != 0;
-        tile_bounds_t tb = tile_bounds(strip_index, width_blocks, height_blocks, *num_strips);
+        tile_bounds tb = tile_bounds_get(strip_index, width_blocks, height_blocks, *num_strips);
         uint32_t tile_width = tb.x1 - tb.x0;
 
         for(uint32_t y = tb.y0; y < tb.y1; ++y)
@@ -2198,7 +2198,7 @@ static bool bcp_decompress_bc1_impl(bcp_context* ctx, const void* input, size_t 
     memset(&dict, 0, sizeof(dict));
     const bool use_top = ((ctx->strip_predictor >> strip_index) & 1) != 0;
     const bool dict_enabled = ((ctx->strip_dict_enable >> strip_index) & 1) != 0;
-    tile_bounds_t tb = tile_bounds(strip_index, width_blocks, height_blocks, num_strips);
+    tile_bounds tb = tile_bounds_get(strip_index, width_blocks, height_blocks, num_strips);
     uint32_t tile_width = tb.x1 - tb.x0;
 
     for(uint32_t y = tb.y0; y < tb.y1; ++y)
