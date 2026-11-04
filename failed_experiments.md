@@ -44,6 +44,7 @@ Rice `k` and rank table per endpoint fits better. Kept.
 | 18 | Per-model raw-byte `q_escape` for static models, searched jointly with the Rice `k` against the histogram (replaces the fixed per-k escape table; one header byte per model) | round-trips; colors −1.19%, 74/74 improved, worst +0.01% | **1.4438:1** (+0.52%) | **kept — this is the new baseline** |
 | 20 | Color-pair sliding dictionary: a 1-bit flag + a `ceil(log2(min(pos,256)))`-bit reference to a matching block within the last 256 replaces the six color deltas when the two endpoint colors exactly repeat, plus a per-strip enable flag | round-trips (CPU + GPU); forced version was a net loss (25 improved / 44 regressed), the per-strip version: 44 improved / 5 regressed / 25 flat, the flat ones byte-identical to the baseline | 1.4587 → 1.4654 (+0.46%) avg; 1.4020 → 1.4073 (+0.38%) byte-weighted; best +2.95% (wall2), worst −0.14% (kodim15) | **kept — this is the new baseline** (the per-strip flag turns the forced-match net loss into a net win) |
 | 21 | `bc4_index_family` endpoint-range thresholds: 30+ split variants on the 10-image bc4/bc5/bc3 suite (3-family 8/16 → 5/40; also 2- and 4-family splits) | round-trips (CPU + GPU); 10/10 images improved, best −1.04% (bc3 leak-stain alpha), worst −0.02%; 2- and 4-family counts all lose, the 3-family minimum is a wide plateau (t1 4..6 / t2 32..48 all ≥ −0.19%) | bc4 1.1244 → 1.1279, bc5 1.0756 → 1.0772, bc3 2.7149 → 2.7307 (suite averages); stream −0.235% overall | **kept — this is the new baseline for bc4/bc5/bc3** (the 74-image bc1 suite is untouched; the README's "obvious tuning lever" exercised) |
+| 22 | 8 x 8 tiles: the 64 streams become an even 8 x 8 tile of the block grid (bounds from one shared helper, `gx` 8/4/2/1 by width, `gy = 64/gx`); same walk inside a tile; the even split keeps the trailing rows of non-tile-multiple images (a breaking stream-format change) | round-trips (CPU + GPU); 62/74 BC1 images improve, worst −2.9% (horizontal-grain wood), best +9%; CPU + GPU decompression inside noise | bc1 1.4676 → 1.4905 (+1.6%); bc4 1.1342 → 1.1351, bc5 1.0995 → 1.0985 (neutral); bc3 2.8199 → 2.8787 (+2.1%) | **kept — this is the new baseline** (tiles replace full-width strips; no header byte / API change, stream layout is versioned by the compressor) |
 
 ---
 
@@ -959,6 +960,101 @@ decision (a disabled strip's six deltas are six symbols of ≥ 1 bit each).
 *cost-aware match* — emit the reference only when `1 + ref_bits < ` the six deltas' actual bit cost,
 otherwise emit the six deltas; it would trim the few remaining cases where a match is more expensive
 than the deltas inside an enabled strip.
+
+---
+
+## 22. 8 x 8 tiles (BC1, BC4, BC5; BC3 inherits)
+
+**Idea:** the 64 decompression streams were full-width strips (each spanned the whole image width).
+Rearrange the block grid into an even 8 x 8 tile layout instead: stream `s` becomes tile
+`(tx, ty) = (s % gx, s / gx)` with bounds from a single helper shared by every block walk,
+
+```text
+x0 = tx * width_blocks / gx    x1 = (tx + 1) * width_blocks / gx
+y0 = ty * height_blocks / gy   y1 = (ty + 1) * height_blocks / gy
+```
+
+`gx` is 8 / 4 / 2 / 1 for `width_blocks` of 32+ / 16+ / 8+ / less and `gy = 64 / gx` (both derived from the
+width alone, so the stream header, `num_strips` = 64, and the C API are unchanged). The tile-local walk is
+the same zigzag rows / `position` / row-above predictor / seed as the strip walk, just confined to the tile.
+The even split also covers images whose block count is **not** a multiple of the tile size: the old
+full-width truncation silently dropped the trailing block rows of such images, the even split keeps them.
+
+**Result (74-image BC1 suite, all tests pass incl. the CPU + GPU round-trip):**
+- BC1 average ratio **1.4676 → 1.4905 (+1.6%)**, matching the offline study's 8 x 8 estimate (1.4910).
+- BC4 **1.1342 → 1.1351** and BC5 **1.0995 → 1.0985** — neutral: the 1024² maps already had 4+ block rows per
+  strip, so the grid shape alone barely moves them. Their real gain comes from exp. 23.
+- BC3 **2.8199 → 2.8787 (+2.1%)**: the color half is BC1 (which gains), the alpha half is BC4 (neutral), so BC3
+  inherits the BC1 win through the color half.
+- CPU decompression (ground.png bench) inside run-to-run noise; the GPU kernel keeps the same 64-thread dispatch
+  and only the per-tile bounds change, so GPU throughput is unchanged.
+
+**Kept — this is the new baseline.** This is a **breaking stream-format change**: the same header now implies a
+tile layout rather than a full-width strip layout, so a stream written by an older (strip) compressor will not
+decode with this one (and vice versa). No API / header-byte change. Regression tests: `tile_uniform_colors`
+(per-tile seeding + state reset), `tile_column_predictor` (row-above predictor inside a tile), `odd_dimensions`
+(36 x 70 blocks — the dropped-trailing-rows fix). The layout-dependent tests `strip_uniform_colors` /
+`row_varying_colors` / `periodic_color_pairs` now exercise per-tile variants of their patterns and still pass
+unmodified.
+
+---
+
+## 23. Cross-block index context for BC4 / BC5 (the 8 x 8 [left][top] neighbor mapping)
+
+**Idea (exp 22 follow-up):** the BC4 / BC5 index models are a set of 64 static 8-symbol
+Rice models, one per entry of the 8 x 8 [left][top] context matrix (the 3-bit indices of the
+two decoded neighbor pixels of the texel). For the 8 texels on a block's top / left edge those
+neighbors live in *other* blocks (the block above, and the chain-previous block for column 0),
+whose 3-bit indices the matrix never sees — only the decoded 8-bit texel *values* are available.
+Map each edge texel's neighbor value to the nearest entry of the current block's BC4 palette
+(the 8-value / 6-value mode expansion of the two endpoints, the standard D3D rule) and use that
+pseudo-index as the context, so all 16 texels of every block price the 8 x 8 models instead of
+8 of the 16 falling into the degenerate 0-neighbor context. BC3 inherits the change through
+its BC4 alpha half. No header byte, no API change; encoder, CPU decoder, and Metal kernel must
+agree on the mapping.
+
+**Method:** one shared helper computes the 8 edge pseudo-indices per block / channel: the 4 top
+texels take their neighbor from the block above (row 3 of the block, raster indices 12..15),
+the 4 left texels from the chain-previous block (the zigzag predecessor, the edge column facing
+this block: column 3 on even rows, column 0 on odd rows — the zigzag is continuous across the
+row boundary, and both the encoder and the decoder use the chain-previous because it is the only
+same-row block both have seen, which keeps the per-tile-parallel decode dependency-free). The
+palette expansion is the exact hardware formula (613566757 = (2^32+3)/7 makes the multiply-shift
+exact for every palette value); the neighbor-to-index map is an 8-way argmin over the palette,
+ties to the lower index. All three index passes (histogram, compress, decompress) code the full
+16 indices under the 8 x 8 models with the 8 edge texels using the mapped pseudo-indices.
+
+**Result (red_brick 1024x1024, 4-image bc4/bc5 suites, M2 Max CPU, 3-run means, GPU round-trip
+byte-identical to CPU):**
+
+| metric | baseline (exp 22) | v1 full mapping | v2 division-free mapping |
+|---|---|---|---|
+| BC4 avg ratio | 1.1351 | 1.1440 (**+0.8%**) | 1.1440 (identical streams) |
+| BC5 avg ratio | 1.0985 | 1.0963 (**−0.2%**) | 1.0963 (identical streams) |
+| BC4 CPU decompression | 484 MiB/s | 293 MiB/s (**−40%**) | 317 MiB/s (**−35%**) |
+| BC5 CPU decompression | 557 MiB/s | 285 MiB/s (**−49%**) | 310 MiB/s (**−44%**) |
+
+**Why it lost:** the gain axis does not clear the bar and the cost axis fails it decisively:
+- **Ratio:** BC4 +0.8% is a marginal win, but BC5 *loses* 0.2% (the red channel of a normal map
+  is near-uniform-random 3-bit indices; the 6-value / degenerate palettes of flat regions map the
+  neighbor values into a few entries, and the 8 x 8 models — now 100% contextual — get a flatter
+  distribution with the same 64 model headers). Averaged over the two formats, the size is a wash.
+- **Speed:** the plan's gate allows BC4 −10% and BC5 −5%; the measured −35…−44% (v2) is 3.5-8.8x
+  over. The per-block cost is 2 neighbor index unpacks + 3 palette expansions + 8 neighbor
+  mappings per channel block, on top of a decode loop of 16 serial model decodes per block —
+  there is no headroom. The division-free mapping (v2, byte-identical streams: the nearest-search
+  argmin is invariant to the division→multiply-shift reformulation) recovers only the divisions
+  (v1→v2: BC4 293→317 MiB/s). The plan's prescribed fully-arithmetic mapping (v3: one reciprocal
+  per block, one multiply + shift per texel, no 8-way search) was not implemented — it cannot
+  clear the gate: its per-block *fixed* cost (the neighbor reads and the 3 palette builds) is
+  identical to v2's, so it can recover at most the search cost, a smaller slice than the divisions
+  v2 already removed, landing well short of the 435 MiB/s (BC4) the gate requires.
+
+**Kept:** the mapping is now proven not worth its decode cost on this suite — do not re-litigate
+the full 16-texel contextualization. If a variant is ever revisited, the cost must move to a
+per-row or per-tile granularity (e.g. only the 4 left-edge texels, which need no read of the
+block above) or the neighbor map must collapse to a 2-bit quantile instead of an 8-way search;
+both are unmeasured, and the BC5 negative above is the stronger argument against the lever.
 
 ---
 

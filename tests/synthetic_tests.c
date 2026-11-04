@@ -488,6 +488,87 @@ TEST periodic_color_pairs(void)
 }
 
 //-----------------------------------------------------------------------------------------------------------------------------
+// tile grid of the 64-tile layout: the same width-based choice the compressor makes
+// (8 for wide images, shrinking to 1 for the narrowest), 64 / gx rows per the even split
+static uint32_t tile_columns(uint32_t width_blocks)
+{
+    if (width_blocks >= 32) return 8;
+    if (width_blocks >= 16) return 4;
+    if (width_blocks >= 8)  return 2;
+    return 1;
+}
+
+//-----------------------------------------------------------------------------------------------------------------------------
+// Each tile is one constant color pair and one index word, random per tile, so every tile
+// starts from a different color and every tile differs from every other tile. stress
+// round-trip for tile boundary handling: a decoder that leaked or re-seeded state
+// incorrectly between tiles would corrupt the colors (the tile version of strip_uniform_colors)
+TEST tile_uniform_colors(void)
+{
+    const uint32_t width = TEST_IMAGE_WIDTH;
+    const uint32_t height = TEST_IMAGE_HEIGHT;
+    const uint32_t width_blocks = width / 4;
+    const uint32_t height_blocks = height / 4;
+
+    const uint32_t gx = tile_columns(width_blocks);
+    const uint32_t gy = BCP_NUM_STRIPS / gx;
+
+    ASSERT(height_blocks % gy == 0); // even split: every tile the same size
+
+    bc1_block image[TEST_IMAGE_SIZE];
+
+    uint32_t rng_state = 0x5EED7A21u;
+    for (uint32_t strip = 0; strip < BCP_NUM_STRIPS; ++strip)
+    {
+        const uint32_t tx = strip % gx;
+        const uint32_t ty = strip / gx;
+
+        const uint32_t x0 = (tx * width_blocks) / gx;
+        const uint32_t x1 = ((tx + 1) * width_blocks) / gx;
+        const uint32_t y0 = (ty * height_blocks) / gy;
+        const uint32_t y1 = ((ty + 1) * height_blocks) / gy;
+
+        const uint16_t c0 = (uint16_t)splitmix32(&rng_state);
+        const uint16_t c1 = (uint16_t)splitmix32(&rng_state);
+        const uint32_t indices = splitmix32(&rng_state);
+
+        for (uint32_t y = y0; y < y1; ++y)
+            for (uint32_t x = x0; x < x1; ++x)
+                image[y * width_blocks + x] = (bc1_block) { .color = { c0, c1 }, .indices = indices };
+    }
+
+    return roundtrip(image, width, height);
+}
+
+//-----------------------------------------------------------------------------------------------------------------------------
+// a 36 x 70 block image: neither block count is a multiple of the 8 x 8 tile size, so the
+// even split must cover every row and column (the old full-width strip truncation silently
+// dropped the trailing rows of images whose height was not a multiple of 64 blocks)
+TEST odd_dimensions(void)
+{
+    const uint32_t width = 4 * 36;    // 144 px = 36 blocks
+    const uint32_t height = 4 * 70;   // 280 px = 70 blocks
+    const uint32_t width_blocks = 36;
+    const uint32_t height_blocks = 70;
+
+    const uint32_t num_blocks = width_blocks * height_blocks;
+
+    bc1_block image[36 * 70]; // literal size: a const-folded VLA trips -Wgnu-folding-constant
+
+    uint32_t rng_state = 0x0D515B0Cu;
+    for (uint32_t i = 0; i < num_blocks; ++i)
+    {
+        image[i] = (bc1_block)
+        {
+            .color = { (uint16_t)splitmix32(&rng_state), (uint16_t)splitmix32(&rng_state) },
+            .indices = splitmix32(&rng_state)
+        };
+    }
+
+    return roundtrip(image, width, height);
+}
+
+//-----------------------------------------------------------------------------------------------------------------------------
 // BC4 / BC5 synthetic roundtrips, 256 x 256 = 4 x 64 blocks (the minimum supported image)
 #define TEST_BC45_WIDTH (256)
 #define TEST_BC45_HEIGHT (256)
@@ -645,6 +726,58 @@ TEST bc45_gradient(void)
     }
 
     return bc45_both(image, image16, TEST_BC45_WIDTH, TEST_BC45_HEIGHT);
+}
+
+//-----------------------------------------------------------------------------------------------------------------------------
+// each block column is constant down the column: the top neighbor always matches the
+// current texel and the left neighbor always differs, so the column-0 top context and
+// the in-row left context must both stay consistent encoder and decoder across the
+// 8 x 8 tile layout (256 x 256 = 64 x 64 blocks = 8 x 8 tiles of 8 x 8 blocks)
+TEST tile_column_predictor(void)
+{
+    const uint32_t width = TEST_BC45_WIDTH;
+    const uint32_t height = TEST_BC45_HEIGHT;
+    const uint32_t width_blocks = width / 4;
+
+    bc1_block image1[TEST_BC45_BLOCKS];
+    bc4_block image[TEST_BC45_BLOCKS];
+    bc4_block image16[TEST_BC45_BLOCKS * 2];
+
+    for(uint32_t i = 0; i < TEST_BC45_BLOCKS; ++i)
+    {
+        const uint32_t bx = i % width_blocks;
+
+        image1[i] = (bc1_block)
+        {
+            .color = { pack_565((uint8_t)(bx & 0x1F), (uint8_t)((bx << 1) & 0x3F), (uint8_t)(bx & 0x1F)), 0 },
+            .indices = 0
+        };
+    }
+
+    greatest_test_res res = roundtrip(image1, width, height);
+    if (res != GREATEST_TEST_RES_PASS)
+        return res;
+
+    for(uint32_t i = 0; i < TEST_BC45_BLOCKS; ++i)
+    {
+        const uint32_t bx = i % width_blocks;
+
+        image[i].endpoint[0] = (uint8_t)(bx & 0xFF);
+        image[i].endpoint[1] = (uint8_t)((bx >> 4) & 0xFF);
+        for(uint32_t j = 0; j < 6; ++j)
+            image[i].indices[j] = (uint8_t)((bx * 5 + j * 3) & 0xFF);
+
+        memcpy(&image16[2 * i], &image[i], sizeof(bc4_block)); // red channel
+        image16[2 * i + 1].endpoint[0] = (uint8_t)(image[i].endpoint[0] ^ 0x5A);
+        image16[2 * i + 1].endpoint[1] = (uint8_t)(image[i].endpoint[1] ^ 0x5A);
+        for(uint32_t j = 0; j < 6; ++j)
+            image16[2 * i + 1].indices[j] = (uint8_t)(image[i].indices[j] ^ 0x38);
+    }
+
+    res = bc45_both(image, image16, width, height);
+    if (res != GREATEST_TEST_RES_PASS)
+        return res;
+    PASS();
 }
 
 //-----------------------------------------------------------------------------------------------------------------------------
@@ -858,6 +991,9 @@ SUITE(suite_synthetic)
     (void)color_context;
     (void)color_dict_repeat;
     (void)periodic_color_pairs;
+    (void)tile_uniform_colors;
+    (void)tile_column_predictor;
+    (void)odd_dimensions;
 
     RUN_TEST(flat);
     RUN_TEST(checkerboard);
@@ -881,4 +1017,7 @@ SUITE(suite_synthetic)
     RUN_TEST(color_context);
     RUN_TEST(color_dict_repeat);
     RUN_TEST(periodic_color_pairs);
+    RUN_TEST(tile_uniform_colors);
+    RUN_TEST(tile_column_predictor);
+    RUN_TEST(odd_dimensions);
 }
