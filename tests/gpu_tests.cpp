@@ -188,8 +188,6 @@ static bool metal_state_init(metal_state* state, const char* kernel_name)
         function_name->release();
     if (function == nullptr)
         fprintf(stderr, "==> function %s not found in %s\n", kernel_name, SHADER_FILE);
-    if (function != nullptr)
-        function->release();
 
     if (state->library != nullptr && function != nullptr)
     {
@@ -198,6 +196,11 @@ static bool metal_state_init(metal_state* state, const char* kernel_name)
         if (state->pipeline == nullptr)
             print_metal_error("compute pipeline creation", error);
     }
+    // the pipeline retains its own reference to the function, so it can be released only after
+    // newComputePipelineState above; releasing it earlier was a use-after-free that the Metal
+    // debug layer caught (segfault) and, without it, intermittently produced a corrupt pipeline
+    if (function != nullptr)
+        function->release();
 
     if (state->pipeline == nullptr)
     {
@@ -329,23 +332,35 @@ static greatest_test_res metal_gpu_decompression(const char* image_file, const c
     metal_state state = { nullptr, nullptr, nullptr, nullptr, nullptr, nullptr };
     ASSERT(metal_state_init(&state, kernel_name));
 
-    // allocate the output buffer for all runs
-    const size_t total_output_size = image_size * (size_t)GPU_DECODE_RUNS;
+    // Cap the number of tiled runs so the two shared (RAM-backed) buffers stay within a fixed
+    // memory budget. At 1000 runs the 1024 x 1024 images allocate ~2 GiB resident; on a
+    // memory-constrained machine the OS aborts the command buffer with
+    // kIOGPUCommandBufferCallbackErrorImpactingInteractivity, intermittently failing the test.
+    // The distinct-region dispatch and the throughput measurement are unchanged: throughput is
+    // total bytes / GPU time, independent of the run count, and the DRAM-bandwidth property is
+    // preserved since each run still reads and writes a distinct region.
+    const size_t GPU_BUFFER_BUDGET = 512ull * 1024 * 1024;
+    const size_t per_run_size = image_size + compressed_length;
+    const uint32_t run_count = (uint32_t)((size_t)GPU_DECODE_RUNS < GPU_BUFFER_BUDGET / per_run_size
+                                           ? (size_t)GPU_DECODE_RUNS
+                                           : (size_t)(GPU_BUFFER_BUDGET / per_run_size));
+    const size_t total_output_size = image_size * (size_t)run_count;
     MTL::Buffer* output_buffer = state.device->newBuffer((NS::UInteger)total_output_size, MTL::ResourceStorageModeShared);
     ASSERT(output_buffer != nullptr);
     ASSERT(output_buffer->length() == (NS::UInteger)total_output_size);
 
-    // upload the compressed stream tiled GPU_DECODE_RUNS times so each run reads a distinct region
-    const size_t total_input_size = compressed_length * (size_t)GPU_DECODE_RUNS;
+    // upload the compressed stream tiled run_count times so each run reads a distinct region
+    const size_t total_input_size = compressed_length * (size_t)run_count;
     MTL::Buffer* stream_buffer = state.device->newBuffer((NS::UInteger)total_input_size, MTL::ResourceStorageModeShared);
     ASSERT(stream_buffer != nullptr);
     ASSERT(stream_buffer->length() == (NS::UInteger)total_input_size);
+    // a Shared buffer is CPU/GPU coherent, so the memcpy is visible to the GPU as-is;
+    // didModifyRange applies only to Managed buffers and is rejected by the validation layer
     uint8_t* stream_contents = (uint8_t*)stream_buffer->contents();
-    for (int run = 0; run < GPU_DECODE_RUNS; ++run)
+    for (uint32_t run = 0; run < run_count; ++run)
         memcpy(stream_contents + run * compressed_length, compressed, compressed_length);
-    stream_buffer->didModifyRange(NS::Range(0, (NS::UInteger)total_input_size));
 
-    // dispatch: 64 threads (one per strip) x GPU_DECODE_RUNS runs in the Y dimension.
+    // dispatch: 64 threads (one per strip) x run_count runs in the Y dimension.
     // each Y row offsets both input and output by run_id, so every run reads from and
     // writes to a distinct memory region, exercising DRAM bandwidth
     MTL::CommandBuffer* command_buffer = state.queue->commandBuffer();
@@ -359,7 +374,7 @@ static greatest_test_res metal_gpu_decompression(const char* image_file, const c
     encoder->setBytes(&args, sizeof(args), 2);
     encoder->setBuffer(stream_buffer, 0, 0);
     encoder->setBuffer(output_buffer, 0, 1);
-    encoder->dispatchThreads(MTL::Size(num_strips, GPU_DECODE_RUNS, 1), MTL::Size(1, 1, 1));
+    encoder->dispatchThreads(MTL::Size(num_strips, run_count, 1), MTL::Size(1, 1, 1));
     encoder->endEncoding();
 
     command_buffer->commit();
@@ -378,10 +393,10 @@ static greatest_test_res metal_gpu_decompression(const char* image_file, const c
     for (size_t i = 0; i < image_size; ++i)
         ASSERT_EQ(decoded[i], original[i]);
 
-    const double total_mib = (double)(image_size * (size_t)GPU_DECODE_RUNS) / (1024.0 * 1024.0);
+    const double total_mib = (double)(image_size * (size_t)run_count) / (1024.0 * 1024.0);
     const double gpu_mib_per_s = (gpu_ms > 0.0) ? total_mib / (gpu_ms / 1000.0) : 0.0;
 
-    fprintf(stdout, "==> GPU : %d decompress runs in %.3f ms, %.1f MiB/s\n", GPU_DECODE_RUNS, gpu_ms, gpu_mib_per_s);
+    fprintf(stdout, "==> GPU : %u decompress runs in %.3f ms, %.1f MiB/s\n", run_count, gpu_ms, gpu_mib_per_s);
 
     // release everything
     command_buffer->release();
