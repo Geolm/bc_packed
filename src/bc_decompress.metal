@@ -73,6 +73,36 @@ typedef struct
     uint16_t num_symbols;
 } model8_t;
 
+// tile columns of the 64-tile grid: 8 for wide images, shrinking so the tiles stay at least
+// 4 blocks wide, 1 for the narrowest supported image (the 16 px minimum)
+uint tile_grid_x(uint width_blocks)
+{
+    if (width_blocks >= 32) return 8;
+    if (width_blocks >= 16) return 4;
+    if (width_blocks >= 8)  return 2;
+    return 1;
+}
+
+// block bounds of tile [strip_index] of the 64-tile grid, x1 / y1 one past. the even split of
+// the block grid covers the image exactly, so images whose block count is not a multiple of
+// the tile size lose no rows or columns (the old strip truncation dropped the trailing rows)
+typedef struct tile_bounds
+{
+    uint x0, x1;
+    uint y0, y1;
+} tile_bounds;
+
+tile_bounds tile_bounds_get(uint strip_index, uint width_blocks, uint height_blocks)
+{
+    uint gx = tile_grid_x(width_blocks);
+    uint gy = NUM_STRIPS / gx;
+    uint tx = strip_index % gx;
+    uint ty = strip_index / gx;
+
+    return tile_bounds { .x0 = (tx * width_blocks) / gx, .x1 = ((tx + 1) * width_blocks) / gx,
+                           .y0 = (ty * height_blocks) / gy, .y1 = ((ty + 1) * height_blocks) / gy };
+}
+
 // mirror of le_stream: a 64-bit reservoir buffers bits to keep I/O at byte granularity,
 // least significant bit read first
 typedef struct
@@ -318,7 +348,6 @@ kernel void bcp_decompress_bc1(const device uint8_t* input [[buffer(0)]],
     const uint strip_id = grid_pos.x;
     const uint height_blocks = args.height / 4;
     const uint width_blocks = args.width / 4;
-    const uint strip_width = height_blocks / NUM_STRIPS;
     const uint64_t length = args.input_length;
 
     // offset both input and output by run_id so each run reads from and writes to
@@ -427,7 +456,8 @@ kernel void bcp_decompress_bc1(const device uint8_t* input [[buffer(0)]],
     uint16_t previous_color1 = (uint16_t)(strip_seed >> 16);
     const bool use_top = ((strip_predictor >> strip_id) & 1) != 0;
     const bool dict_enabled = ((strip_dict_enable >> strip_id) & 1) != 0;
-    const uint start_y = strip_id * strip_width;
+    const tile_bounds tb = tile_bounds_get(strip_id, width_blocks, height_blocks);
+    const uint tile_width = tb.x1 - tb.x0;
 
     // the output is read back for the top prediction: the two endpoint colors of a block are packed in one u32
     const device uint32_t* output_colors32 = (const device uint32_t*)output; // already offset by run_id
@@ -438,13 +468,13 @@ kernel void bcp_decompress_bc1(const device uint8_t* input [[buffer(0)]],
     for (uint i = 0; i < 256; ++i)
         dict[i] = 0;
 
-    for (uint y = start_y; y < start_y + strip_width; ++y)
+    for (uint y = tb.y0; y < tb.y1; ++y)
     {
-        for (uint x = 0; x < width_blocks; ++x)
+        for (uint x = 0; x < tile_width; ++x)
         {
-            uint zigzag_x = (y & 1) ? x : width_blocks - x - 1;
+            uint zigzag_x = tb.x0 + ((y & 1) ? x : tile_width - x - 1);
             uint block_index = y * width_blocks + zigzag_x;
-            uint position = (y - start_y) * width_blocks + x;
+            uint position = (y - tb.y0) * tile_width + x;
 
             uint16_t current_color0 = 0;
             uint16_t current_color1 = 0;
@@ -462,12 +492,12 @@ kernel void bcp_decompress_bc1(const device uint8_t* input [[buffer(0)]],
             }
             else
             {
-                // first scanline of a strip is always predicted from the seed via the zigzag-previous chain,
-                // after that a top-flagged strip is predicted from the row above, same zigzag position
+                // first scanline of a tile is always predicted from the seed via the zigzag-previous chain,
+                // after that a top-flagged tile is predicted from the row above, same zigzag position
                 uint16_t reference_color0 = previous_color0;
                 uint16_t reference_color1 = previous_color1;
 
-                if (use_top && y > start_y)
+                if (use_top && y > tb.y0)
                 {
                     uint32_t previous_colors = output_colors32[((uint64_t)(y - 1) * width_blocks + zigzag_x) * 2];
                     reference_color0 = (uint16_t)previous_colors;
@@ -573,7 +603,6 @@ void bc45_decode_strip(const device uint8_t* input,
     const uint strip_id = grid_pos.x;
     const uint height_blocks = args.height / 4;
     const uint width_blocks = args.width / 4;
-    const uint strip_width = height_blocks / NUM_STRIPS;
     const uint64_t length = args.input_length;
 
     // offset both input and output by run_id so each run reads from and writes to
@@ -652,18 +681,19 @@ void bc45_decode_strip(const device uint8_t* input,
         }
     }
 
-    const uint start_y = strip_id * strip_width;
+    const tile_bounds tb = tile_bounds_get(strip_id, width_blocks, height_blocks);
+    const uint tile_width = tb.x1 - tb.x0;
 
     // the output is read back for the top prediction: the two endpoints of a channel block
     // sit in the low bytes of one u32 (the block is 8-aligned)
 
-    for (uint y = start_y; y < start_y + strip_width; ++y)
+    for (uint y = tb.y0; y < tb.y1; ++y)
     {
-        for (uint x = 0; x < width_blocks; ++x)
+        for (uint x = 0; x < tile_width; ++x)
         {
             // zig-zag pattern, same chain as BC1
-            uint zigzag_x = (y & 1) ? x : width_blocks - x - 1;
-            const bool first_row = (y == start_y);
+            uint zigzag_x = tb.x0 + ((y & 1) ? x : tile_width - x - 1);
+            const bool first_row = (y == tb.y0);
             const bool row_start = (x == 0);
             const uint64_t block_index = (uint64_t)y * width_blocks + zigzag_x;
 

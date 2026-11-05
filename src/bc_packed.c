@@ -1142,7 +1142,40 @@ static inline void init_color_models(bcp_context* ctx, const color_hists* hist)
 }
 
 //-----------------------------------------------------------------------------------------------------------------------------
-void init_static_models(bcp_context* ctx, const void* input, uint32_t width_blocks, uint32_t strip_width, uint32_t num_strips, uint32_t block_stride)
+// tile columns of the 64-tile grid: 8 for wide images, shrinking so the tiles stay at least
+// 4 blocks wide, 1 for the narrowest supported image (the 16 px minimum)
+static inline uint32_t tile_grid_x(uint32_t width_blocks)
+{
+    if (width_blocks >= 32) return 8;
+    if (width_blocks >= 16) return 4;
+    if (width_blocks >= 8)  return 2;
+    return 1;
+}
+
+//-----------------------------------------------------------------------------------------------------------------------------
+// block bounds of tile [strip_index] of the 64-tile grid, x1 / y1 one past. the even split of
+// the block grid covers the image exactly, so images whose block count is not a multiple of
+// the tile size lose no rows or columns (the old strip truncation dropped the trailing rows)
+typedef struct tile_bounds
+{
+    uint32_t x0, x1;
+    uint32_t y0, y1;
+} tile_bounds;
+
+//-----------------------------------------------------------------------------------------------------------------------------
+static inline tile_bounds tile_bounds_get(uint32_t strip_index, uint32_t width_blocks, uint32_t height_blocks, uint32_t num_strips)
+{
+    uint32_t gx = tile_grid_x(width_blocks);
+    uint32_t gy = num_strips / gx;
+    uint32_t tx = strip_index % gx;
+    uint32_t ty = strip_index / gx;
+
+    return (tile_bounds) { .x0 = (tx * width_blocks) / gx, .x1 = ((tx + 1) * width_blocks) / gx,
+                           .y0 = (ty * height_blocks) / gy, .y1 = ((ty + 1) * height_blocks) / gy };
+}
+
+//-----------------------------------------------------------------------------------------------------------------------------
+void init_static_models(bcp_context* ctx, const void* input, uint32_t width_blocks, uint32_t height_blocks, uint32_t num_strips, uint32_t block_stride)
 {
     color_hists hist;
     uint32_t hist_reference[TOP_TABLE_SIZE];
@@ -1154,15 +1187,15 @@ void init_static_models(bcp_context* ctx, const void* input, uint32_t width_bloc
     memset(hist_mask, 0, sizeof(hist_mask));
     memset(hist_difference, 0, sizeof(hist_difference));
 
-    // pre-pass: the average of the first block of each strip becomes the seed "previous" block used to start every strip
+    // pre-pass: the average of the first block of each tile becomes the seed "previous" block used to start every tile
     uint32_t sums[6] = { 0, 0, 0, 0, 0, 0 }; // r, g, b of color[0] and color[1]
 
     for(uint32_t strip_index=0; strip_index<num_strips; ++strip_index)
     {
-        uint32_t start_y = strip_index * strip_width;
-        uint32_t zigzag_x = (start_y & 1) ? 0 : width_blocks - 1;
+        tile_bounds tb = tile_bounds_get(strip_index, width_blocks, height_blocks, num_strips);
+        uint32_t zigzag_x = (tb.y0 & 1) ? tb.x0 : tb.x1 - 1;
 
-        const bc1_block* first = (const bc1_block*) input + ((start_y * width_blocks) + zigzag_x) * block_stride;
+        const bc1_block* first = (const bc1_block*) input + ((tb.y0 * width_blocks) + zigzag_x) * block_stride;
 
         for(uint32_t j=0; j<2; ++j)
         {
@@ -1179,7 +1212,7 @@ void init_static_models(bcp_context* ctx, const void* input, uint32_t width_bloc
     uint16_t average1 = bc1_pack_565((uint8_t)(sums[3] / num_strips), (uint8_t)(sums[4] / num_strips), (uint8_t)(sums[5] / num_strips));
     ctx->strip_seed = ((uint32_t)average1 << 16) | (uint32_t)average0;
 
-    // pre-pass: per strip, pick the cheaper color predictor, zigzag-previous vs the row above (same zigzag
+    // pre-pass: per tile, pick the cheaper color predictor, zigzag-previous vs the row above (same zigzag
     // position) after the first scanline, by the total absolute magnitude of the color deltas each would emit
     ctx->strip_predictor = 0;
     for(uint32_t strip_index=0; strip_index<num_strips; ++strip_index)
@@ -1190,16 +1223,18 @@ void init_static_models(bcp_context* ctx, const void* input, uint32_t width_bloc
         bc1_block previous;
         unpack_strip_seed(ctx->strip_seed, &previous);
 
-        uint32_t start_y = strip_index * strip_width;
-        for(uint32_t y = start_y; y < start_y + strip_width; ++y)
+        tile_bounds tb = tile_bounds_get(strip_index, width_blocks, height_blocks, num_strips);
+        uint32_t tile_width = tb.x1 - tb.x0;
+
+        for(uint32_t y = tb.y0; y < tb.y1; ++y)
         {
-            for(uint32_t x = 0; x < width_blocks; ++x)
+            for(uint32_t x = 0; x < tile_width; ++x)
             {
-                uint32_t zigzag_x = (y&1) ? x : width_blocks - x - 1;
+                uint32_t zigzag_x = tb.x0 + ((y & 1) ? x : tile_width - x - 1);
                 const bc1_block* current = (const bc1_block*) input + ((y * width_blocks) + zigzag_x) * block_stride;
 
                 const bc1_block* top = &previous;
-                if (y > start_y)
+                if (y > tb.y0)
                     top = (const bc1_block*) input + ((y - 1) * width_blocks + zigzag_x) * block_stride; // same zigzag position, row above
 
                 energy_previous += color_delta_energy(current, &previous);
@@ -1222,21 +1257,22 @@ void init_static_models(bcp_context* ctx, const void* input, uint32_t width_bloc
         bc1_block previous;
         unpack_strip_seed(ctx->strip_seed, &previous);
         const bool use_top = ((ctx->strip_predictor >> strip_index) & 1) != 0;
-        uint32_t start_y = strip_index * strip_width;
+        tile_bounds tb = tile_bounds_get(strip_index, width_blocks, height_blocks, num_strips);
+        uint32_t tile_width = tb.x1 - tb.x0;
 
-        for(uint32_t y = start_y; y < start_y + strip_width; ++y)
+        for(uint32_t y = tb.y0; y < tb.y1; ++y)
         {
-            for(uint32_t x = 0; x < width_blocks; ++x)
+            for(uint32_t x = 0; x < tile_width; ++x)
             {
                 // zig-zag pattern delta compression for colors
-                uint32_t zigzag_x = (y&1) ? x : width_blocks - x - 1;
+                uint32_t zigzag_x = tb.x0 + ((y & 1) ? x : tile_width - x - 1);
 
                 const bc1_block* current = (const bc1_block*) input + ((y * width_blocks) + zigzag_x) * block_stride;
 
-                // first scanline of a strip is always predicted from the seed via the zigzag-previous
-                // chain, after that a top-flagged strip is predicted from the row above, same zigzag position
+                // first scanline of a tile is always predicted from the seed via the zigzag-previous
+                // chain, after that a top-flagged tile is predicted from the row above, same zigzag position
                 const bc1_block* color_reference = &previous;
-                if (use_top && y > start_y)
+                if (use_top && y > tb.y0)
                     color_reference = (const bc1_block*) input + ((y - 1) * width_blocks + zigzag_x) * block_stride;
 
                 color_hists_add(&hist, current, color_reference);
@@ -1278,23 +1314,24 @@ void init_static_models(bcp_context* ctx, const void* input, uint32_t width_bloc
         memset(&dict, 0, sizeof(dict));
         memset(&matched, 0, sizeof(matched));
         const bool use_top = ((ctx->strip_predictor >> strip_index) & 1) != 0;
-        uint32_t start_y = strip_index * strip_width;
+        tile_bounds tb = tile_bounds_get(strip_index, width_blocks, height_blocks, num_strips);
+        uint32_t tile_width = tb.x1 - tb.x0;
 
         int64_t savings = 0;
         uint32_t num_blocks = 0;
 
-        for(uint32_t y = start_y; y < start_y + strip_width; ++y)
+        for(uint32_t y = tb.y0; y < tb.y1; ++y)
         {
-            for(uint32_t x = 0; x < width_blocks; ++x)
+            for(uint32_t x = 0; x < tile_width; ++x)
             {
                 // zig-zag pattern delta compression for colors
-                uint32_t zigzag_x = (y&1) ? x : width_blocks - x - 1;
+                uint32_t zigzag_x = tb.x0 + ((y & 1) ? x : tile_width - x - 1);
 
                 const bc1_block* current = (const bc1_block*) input + ((y * width_blocks) + zigzag_x) * block_stride;
-                uint32_t position = (y - start_y) * width_blocks + x;
+                uint32_t position = (y - tb.y0) * tile_width + x;
 
                 const bc1_block* color_reference = &previous;
-                if (use_top && y > start_y)
+                if (use_top && y > tb.y0)
                     color_reference = (const bc1_block*) input + ((y - 1) * width_blocks + zigzag_x) * block_stride;
 
                 if (color_dict_match(&dict, position, color_pair(current)) > 0)
@@ -1468,24 +1505,24 @@ typedef struct bc4_hists
 } bc4_hists;
 
 //-----------------------------------------------------------------------------------------------------------------------------
-// Fits the bc4/bc5 static models from [input]: the per-channel strip seed is the average of the
-// first block of each strip in chain order (as BC1), then one histogram pass with the exact
-// strip predictors of the encoder. there is no per-strip mode decision, so a single fit is final
-static void bc4_init_models(bcp_context* ctx, const void* image, uint32_t width_blocks, uint32_t strip_width, uint32_t num_strips, uint32_t num_channels, uint32_t block_stride)
+// Fits the bc4/bc5 static models from [input]: the per-channel tile seed is the average of the
+// first block of each tile in chain order (as BC1), then one histogram pass with the exact
+// tile predictors of the encoder. there is no per-tile mode decision, so a single fit is final
+static void bc4_init_models(bcp_context* ctx, const void* image, uint32_t width_blocks, uint32_t height_blocks, uint32_t num_strips, uint32_t num_channels, uint32_t block_stride)
 {
     bc4_hists hist[BCP_MAX_CHANNELS] = { 0 };
     uint32_t sums[BCP_MAX_CHANNELS][2] = { 0 };
     uint8_t prev_e[BCP_MAX_CHANNELS][2], top_e[BCP_MAX_CHANNELS][2], top_prev_e[BCP_MAX_CHANNELS][2];
 
-    // pass 1: strip seeds, the average of the first block of each strip in chain order
+    // pass 1: tile seeds, the average of the first block of each tile in chain order
     for(uint32_t strip_index=0; strip_index<num_strips; ++strip_index)
     {
-        uint32_t start_y = strip_index * strip_width;
-        uint32_t x0 = (start_y & 1) ? 0 : width_blocks - 1;
+        tile_bounds tb = tile_bounds_get(strip_index, width_blocks, height_blocks, num_strips);
+        uint32_t x0 = (tb.y0 & 1) ? tb.x0 : tb.x1 - 1;
 
         for(uint32_t c=0; c<num_channels; ++c)
         {
-            const bc4_block* b = (const bc4_block*)image + (start_y * width_blocks + x0) * block_stride + c;
+            const bc4_block* b = (const bc4_block*)image + ((tb.y0 * width_blocks) + x0) * block_stride + c;
 
             sums[c][0] += b->endpoint[0];
             sums[c][1] += b->endpoint[1];
@@ -1498,7 +1535,7 @@ static void bc4_init_models(bcp_context* ctx, const void* image, uint32_t width_
             ctx->bc4_strip_seed[c][e] = (uint8_t)(sums[c][e] / num_strips);
     }
 
-    // pass 2: histograms with the exact strip predictors of the encoder
+    // pass 2: histograms with the exact tile predictors of the encoder
     for(uint32_t strip_index=0; strip_index<num_strips; ++strip_index)
     {
         for(uint32_t c=0; c<num_channels; ++c)
@@ -1511,15 +1548,16 @@ static void bc4_init_models(bcp_context* ctx, const void* image, uint32_t width_
             }
         }
 
-        uint32_t start_y = strip_index * strip_width;
+        tile_bounds tb = tile_bounds_get(strip_index, width_blocks, height_blocks, num_strips);
+        uint32_t tile_width = tb.x1 - tb.x0;
 
-        for(uint32_t y = start_y; y < start_y + strip_width; ++y)
+        for(uint32_t y = tb.y0; y < tb.y1; ++y)
         {
-            for(uint32_t x = 0; x < width_blocks; ++x)
+            for(uint32_t x = 0; x < tile_width; ++x)
             {
                 // zig-zag pattern, same chain as BC1
-                uint32_t zigzag_x = (y & 1) ? x : width_blocks - x - 1;
-                const bool first_row = (y == start_y);
+                uint32_t zigzag_x = tb.x0 + ((y & 1) ? x : tile_width - x - 1);
+                const bool first_row = (y == tb.y0);
                 const bool row_start = (x == 0);
 
                 for(uint32_t c=0; c<num_channels; ++c)
@@ -1587,9 +1625,8 @@ static size_t bcp_compress_bc45(bcp_context* ctx, const void* image, uint32_t wi
 
     const uint32_t height_blocks = height / 4;
     const uint32_t width_blocks = width / 4;
-    const uint32_t strip_width = height_blocks / *num_strips;
 
-    bc4_init_models(ctx, image, width_blocks, strip_width, *num_strips, num_channels, block_stride);
+    bc4_init_models(ctx, image, width_blocks, height_blocks, *num_strips, num_channels, block_stride);
 
     byte_stream stream = {.buffer = output, .length = output_length, .pos = 0};
 
@@ -1652,15 +1689,16 @@ static size_t bcp_compress_bc45(bcp_context* ctx, const void* image, uint32_t wi
             }
         }
 
-        uint32_t start_y = strip_index * strip_width;
+        tile_bounds tb = tile_bounds_get(strip_index, width_blocks, height_blocks, *num_strips);
+        uint32_t tile_width = tb.x1 - tb.x0;
 
-        for(uint32_t y = start_y; y < start_y + strip_width; ++y)
+        for(uint32_t y = tb.y0; y < tb.y1; ++y)
         {
-            for(uint32_t x = 0; x < width_blocks; ++x)
+            for(uint32_t x = 0; x < tile_width; ++x)
             {
                 // zig-zag pattern, same chain as BC1
-                uint32_t zigzag_x = (y & 1) ? x : width_blocks - x - 1;
-                const bool first_row = (y == start_y);
+                uint32_t zigzag_x = tb.x0 + ((y & 1) ? x : tile_width - x - 1);
+                const bool first_row = (y == tb.y0);
                 const bool row_start = (x == 0);
 
                 for(uint32_t c=0; c<num_channels; ++c)
@@ -1734,7 +1772,6 @@ static bool bcp_decompress_bc45(bcp_context* ctx, const void* input, size_t inpu
 
     const uint32_t height_blocks = height / 4;
     const uint32_t width_blocks = width / 4;
-    const uint32_t strip_width = height_blocks / num_strips;
 
     byte_stream stream = {.buffer = (uint8_t*)input, .length = input_length, .pos = 0};
 
@@ -1791,15 +1828,16 @@ static bool bcp_decompress_bc45(bcp_context* ctx, const void* input, size_t inpu
         }
     }
 
-    uint32_t start_y = strip_index * strip_width;
+    tile_bounds tb = tile_bounds_get(strip_index, width_blocks, height_blocks, num_strips);
+    uint32_t tile_width = tb.x1 - tb.x0;
 
-    for(uint32_t y = start_y; y < start_y + strip_width; ++y)
+    for(uint32_t y = tb.y0; y < tb.y1; ++y)
     {
-        for(uint32_t x = 0; x < width_blocks; ++x)
+        for(uint32_t x = 0; x < tile_width; ++x)
         {
             // zig-zag pattern, same chain as BC1
-            uint32_t zigzag_x = (y & 1) ? x : width_blocks - x - 1;
-            const bool first_row = (y == start_y);
+            uint32_t zigzag_x = tb.x0 + ((y & 1) ? x : tile_width - x - 1);
+            const bool first_row = (y == tb.y0);
             const bool row_start = (x == 0);
 
             for(uint32_t c=0; c<num_channels; ++c)
@@ -1891,13 +1929,12 @@ static size_t bcp_compress_bc1_impl(bcp_context* ctx, const void* bc1_image, uin
     const uint32_t num_blocks = (width*height) / 16;
     const uint32_t height_blocks = height / 4;
     const uint32_t width_blocks = width / 4;
-    const uint32_t strip_width = height_blocks / *num_strips;
 
     if (ctx->hashmap == NULL)
         ctx->hashmap = ctx->mem.malloc_fn(sizeof(hashmap_entry) * HASHMAP_SIZE, ctx->mem.user);
 
     build_top_table(ctx->hashmap, bc1_image, num_blocks, block_stride, ctx->top_table, &ctx->top_table_size);
-    init_static_models(ctx, bc1_image, width_blocks, strip_width, *num_strips, block_stride);
+    init_static_models(ctx, bc1_image, width_blocks, height_blocks, *num_strips, block_stride);
 
     byte_stream stream = {.buffer = output, .length = output_length, .pos = 0};
 
@@ -1969,17 +2006,18 @@ static size_t bcp_compress_bc1_impl(bcp_context* ctx, const void* bc1_image, uin
         memset(&dict, 0, sizeof(dict));
         const bool use_top = ((ctx->strip_predictor >> strip_index) & 1) != 0;
         const bool dict_enabled = ((ctx->strip_dict_enable >> strip_index) & 1) != 0;
-        uint32_t start_y = strip_index * strip_width;
+        tile_bounds tb = tile_bounds_get(strip_index, width_blocks, height_blocks, *num_strips);
+        uint32_t tile_width = tb.x1 - tb.x0;
 
-        for(uint32_t y = start_y; y < start_y + strip_width; ++y)
+        for(uint32_t y = tb.y0; y < tb.y1; ++y)
         {
-            for(uint32_t x = 0; x < width_blocks; ++x)
+            for(uint32_t x = 0; x < tile_width; ++x)
             {
                 // zig-zag pattern delta compression for colors
-                uint32_t zigzag_x = (y&1) ? x : width_blocks - x - 1;
+                uint32_t zigzag_x = tb.x0 + ((y & 1) ? x : tile_width - x - 1);
                 const bc1_block* current = (const bc1_block*) bc1_image + ((y * width_blocks) + zigzag_x) * block_stride;
 
-                uint32_t position = (y - start_y) * width_blocks + x;
+                uint32_t position = (y - tb.y0) * tile_width + x;
                 uint32_t pair = color_pair(current);
 
                 // a disabled strip never matches: no flag bit, the six color deltas go straight into the stream
@@ -1994,10 +2032,10 @@ static size_t bcp_compress_bc1_impl(bcp_context* ctx, const void* bc1_image, uin
                     le_write_bits(&compressed_stream, match - 1, color_ref_bits(position));
                 else
                 {
-                    // first scanline of a strip is always predicted from the seed via the zigzag-previous
-                    // chain, after that a top-flagged strip is predicted from the row above, same zigzag position
+                    // first scanline of a tile is always predicted from the seed via the zigzag-previous
+                    // chain, after that a top-flagged tile is predicted from the row above, same zigzag position
                     const bc1_block* color_reference = &previous;
-                    if (use_top && y > start_y)
+                    if (use_top && y > tb.y0)
                         color_reference = (const bc1_block*) bc1_image + ((y - 1) * width_blocks + zigzag_x) * block_stride;
 
                     int first_green_delta = 0;
@@ -2083,7 +2121,6 @@ static bool bcp_decompress_bc1_impl(bcp_context* ctx, const void* input, size_t 
 
     const uint32_t height_blocks = height / 4;
     const uint32_t width_blocks = width / 4;
-    const uint32_t strip_width = height_blocks / num_strips;
 
     byte_stream stream = {.buffer = (uint8_t *) input, .length = input_length, .pos = 0};
 
@@ -2162,16 +2199,17 @@ static bool bcp_decompress_bc1_impl(bcp_context* ctx, const void* input, size_t 
     memset(&dict, 0, sizeof(dict));
     const bool use_top = ((ctx->strip_predictor >> strip_index) & 1) != 0;
     const bool dict_enabled = ((ctx->strip_dict_enable >> strip_index) & 1) != 0;
-    uint32_t start_y = strip_index * strip_width;
+    tile_bounds tb = tile_bounds_get(strip_index, width_blocks, height_blocks, num_strips);
+    uint32_t tile_width = tb.x1 - tb.x0;
 
-    for(uint32_t y = start_y; y < start_y + strip_width; ++y)
+    for(uint32_t y = tb.y0; y < tb.y1; ++y)
     {
-        for(uint32_t x = 0; x < width_blocks; ++x)
+        for(uint32_t x = 0; x < tile_width; ++x)
         {
-            uint32_t zigzag_x = (y&1) ? x : width_blocks - x - 1;
+            uint32_t zigzag_x = tb.x0 + ((y & 1) ? x : tile_width - x - 1);
             bc1_block* current = (bc1_block*) output + ((y * width_blocks) + zigzag_x) * block_stride;
 
-            uint32_t position = (y - start_y) * width_blocks + x;
+            uint32_t position = (y - tb.y0) * tile_width + x;
 
             // color payload: an enabled strip writes a 1-bit flag, then either a dictionary reference
             // (copy the two endpoint colors of the referenced block, skipping the six delta symbols)
@@ -2185,10 +2223,10 @@ static bool bcp_decompress_bc1_impl(bcp_context* ctx, const void* input, size_t 
             }
             else
             {
-                // first scanline of a strip is always predicted from the seed via the zigzag-previous chain,
-                // after that a top-flagged strip is predicted from the row above, same zigzag position
+                // first scanline of a tile is always predicted from the seed via the zigzag-previous chain,
+                // after that a top-flagged tile is predicted from the row above, same zigzag position
                 const bc1_block* color_reference = &previous;
-                if (use_top && y > start_y)
+                if (use_top && y > tb.y0)
                     color_reference = (const bc1_block*) output + ((y - 1) * width_blocks + zigzag_x) * block_stride;
 
                 int first_green_delta = 0;

@@ -10,6 +10,12 @@ extern "C" {
 #include <stddef.h>
 #include <stdbool.h>
 
+//----------------------------------------------------------------------------------------------------------------------------
+// version
+#define BC_PACKED_MAJOR 0
+#define BC_PACKED_MINOR 0
+#define BC_PACKED_PATCH 1
+
 
 //----------------------------------------------------------------------------------------------------------------------------
 // Memory interface, used for the large working buffers of the compressor.

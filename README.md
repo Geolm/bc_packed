@@ -14,7 +14,7 @@ The compressor is CPU-side and can use significantly more computation than the d
 |      M5 Pro | GPU | 15300 MiB/s      |
 |      M2 Max | CPU 12 cores | 1300 MiB/s      |
 |      M2 Max | GPU | 11850 MiB/s      |
-|      AMD Threadripper | CPU 24 cores | 1322 MiB/s |
+| AMD 5945WX | CPU 24 cores  | 1375 MiB/s |
 
 
 | Block type |  Average compression from the image suite | 
@@ -44,7 +44,7 @@ The format is designed to allow decompression (CPU or GPU) on multiple threads.
 * Lossless.
 * Input is a standard BC1 texture (8 bytes per 4×4 block: two 565 endpoints + one 32-bit index word); decompression reconstructs the same standard format byte-exact.
 * GPU decompression only requires a compute shader.
-* The texture is split into 64 independent strips, one GPU thread decodes each strip, with no dependency between threads.
+* The texture is split into 64 independent tiles, one GPU thread decodes each tile, with no dependency between threads.
 * No CPU-side work is required at runtime.
 * The decompressed result can be used directly as a normal BC1 texture.
 
@@ -54,7 +54,7 @@ The techniques are adapted to make GPU decompression fast and simple:
 
 * **Rice-Golomb coding** instead of arithmetic or Huffman coding. Rice-Golomb decoding is particularly well suited to GPU execution because it requires only simple integer operations and bit manipulation.
 * **Static symbol ranking.** Symbols are remapped so that the most frequently used symbols have the lowest indices. The rank table is generated from a histogram during compression.
-* **Parallel decompression.** The texture is divided into 64 independent strips. 64 GPU threads decompress the strips in parallel, with no dependency between threads.
+* **Parallel decompression.** The texture is divided into 64 independent tiles. 64 GPU threads decompress the tiles in parallel, with no dependency between threads.
 
 Multiple independent Rice-Golomb models are used for the different data: endpoint color deltas (one set of red, green, blue per endpoint, red and blue each with one model per green-delta context bucket, and the second endpoint's green also contextual on the sign of the first endpoint's green — 16 color models, see Endpoints), top-table references, difference masks, and residual difference bytes (19 models in total).
 
@@ -96,13 +96,15 @@ As we use static models, we need two passes to compress the texture :
 
 ### Multiple streams
 
-As the decompression happens on the GPU we need to decompress in parallel multiple streams. The texture is split in 64 strips, each thread decodes a strip of the image.
+As the decompression happens on the GPU we need to decompress in parallel multiple streams. The texture is split in 64 tiles, each thread decodes a tile of the image.
 
-For example for a 1024x1024 texture : each thread will decode 256 blocks (in width) x 4 blocks (in height).
+For example for a 1024x1024 texture : each thread will decode 32 blocks (in width) x 8 blocks (in height) — the 256 x 256 block grid is split in 8 x 8 = 64 tiles.
+
+The 64 tiles lay out the block grid in an even split: tile `s` is `(tx, ty) = (s % gx, s / gx)` with bounds `x0 = tx * width_blocks / gx, x1 = (tx + 1) * width_blocks / gx` and the same for `y`, where `gx` is 8 / 4 / 2 / 1 for `width_blocks` of 32+ / 16+ / 8+ / less and `gy = 64 / gx` (both derived from the width, no header byte, no API change). The even split covers every row and column even when the block grid is not a multiple of the tile size, so images whose height in blocks is not a multiple of the tile row count no longer lose their trailing rows.
 
 As the models are static, each thread just loads the same 19 models from the stream (`le_static_model_load`); the color context is derived from the current block's own decoded green delta, so there is no adaptive state to keep in sync between threads.
 
-As Rice encoding output is non-fixed, we stored in the stream 63 offsets (uint16_t), each a delta in dword units relative to the previous strip, so each thread knows where to start (strip 0 always starts the strip data, its implicit zero offset is not stored).
+As Rice encoding output is non-fixed, we stored in the stream 63 offsets (uint16_t), each a delta in dword units relative to the previous tile, so each thread knows where to start (tile 0 always starts the tile data, its implicit zero offset is not stored).
 
 ### Endpoints
 
@@ -121,41 +123,41 @@ BC1 colors are R5G6B5, so the deltas always fit in 7 bits. Each delta is stored 
 
 The red and blue deltas are contextual: the context is three value buckets of the endpoint's own 6-bit green delta (negative / zero / positive). The decorrelation removes the *linear* luminance component of the chroma deltas, but the residual chroma still scales with the local luminance energy, so a model fitted per luminance-delta regime prices each block tighter than a single image-wide model. The first endpoint's green delta is encoded uncontexted; the second endpoint's green delta is contextual on the sign of the first endpoint's green delta (negative / zero / positive). The context is derived from a value that is already decoded, so the model selection costs no stream bits.
 
-The blocks are traversed in a zigzag order to avoid a discontinuity at the end of each scanline:
+The blocks of a tile are traversed in a zigzag order to avoid a discontinuity at the end of each scanline:
 
 ```C
-uint32_t zigzag_x = (y & 1) ? x : width_blocks - x - 1;
+uint32_t zigzag_x = tb.x0 + ((y & 1) ? x : tile_width - x - 1);
 ```
 
-This keeps the prediction direction continuous when moving from one scanline to the next. There is no previous block at the start of each strip, so the first block of each strip is predicted from the strip seed, a single endpoint color pair stored in the stream header (see Compressed stream).
+This keeps the prediction direction continuous when moving from one scanline to the next. There is no previous block at the start of each tile, so the first block of each tile is predicted from the tile seed, a single endpoint color pair stored in the stream header (see Compressed stream).
 
-### Per-strip predictor
+### Per-tile predictor
 
 Two predictors are available for the endpoint colors:
 
 * **zigzag-previous** (the default): the previous block of the zigzag chain, the in-row spatial neighbor.
 * **row-above**: the block of the row above at the *same zigzag position* — visually, the horizontally mirrored column of the previous row.
 
-The compressor runs a pre-pass before the histogram and, for each strip, sums the absolute magnitude of the color deltas each predictor would emit (the first scanline is identical for both, the strip seed chain): the cheaper one wins and one bit per strip is stored in the stream header (see Compressed stream). The histogram and the encoder then use the chosen predictor per strip, so the static color models always fit the distribution that is actually emitted.
+The compressor runs a pre-pass before the histogram and, for each tile, sums the absolute magnitude of the color deltas each predictor would emit (the first scanline is identical for both, the tile seed chain): the cheaper one wins and one bit per tile is stored in the stream header (see Compressed stream). The histogram and the encoder then use the chosen predictor per tile, so the static color models always fit the distribution that is actually emitted.
 
-Textures whose features follow the zigzag columns (e.g. plank scans) make the row-above predictor much cheaper, while most other textures keep the zigzag-previous one. On the 74-image test suite this moves the average ratio 1.41 → 1.43 (colors payload −2.7%), with 58/74 images improving and the worst single image at −0.01% (the 8-byte header overhead on an image where no strip switches). For GPU decompression the row-above predictor also removes the serial zigzag chain: every block after the first scanline depends only on the row above, so a whole row decodes in parallel.
+Textures whose features follow the zigzag columns (e.g. plank scans) make the row-above predictor much cheaper, while most other textures keep the zigzag-previous one. On the 74-image test suite this moves the average ratio 1.41 → 1.43 (colors payload −2.7%), with 58/74 images improving and the worst single image at −0.01% (the 8-byte header overhead on an image where no tile switches). For GPU decompression the row-above predictor also removes the serial zigzag chain: every block after the first scanline depends only on the row above, so a whole row decodes in parallel.
 
 ### Color-pair dictionary
 
-A sliding dictionary of the last 256 endpoint-color *pairs* of the strip's zigzag chain (one ring buffer per strip, 32-bit entry = the two 565 colors packed). For each block of a strip with the dictionary enabled, one flag bit is written before the deltas:
+A sliding dictionary of the last 256 endpoint-color *pairs* of the tile's zigzag chain (one ring buffer per tile, 32-bit entry = the two 565 colors packed). For each block of a tile with the dictionary enabled, one flag bit is written before the deltas:
 
-* If the block's two endpoint colors exactly match one of the previous 256 blocks of the strip, the flag is 1 and a reference is written — the distance to the most recent match, minus one, in `ceil(log2(min(position, 256)))` bits (`position` is the block's 0-indexed position in the strip; 0 bits for the first block, 8 bits once the window is full). The six color-delta symbols are skipped: the decoder copies the two colors of the referenced, already-decoded block.
+* If the block's two endpoint colors exactly match one of the previous 256 blocks of the tile, the flag is 1 and a reference is written — the distance to the most recent match, minus one, in `ceil(log2(min(position, 256)))` bits (`position` is the block's 0-indexed position in the tile; 0 bits for the first block, 8 bits once the window is full). The six color-delta symbols are skipped: the decoder copies the two colors of the referenced, already-decoded block.
 * Otherwise the flag is 0 and the six color-delta symbols are written as described in Endpoints.
 
 The match is decided on the *decoded* colors only, so it is identical on the compressor and the decompressor and independent of the color predictor. A matched block still emits its top-table reference, mask, and difference bytes (the indices are not part of the color pair).
 
-#### Per-strip enable flag
+#### Per-tile enable flag
 
-The flag bit is only as cheap as the matches it replaces, so each strip decides independently whether to use the dictionary: one bit per strip in the stream header (8 bytes, like the predictor flag). A strip pays one flag bit per block when enabled, so it is enabled exactly when the total savings of its matched blocks — the six color deltas they would emit minus the reference they pay — exceed that flag cost. The decision is made with the models fit on every block's deltas (a one-time approximation, stored in the header and read by both the encoder and the decoder, so it stays lossless).
+The flag bit is only as cheap as the matches it replaces, so each tile decides independently whether to use the dictionary: one bit per tile in the stream header (8 bytes, like the predictor flag). A tile pays one flag bit per block when enabled, so it is enabled exactly when the total savings of its matched blocks — the six color deltas they would emit minus the reference they pay — exceed that flag cost. The decision is made with the models fit on every block's deltas (a one-time approximation, stored in the header and read by both the encoder and the decoder, so it stays lossless).
 
-Disabled strips write exactly the six color-delta symbols with no flag: byte-identical to the dictionary-less format, zero overhead. This is a two-pass model fit: the final color models are refit on the deltas that are actually emitted — every block of the disabled strips, the non-matched blocks of the enabled ones.
+Disabled tiles write exactly the six color-delta symbols with no flag: byte-identical to the dictionary-less format, zero overhead. This is a two-pass model fit: the final color models are refit on the deltas that are actually emitted — every block of the disabled tiles, the non-matched blocks of the enabled ones.
 
-Measured on the 74-image test suite this turns the dictionary into a net win: average ratio 1.4587 → 1.4654, byte-weighted 1.4020 → 1.4073, with 44 images improving, 25 byte-identical, and 5 regressing at most 0.14% (8-byte header on near break-even strips). Structured content (wood, walls, planks) gains up to +2.95%; feature-rich content (grass, sand, rock) is left untouched. See `failed_experiments.md`, exp. 20.
+Measured on the 74-image test suite this turns the dictionary into a net win: average ratio 1.4587 → 1.4654, byte-weighted 1.4020 → 1.4073, with 44 images improving, 25 byte-identical, and 5 regressing at most 0.14% (8-byte header on near break-even tiles). Structured content (wood, walls, planks) gains up to +2.95%; feature-rich content (grass, sand, rock) is left untouched. See `failed_experiments.md`, exp. 20.
 
 ### Indices
 
@@ -202,32 +204,34 @@ Pseudo-description of the stream.
 
 Note : the stream does not include width, height or format, only the compressed data. This is intended, it's up to the user to store that somewhere.
 
+The 64 tiles are the even split of the block grid (see Multiple streams): `gx` is 8 / 4 / 2 / 1 for `width_blocks` of 32+ / 16+ / 8+ / less, `gy = 64 / gx`, both derived from the width, so the stream layout itself never changes and images of any size (16×256 and up) use the same 64 streams.
+
 The output buffer must be at least `packed_bc1_maxsize(width, height)` bytes. This is a very rough bound: `(width/4) * (height/4) * 16`, i.e. 2× the standard BC1 texture size. In practice the stream is much smaller.
 
 ```text
 * 19 static models, in order: for each endpoint (0, 1): red (3 context buckets), green (3 context buckets), blue (3 context buckets) — 16 color models — then top-table reference, difference mask, table difference.
   Each is 3 + num_symbols bytes, no padding (max 259 bytes).
 * Top table size: one uint8_t (number of entries − 1), padded to a 4-byte boundary.
-* Strip seed: one uint32_t (little-endian) — the two endpoint colors of the "previous block" used to predict the first block of each strip, averaged over the 64 strips at compression time. Low 16 bits = color[0], high 16 bits = color[1].
-* Strip predictor flags: 8 bytes (little-endian uint64_t) — one bit per strip: 1 → endpoint colors of that strip are predicted from the row above (same zigzag position) after the first scanline, 0 → zigzag-previous block. See Per-strip predictor.
-* Strip dictionary enable flags: 8 bytes (little-endian uint64_t) — one bit per strip: 1 → the strip's blocks write the color-pair dictionary flag + reference per block, 0 → the six color deltas only (byte-identical to the dictionary-less format). See Per-strip enable flag.
+* Tile seed: one uint32_t (little-endian) — the two endpoint colors of the "previous block" used to predict the first block of each tile, averaged over the 64 tiles at compression time. Low 16 bits = color[0], high 16 bits = color[1].
+* Tile predictor flags: 8 bytes (little-endian uint64_t) — one bit per tile: 1 → endpoint colors of that tile are predicted from the row above (same zigzag position) after the first scanline, 0 → zigzag-previous block. See Per-tile predictor.
+* Tile dictionary enable flags: 8 bytes (little-endian uint64_t) — one bit per tile: 1 → the tile's blocks write the color-pair dictionary flag + reference per block, 0 → the six color deltas only (byte-identical to the dictionary-less format). See Per-tile enable flag.
 * Top table entries, 4 bytes each (little-endian uint32_t).
 * Padded to a 2-byte boundary.
-* 63 strip offsets (uint16_t each), relative deltas in dword units. Strip 0 always starts the strip data so its offset is zero and not stored; the k-th stored offset (k = 1..63) is the delta from strip k-1 to strip k in dword units.
+* 63 tile offsets (uint16_t each), relative deltas in dword units. Tile 0 always starts the tile data so its offset is zero and not stored; the k-th stored offset (k = 1..63) is the delta from tile k-1 to tile k in dword units.
 * Padded to a 4-byte boundary.
-* 64 strip bitstreams, each 4-byte aligned, each flushed independently.
+* 64 tile bitstreams, each 4-byte aligned, each flushed independently.
 ```
 
-Within a strip, the blocks are traversed in the zigzag row order. For each block:
+Within a tile, the blocks are traversed in the zigzag row order. For each block:
 
 ```text
-* For a strip with the dictionary enabled: the color-pair dictionary flag (1 bit): 1 if the block's two endpoint
-  colors exactly match a previous block of the strip, 0 otherwise.
+* For a tile with the dictionary enabled: the color-pair dictionary flag (1 bit): 1 if the block's two endpoint
+  colors exactly match a previous block of the tile, 0 otherwise.
   * If 1: a reference to the matching block — the distance minus one, in ceil(log2(min(position, 256))) bits,
-    where position is the block's 0-indexed position in the strip (0 bits for the first block, 8 bits once 256
+    where position is the block's 0-indexed position in the tile (0 bits for the first block, 8 bits once 256
     blocks back are reachable). The six color-delta symbols are skipped.
   * If 0: the six color deltas, as below.
-* For a strip with the dictionary disabled: no flag.
+* For a tile with the dictionary disabled: no flag.
 * Two endpoints, each: green, red, blue deltas (7-bit values offset by 64).
 * Top-table reference (8-bit index).
 * Difference mask (4 bits).
@@ -240,7 +244,7 @@ See Color-pair dictionary. The six color deltas, the top-table reference, the ma
 =======
 ## BC4 / BC5
 
-BC4 (one 8-bit channel) and BC5 (red + green channels) reuse the BC1 machinery: static Rice-Golomb models fitted from a histogram pre-pass, 64 independent strips, and a self-describing byte stream. The entry points are `packed_bc4_maxsize` / `packed_bc5_maxsize`, `bcp_compress_bc4` / `bcp_compress_bc5`, and `bcp_decompress_bc4` / `bcp_decompress_bc5` (see `src/bc_packed.h`), with the same signature shape as their BC1 counterparts.
+BC4 (one 8-bit channel) and BC5 (red + green channels) reuse the BC1 machinery: static Rice-Golomb models fitted from a histogram pre-pass, 64 independent tiles, and a self-describing byte stream. The entry points are `packed_bc4_maxsize` / `packed_bc5_maxsize`, `bcp_compress_bc4` / `bcp_compress_bc5`, and `bcp_decompress_bc4` / `bcp_decompress_bc5` (see `src/bc_packed.h`), with the same signature shape as their BC1 counterparts.
 
 ### Blocks
 
@@ -256,17 +260,17 @@ A BC5 block is the red BC4 block followed by the green one (16 bytes). The libra
 
 ### Endpoints
 
-Each channel carries two 8-bit endpoints per block. The encoder predicts the current endpoint from the strip chain and stores the wrapped 8-bit delta (`curr - pred`, decoded as `pred + delta`, modulo 256) with one static 256-symbol Rice-Golomb model per (channel, endpoint).
+Each channel carries two 8-bit endpoints per block. The encoder predicts the current endpoint from the tile chain and stores the wrapped 8-bit delta (`curr - pred`, decoded as `pred + delta`, modulo 256) with one static 256-symbol Rice-Golomb model per (channel, endpoint).
 
-The predictor is fixed — no per-strip flag, unlike the BC1 per-strip choice:
+The predictor is fixed — no per-tile flag, unlike the BC1 per-tile choice:
 
 ```text
-first row of a strip:   pred = previous              (the strip seed for the strip's first block)
-start of a row:         pred = top
-other blocks:           pred = previous + top - top_previous   (mod 256)
+first row of a tile:   pred = previous              (the tile seed for the tile's first block)
+start of a row:        pred = top
+other blocks:          pred = previous + top - top_previous   (mod 256)
 ```
 
-`previous` is the chain-previous block in the BC1 zigzag order, `top` the block of the row above at the same column, `top_previous` the block above the chain-previous. All references stay inside the strip, so the 64 strips remain independent. The strip seed is the per-endpoint average of the first block of each strip, stored in the stream header like the BC1 color seed.
+`previous` is the chain-previous block in the BC1 zigzag order, `top` the block of the row above at the same column, `top_previous` the block above the chain-previous. All references stay inside the tile, so the 64 tiles remain independent. The tile seed is the per-endpoint average of the first block of each tile, stored in the stream header like the BC1 color seed.
 
 ### Indices
 
@@ -294,24 +298,24 @@ As BC1, the stream does not include width, height or format: the BC4 / BC5 decom
 ```text
 * 2 endpoint models per channel — 256-symbol static models, 3 + num_symbols bytes each, no padding (max 259).
 * 64 index models per channel — 8-symbol static models, 3 + num_symbols bytes each, no padding (max 11).
-* Strip seed: 2 bytes per channel (endpoint 0, endpoint 1).
+* Tile seed: 2 bytes per channel (endpoint 0, endpoint 1).
 * Padded to a 2-byte boundary.
-* 63 strip offsets (uint16_t each), relative deltas in dword units. Strip 0 always starts the strip data; its offset is zero and not stored.
+* 63 tile offsets (uint16_t each), relative deltas in dword units. Tile 0 always starts the tile data; its offset is zero and not stored.
 * Padded to a 4-byte boundary.
-* 64 strip bitstreams, each 4-byte aligned, each flushed independently.
+* 64 tile bitstreams, each 4-byte aligned, each flushed independently.
 ```
 
-For BC5 the red channel's models and seed come first, then the green channel's, then the shared offsets and strips. Within a strip the blocks follow the zigzag row order; per block the payload is the red channel complete, then the green one, and per channel: endpoint 0, endpoint 1, index 0 (3 raw bits), then indices 1..15.
+For BC5 the red channel's models and seed come first, then the green channel's, then the shared offsets and tiles. Within a tile the blocks follow the zigzag row order; per block the payload is the red channel complete, then the green one, and per channel: endpoint 0, endpoint 1, index 0 (3 raw bits), then indices 1..15.
 
 ### Status
 
-* CPU + GPU: `bcp_compress_bc4/bc5` and `bcp_decompress_bc4/bc5` are implemented and tested; the GPU decoders are the `bcp_decompress_bc4` / `bcp_decompress_bc5` compute kernels of [src/bc_decompress.metal](src/bc_decompress.metal): one thread per strip, bit-identical to the CPU. Measured on the M5 Pro (1024×1024, 1000 runs): **14540 MiB/s** for BC4, **7868 MiB/s** for BC5.
-* `width >= 16` and `height >= 256` are required (multiples of 4, as BC1); textures whose height in blocks is not a multiple of 64 silently drop the trailing block rows.
+* CPU + GPU: `bcp_compress_bc4/bc5` and `bcp_decompress_bc4/bc5` are implemented and tested; the GPU decoders are the `bcp_decompress_bc4` / `bcp_decompress_bc5` compute kernels of [src/bc_decompress.metal](src/bc_decompress.metal): one thread per tile, bit-identical to the CPU. Measured on the M5 Pro (1024×1024, 1000 runs): **14540 MiB/s** for BC4, **7868 MiB/s** for BC5.
+* `width >= 16` and `height >= 256` are required (multiples of 4, as BC1); the even tile split covers every row and column, so no image loses block rows.
 * The output buffer must be at least `packed_bc4_maxsize` / `packed_bc5_maxsize` — 2× the standard block size (16 / 32 bytes per 4×4 block), the BC1 convention.
 
 ### Validation
 
-Everything is validated byte-exact over all 64 strips, on CPU and GPU:
+Everything is validated byte-exact over all 64 tiles, on CPU and GPU:
 
 * GPU roundtrips: the `bcp_decompress_bc4` / `bcp_decompress_bc5` Metal kernels decode the brick AO / normal maps (1024×1024, `images/bc4` / `images/bc5`) and the result is verified byte-identical to the stb-built textures, the same way the BC1 kernel is tested.
 
@@ -328,7 +332,7 @@ BC3 combines a BC1 color block and a BC4 alpha block in the standard D3D layout,
 
 ### Scheme
 
-BC3 is the composition of the two pipelines above, applied to the two halves of the block grid: the BC1 pipeline on the color half, the single-channel BC4 pipeline on the alpha half. No payload logic, model, or context state is new: the strip decomposition, the zigzag chains, the BC1 predictors / top table / color-pair dictionary, and the BC4 endpoint / index models are all the existing ones, fitted on their own half as for the standalone formats.
+BC3 is the composition of the two pipelines above, applied to the two halves of the block grid: the BC1 pipeline on the color half, the single-channel BC4 pipeline on the alpha half. No payload logic, model, or context state is new: the tile decomposition, the zigzag chains, the BC1 predictors / top table / color-pair dictionary, and the BC4 endpoint / index models are all the existing ones, fitted on their own half as for the standalone formats.
 
 ### Compressed stream
 
@@ -340,17 +344,17 @@ Self-describing, as the other streams (no width, height, or format):
 * The BC4 stream of the alpha half, exactly the [BC4 / BC5 → Compressed stream](#compressed-stream-1) format with 1 channel.
 ```
 
-Each substream is self-contained (its own models, strip seed, 63 strip offsets, 64 strips) and ends 4-byte aligned, so the two can be decoded independently; the 64 strips of both halves share the same decomposition, so one `bcp_decompress_bc3` call decodes one strip of both.
+Each substream is self-contained (its own models, tile seed, 63 tile offsets, 64 tiles) and ends 4-byte aligned, so the two can be decoded independently; the 64 tiles of both halves share the same decomposition, so one `bcp_decompress_bc3` call decodes one tile of both.
 
 ### Status
 
 * CPU only: `bcp_compress_bc3` / `bcp_decompress_bc3` are implemented and tested; BC3 is niche, so there is no Metal decoder (the BC1 and BC4 kernels of [src/bc_decompress.metal](src/bc_decompress.metal) cover the two halves, a `bcp_decompress_bc3` kernel is a possible follow-up).
-* `width >= 16` and `height >= 256` are required (multiples of 4, as BC1); textures whose height in blocks is not a multiple of 64 silently drop the trailing block rows.
+* `width >= 16` and `height >= 256` are required (multiples of 4, as BC1); the even tile split covers every row and column, so no image loses block rows.
 * The output buffer must be at least `packed_bc3_maxsize` — 2× the standard BC3 block size (32 bytes per 4×4 block), the BC1 convention, plus the 4-byte prefix.
 
 ### Validation
 
-Everything is validated byte-exact over all 64 strips on CPU:
+Everything is validated byte-exact over all 64 tiles on CPU:
 
 * 4 synthetic 256×256 roundtrips (flat, checkerboard, gradient, SplitMix32 random): the color half and the alpha half each use the corresponding BC1 / BC4 pattern, so the random pattern forces the raw-mode fallback and the full model usage in both halves at once.
 * 2 albedo + alpha maps (`images/bc3`), 1024×1024, converted per block with stb_dxt: the per-image ratio is printed to stdout (no CSV) and the suite average must stay above 1:1. Measured: **2.8030:1** average (3.1231:1 for leak-stain_albedo, 2.4828:1 for leaves). The ratio is dominated by the BC1 color half, which keeps the BC1 headroom; the 8-bit alpha half compresses like a standalone BC4.

@@ -32,6 +32,7 @@
 #include "stb_dxt.h"
 
 #define BENCH_IMAGE_PATH           ("./images/ground.png")
+#define BENCH_BC4_IMAGE_PATH       ("./images/bc4/red_brick_ao_1k.png")
 #define BENCH_BC5_IMAGE_PATH       ("./images/bc5/red_brick_nor_dx_1k.png")
 #define BENCH_IMAGE_WIDTH          (1024)
 #define BENCH_IMAGE_HEIGHT         (1024)
@@ -296,8 +297,69 @@ TEST benchmark_bc5_redbrick_decompression(void)
 }
 
 
+//----------------------------------------------------------------------------------------------------------------------------
+// compresses the red_brick ao map to bc4 once (unmeasured), then measures its decompression
+// rate with the shared strip task (see bench_decompress).
+//----------------------------------------------------------------------------------------------------------------------------
+TEST benchmark_bc4_redbrick_decompression(void)
+{
+    int width = 0, height = 0, channels = 0;
+    uint8_t* rgba = stbi_load(BENCH_BC4_IMAGE_PATH, &width, &height, &channels, 4);
+    ASSERT(rgba != NULL);
+    ASSERT_EQ(width, BENCH_IMAGE_WIDTH);
+    ASSERT_EQ(height, BENCH_IMAGE_HEIGHT);
+
+    const uint32_t bench_width = (uint32_t)width;
+    const uint32_t bench_height = (uint32_t)height;
+    const size_t image_size = (bench_width/4) * (bench_height/4) * sizeof(bc4_block);
+
+    // load and convert to bc4 (the alpha channel of the ao map)
+    uint8_t* original_bc4 = malloc(image_size);
+    ASSERT(original_bc4 != NULL);
+    for (uint32_t y = 0; y < bench_height/4; ++y)
+    {
+        for (uint32_t x = 0; x < bench_width/4; ++x)
+        {
+            uint8_t block[16];
+            for (uint32_t j = 0; j < 4; ++j)
+            {
+                for (uint32_t k = 0; k < 4; ++k)
+                {
+                    const uint8_t* px = &rgba[((y * 4 + j) * bench_width + (x * 4 + k)) * 4];
+                    block[(j * 4 + k)] = px[0]; // red channel, as the bc4 image suite
+                }
+            }
+            stb_compress_bc4_block(&original_bc4[8 * (y * (bench_width/4) + x)], block);
+        }
+    }
+
+    // compress once, not measured
+    bcp_context* compress_ctx = bcp_init(NULL);
+    ASSERT(compress_ctx != NULL);
+    const size_t max_stream_size = packed_bc4_maxsize(bench_width, bench_height);
+    uint8_t* compressed = malloc(max_stream_size);
+    ASSERT(compressed != NULL);
+    uint32_t num_strips = 0;
+    const size_t compressed_size = bcp_compress_bc4(compress_ctx, original_bc4, bench_width, bench_height, compressed, max_stream_size, &num_strips);
+    ASSERT(compressed_size != 0);
+    ASSERT(compressed_size <= max_stream_size);
+
+    greatest_test_res res = bench_decompress(BENCH_BC4_IMAGE_PATH, original_bc4, image_size, compressed, compressed_size,
+                                             bench_width, bench_height, num_strips, bcp_decompress_bc4);
+
+    // teardown
+    free(compressed);
+    bcp_terminate(compress_ctx);
+    free(original_bc4);
+    stbi_image_free(rgba);
+
+    return res;
+}
+
+
 SUITE(suite_benchmark)
 {
     RUN_TEST(benchmark_ground_decompression);
+    RUN_TEST(benchmark_bc4_redbrick_decompression);
     RUN_TEST(benchmark_bc5_redbrick_decompression);
 }
