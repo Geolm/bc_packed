@@ -19,7 +19,7 @@ The compressor is CPU-side and can use significantly more computation than the d
 
 | Block type |  Average compression from the image suite | 
 |:-----: | :------------: 
-| BC1 | 1.47:1  
+| BC1 | 1.49:1  
 | BC4 | 1.13:1
 | BC5 | 1.1:1  
 
