@@ -20,7 +20,7 @@ The compressor is CPU-side and can use significantly more computation than the d
 | Block type |  Average compression from the image suite | 
 |:-----: | :------------: 
 | BC1 | 1.49:1  
-| BC4 | 1.13:1
+| BC4 | 1.14:1
 | BC5 | 1.1:1  
 
 All compression ratio are better than zlib.
@@ -309,7 +309,7 @@ For BC5 the red channel's models and seed come first, then the green channel's, 
 
 ### Status
 
-* CPU + GPU: `bcp_compress_bc4/bc5` and `bcp_decompress_bc4/bc5` are implemented and tested; the GPU decoders are the `bcp_decompress_bc4` / `bcp_decompress_bc5` compute kernels of [src/bc_decompress.metal](src/bc_decompress.metal): one thread per tile, bit-identical to the CPU. Measured on the M5 Pro (1024×1024, 1000 runs): **14540 MiB/s** for BC4, **7868 MiB/s** for BC5.
+* CPU + GPU: `bcp_compress_bc4/bc5` and `bcp_decompress_bc4/bc5` are implemented and tested; the GPU decoders are the `bcp_decompress_bc4` / `bcp_decompress_bc5` compute kernels of [src/bc_decompress.metal](src/bc_decompress.metal): one thread per tile, bit-identical to the CPU. Measured on the M5 Pro (1024×1024): **14540 MiB/s** for BC4, **7868 MiB/s** for BC5.
 * `width >= 16` and `height >= 256` are required (multiples of 4, as BC1); the even tile split covers every row and column, so no image loses block rows.
 * The output buffer must be at least `packed_bc4_maxsize` / `packed_bc5_maxsize` — 2× the standard block size (16 / 32 bytes per 4×4 block), the BC1 convention.
 
@@ -320,7 +320,7 @@ Everything is validated byte-exact over all 64 tiles, on CPU and GPU:
 * GPU roundtrips: the `bcp_decompress_bc4` / `bcp_decompress_bc5` Metal kernels decode the brick AO / normal maps (1024×1024, `images/bc4` / `images/bc5`) and the result is verified byte-identical to the stb-built textures, the same way the BC1 kernel is tested.
 
 * CPU: 8 synthetic 256×256 roundtrips (flat, checkerboard, gradient, SplitMix32 random, each as BC4 and BC5): the random pattern forces the raw-mode fallback and the full 64-context usage.
-* CPU: 4 AO maps (`images/bc4`) and 4 normal maps (`images/bc5`), 1024×1024, converted per block with stb_dxt: the per-image ratio is printed to stdout (no CSV) and the suite average must stay above 1:1. Measured: **1.1342:1** average for BC4 (1.0932 – 1.1577 per image) and **1.0995:1** for BC5 (1.0642 – 1.1334 per image). BC5 compression ratio looks modest but zlib only achieves 1.010563:1 for the same images.
+* CPU: 4 AO maps (`images/bc4`) and 4 normal maps (`images/bc5`), 1024×1024, converted per block with stb_dxt: the per-image ratio is printed to stdout (no CSV) and the suite average must stay above 1:1. Measured: **1.1351:1** average for BC4 (1.0921 – 1.1592 per image) and **1.0985:1** for BC5 (1.0630 – 1.1339 per image). BC5 compression ratio looks modest but zlib only achieves 1.010563:1 for the same images.
 
 The 8-bit formats leave less headroom than BC1: the indices of these maps sit close to 3 near-uniform bits each, so most of the gain comes from the endpoint deltas.
 
@@ -357,7 +357,7 @@ Each substream is self-contained (its own models, tile seed, 63 tile offsets, 64
 Everything is validated byte-exact over all 64 tiles on CPU:
 
 * 4 synthetic 256×256 roundtrips (flat, checkerboard, gradient, SplitMix32 random): the color half and the alpha half each use the corresponding BC1 / BC4 pattern, so the random pattern forces the raw-mode fallback and the full model usage in both halves at once.
-* 2 albedo + alpha maps (`images/bc3`), 1024×1024, converted per block with stb_dxt: the per-image ratio is printed to stdout (no CSV) and the suite average must stay above 1:1. Measured: **2.8030:1** average (3.1231:1 for leak-stain_albedo, 2.4828:1 for leaves). The ratio is dominated by the BC1 color half, which keeps the BC1 headroom; the 8-bit alpha half compresses like a standalone BC4.
+* 2 albedo + alpha maps (`images/bc3`), 1024×1024, converted per block with stb_dxt: the per-image ratio is printed to stdout (no CSV) and the suite average must stay above 1:1. Measured: **2.8787:1** average (3.2210:1 for leak-stain_albedo, 2.5364:1 for leaves). The ratio is dominated by the BC1 color half, which keeps the BC1 headroom; the 8-bit alpha half compresses like a standalone BC4.
 
 ## Images 
 
