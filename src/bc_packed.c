@@ -1162,6 +1162,7 @@ typedef struct tile_bounds
     uint32_t y0, y1;
 } tile_bounds;
 
+//-----------------------------------------------------------------------------------------------------------------------------
 static inline tile_bounds tile_bounds_get(uint32_t strip_index, uint32_t width_blocks, uint32_t height_blocks, uint32_t num_strips)
 {
     uint32_t gx = tile_grid_x(width_blocks);
