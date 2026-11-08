@@ -657,6 +657,34 @@ TEST bc45_flat(void)
 }
 
 //-----------------------------------------------------------------------------------------------------------------------------
+// one solid block value per channel with UNIFORM indices: a flat block (identical endpoints) whose
+// index word is constant selects the single-index flat-index mode (mode 1) for the channel, unlike
+// bc45_flat whose non-uniform indices force mode 0. each channel uses a different value
+TEST bc45_flat_uniform(void)
+{
+    bc4_block image[TEST_BC45_BLOCKS];
+    bc4_block image16[TEST_BC45_BLOCKS * 2]; // 16-byte BC5 block: the red bc4_block followed by the green one
+
+    for(uint32_t i=0; i<TEST_BC45_BLOCKS; ++i)
+    {
+        image[i].endpoint[0] = 0xC0;
+        image[i].endpoint[1] = 0xC0;
+        for(uint32_t j=0; j<6; ++j)
+            image[i].indices[j] = 0x33; // 3, 3, 3, 3, ... all 16 indices uniform as 3-bit values
+
+        memcpy(&image16[2 * i], &image[i], sizeof(bc4_block)); // red channel
+
+        // green channel: the same endpoints (XOR of two equal bytes) with a different uniform value
+        image16[2 * i + 1].endpoint[0] = (uint8_t)(image[i].endpoint[0] ^ 0x5A);
+        image16[2 * i + 1].endpoint[1] = (uint8_t)(image[i].endpoint[1] ^ 0x5A);
+        for(uint32_t j=0; j<6; ++j)
+            image16[2 * i + 1].indices[j] = 0x77; // 7, 7, 7, 7, ...
+    }
+
+    return bc45_both(image, image16, TEST_BC45_WIDTH, TEST_BC45_HEIGHT);
+}
+
+//-----------------------------------------------------------------------------------------------------------------------------
 // alternating endpoint pairs and index patterns across the block grid
 TEST bc45_checkerboard(void)
 {
@@ -872,6 +900,30 @@ TEST bc3_flat(void)
 
 
 //-----------------------------------------------------------------------------------------------------------------------------
+// one solid color (non-flat endpoints, color half in mode 0) + one solid alpha with UNIFORM indices
+// (flat endpoints, alpha half in the single-index mode 1): the two halves take different modes in
+// one stream, unlike bc3_flat whose non-uniform alpha indices force mode 0 in both halves
+TEST bc3_flat_uniform(void)
+{
+    bc3_block image[TEST_BC45_BLOCKS];
+
+    for(uint32_t i=0; i<TEST_BC45_BLOCKS; ++i)
+    {
+        image[i].color.color[0] = red;
+        image[i].color.color[1] = cyan;
+        image[i].color.indices = 0x33333333;
+
+        image[i].alpha.endpoint[0] = 0xC0;
+        image[i].alpha.endpoint[1] = 0xC0;
+        for(uint32_t j=0; j<6; ++j)
+            image[i].alpha.indices[j] = 0x33; // 3, 3, 3, 3, ... all 16 indices uniform as 3-bit values
+    }
+
+    return bc3_roundtrip(image, TEST_BC45_WIDTH, TEST_BC45_HEIGHT);
+}
+
+
+//-----------------------------------------------------------------------------------------------------------------------------
 // alternating color and alpha patterns across the block grid
 TEST bc3_checkerboard(void)
 {
@@ -973,10 +1025,12 @@ SUITE(suite_synthetic)
     (void)flat;
     (void)checkerboard;
     (void)bc45_flat;
+    (void)bc45_flat_uniform;
     (void)bc45_checkerboard;
     (void)bc45_gradient;
     (void)bc45_random_splitmix32;
     (void)bc3_flat;
+    (void)bc3_flat_uniform;
     (void)bc3_checkerboard;
     (void)bc3_gradient;
     (void)bc3_random_splitmix32;
@@ -1000,10 +1054,12 @@ SUITE(suite_synthetic)
     RUN_TEST(gradient);
     RUN_TEST(random_splitmix32);
     RUN_TEST(bc45_flat);
+    RUN_TEST(bc45_flat_uniform);
     RUN_TEST(bc45_checkerboard);
     RUN_TEST(bc45_gradient);
     RUN_TEST(bc45_random_splitmix32);
     RUN_TEST(bc3_flat);
+    RUN_TEST(bc3_flat_uniform);
     RUN_TEST(bc3_checkerboard);
     RUN_TEST(bc3_gradient);
     RUN_TEST(bc3_random_splitmix32);

@@ -25,10 +25,17 @@
 // buffer(2): constant decode_args_t
 //
 // The stream layout parsed here mirrors the CPU compressors / decompressors:
-//   BC1       [19 static models][top table size u8][4-align][strip seed u32][strip predictor u64][strip dict enable u64]
-//             [top table u32s][2-align][63 strip offsets u16, deltas in dword units][4-align][strip bitstreams]
+//   BC1       [19 static models][top table size u8][flat index mode u8][4-align][strip seed u32]
+//             [strip predictor u64][strip dict enable u64][top table u32s][2-align][63 strip offsets u16,
+//             deltas in dword units][4-align][strip bitstreams]
 //   BC4 / BC5 [2 endpoint models per channel][64 index models per channel][strip seed, 2 bytes per channel]
-//             [2-align][63 strip offsets u16, deltas in dword units][4-align][strip bitstreams]
+//             [flat index mode, 1 byte per channel][2-align][63 strip offsets u16, deltas in dword units]
+//             [4-align][strip bitstreams]
+//
+// The flat index mode (0 / 1) is decided once per stream (per channel for BC4 / BC5) in the first pass:
+// 1 when at least one block has identical endpoints and every such block has uniform indices. A block
+// with identical endpoints then stores a single index value (2 bits for BC1, 3 bits per channel for
+// BC4 / BC5) expanded to all 16 indices, instead of the full index payload.
 //
 // On a corrupted stream the decode runs to completion and the output is garbage, mirroring the
 // CPU version which only reports the failure after the whole strip was decoded. A valid stream
@@ -391,6 +398,9 @@ kernel void bcp_decompress_bc1(const device uint8_t* input [[buffer(0)]],
         return;
 
     uint top_table_size = input[pos++] + 1;
+    if (pos + 1 > length)
+        return;
+    const bool flat_index_mode = input[pos++] != 0; // flat-index mode, right after the top-table size
     pos = (pos + 3) & ~(uint64_t)3; // 4-byte align
 
     if (pos + 20 > length)
@@ -541,16 +551,27 @@ kernel void bcp_decompress_bc1(const device uint8_t* input [[buffer(0)]],
                 }
             }
 
-            // indices difference with top table
-            uint8_t reference = decode_symbol(&compressed_stream, &reference_model);
-            uint8_t mask = decode_symbol(&compressed_stream, &mask_model);
+            // a flat block (identical endpoints, reconstructed exactly like the encoder sees the source) in
+            // mode 1 stores one 2-bit value, expanded to all 16 indices; otherwise the full reference +
+            // mask + differences
+            uint32_t indices;
+            if ((current_color0 == current_color1) && flat_index_mode)
+            {
+                uint8_t value = bs_read_bits(&compressed_stream, 2);
+                indices = (uint32_t)value * 0x11111111u;
+            }
+            else
+            {
+                uint8_t reference = decode_symbol(&compressed_stream, &reference_model);
+                uint8_t mask = decode_symbol(&compressed_stream, &mask_model);
 
-            uint32_t difference = 0;
-            for (uint j = 0; j < 4; ++j)
-                if (mask & (1 << j))
-                    difference |= (uint32_t)decode_symbol(&compressed_stream, &difference_model) << (j * 8);
+                uint32_t difference = 0;
+                for (uint j = 0; j < 4; ++j)
+                    if (mask & (1 << j))
+                        difference |= (uint32_t)decode_symbol(&compressed_stream, &difference_model) << (j * 8);
 
-            uint32_t indices = difference ^ top_table[reference];
+                indices = difference ^ top_table[reference];
+            }
 
             write_block(output, block_index, current_color0, current_color1, indices);
 
@@ -640,6 +661,14 @@ void bc45_decode_strip(const device uint8_t* input,
             seed[c][e] = input[pos++];
     }
 
+    // flat-index mode: one byte per channel, after the seeds, before the 2-align
+    if (pos + NumChannels > length)
+        return;
+
+    bool flat_mode[NumChannels];
+    for (uint c = 0; c < NumChannels; ++c)
+        flat_mode[c] = input[pos++] != 0;
+
     //-------------------------------------------------------------------------------------------------------------------------
     // strip offsets (deltas in dword units), then the strip bitstream of this thread
     pos = (pos + 1) & ~(uint64_t)1; // 2-byte align
@@ -721,16 +750,27 @@ void bc45_decode_strip(const device uint8_t* input,
 
                 // index payload: the first index in raw 3 bits, then each index xored with its
                 // intra-block prediction, contextual on the 8 x 8 [left][top] matrix
-                idx[0] = bs_read_bits(&compressed_stream, 3);
-
-                for (uint i = 1; i < 16; ++i)
+                // a flat block (identical endpoints, reconstructed exactly like the encoder sees the
+                // source) in mode 1 stores one 3-bit value, expanded to all 16 indices
+                if ((e[0] == e[1]) && flat_mode[c])
                 {
-                    // the missing neighbor of the pixel (first row, row start) defaults to 0
-                    uint8_t left = ((i & 3) == 0) ? 0 : idx[i - 1];
-                    uint8_t top = (i < 4) ? 0 : idx[i - 4];
-                    uint8_t p = ((i & 3) == 0) ? top : left;
+                    uint8_t value = bs_read_bits(&compressed_stream, 3);
+                    for (uint i = 0; i < 16; ++i)
+                        idx[i] = value;
+                }
+                else
+                {
+                    idx[0] = bs_read_bits(&compressed_stream, 3);
 
-                    idx[i] = (uint8_t)(p ^ decode_symbol8(&compressed_stream, &index[c][bc4_index_context(left, top)]));
+                    for (uint i = 1; i < 16; ++i)
+                    {
+                        // the missing neighbor of the pixel (first row, row start) defaults to 0
+                        uint8_t left = ((i & 3) == 0) ? 0 : idx[i - 1];
+                        uint8_t top = (i < 4) ? 0 : idx[i - 4];
+                        uint8_t p = ((i & 3) == 0) ? top : left;
+
+                        idx[i] = (uint8_t)(p ^ decode_symbol8(&compressed_stream, &index[c][bc4_index_context(left, top)]));
+                    }
                 }
 
                 // the standard block: two endpoints + the 48-bit little-endian index field, as two aligned u32 words
