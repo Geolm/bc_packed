@@ -753,8 +753,6 @@ void bc45_decode_strip(const device uint8_t* input,
                     e[j] = (uint8_t)(pred + decode_symbol(&compressed_stream, &endpoint[c][j]));
                 }
 
-                // index payload: the first index in raw 3 bits, then each index xored with its
-                // intra-block prediction, contextual on the 8 x 8 [left][top] matrix
                 // a flat block (identical endpoints, reconstructed exactly like the encoder sees the
                 // source) in mode 1 stores no index payload: the header value is expanded to all 16
                 if ((e[0] == e[1]) && flat_mode[c])
@@ -764,6 +762,8 @@ void bc45_decode_strip(const device uint8_t* input,
                 }
                 else
                 {
+                    // index payload: the first index in raw 3 bits, then each index xored with its
+                    // intra-block prediction, contextual on the 8 x 8 [left][top] matrix
                     idx[0] = bs_read_bits(&compressed_stream, 3);
 
                     for (uint i = 1; i < 16; ++i)

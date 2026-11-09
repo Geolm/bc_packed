@@ -529,25 +529,14 @@ struct bcp_context
     uint32_t strip_seed;
 
     // per-strip color predictor: bit s = 1 → strip s predicts endpoint colors from the block of the row above,
-    // same zigzag position (visually: the horizontally mirrored column of the previous row), after its first
-    // scanline; 0 → zigzag-previous block. the first scanline of every strip is always predicted from the
-    // strip seed via the zigzag chain, as there is no previous row within the strip
     uint64_t strip_predictor;
 
     // per-strip color-pair dictionary: bit s = 1 → strip s writes the 1-bit flag + reference / delta
     // choice per block; 0 → the block colors are always the six deltas (no flag), i.e. the baseline.
-    // a strip enables the dictionary only when it saves bits overall, so feature-rich strips (few
-    // matching blocks) pay no flag overhead. see the per-strip dictionary enable in init_static_models
     uint64_t strip_dict_enable;
 
     // flat-index mode of the whole stream: 1 → a block whose two endpoints are identical stores no
     // index payload; the decoder expands the 2-bit value from the stream header to all 16 indices,
-    // instead of the reference + mask + differences; 0 → every block stores its indices as usual.
-    // decided once in the first pass: 1 only if at least one block has identical endpoints and every
-    // such block holds the same uniform index word, else 0 (an encoder that leaves garbage or
-    // differing indices on flat blocks forces mode 0, keeping the roundtrip byte-exact). the mode and
-    // the value share one header byte (mode | value << 1) written in the stream header's alignment
-    // padding, absorbed except in the worst parity case (a few bytes, covered by packed_bc1_maxsize)
     uint8_t bc1_index_mode;
     uint8_t bc1_index_value; // 2-bit value of the shared index word, expanded to all 16 indices, mode 1 only
 
@@ -561,9 +550,6 @@ struct bcp_context
     // per-channel flat-index mode: 1 → a block whose two endpoints are identical stores no index
     // payload; the decoder expands the 3-bit value from the stream header to all 16 indices, instead
     // of the 15 contextual symbols; 0 → the indices are stored as usual. decided per channel in the
-    // first pass, same rule as the BC1 mode. the mode and the value share one header byte per channel
-    // (mode | value << 1) after the seeds, in the 2-byte alignment padding (worst case a couple bytes,
-    // covered by packed_bc4_maxsize / packed_bc5_maxsize)
     uint8_t bc4_index_mode[BCP_MAX_CHANNELS]; // [channel]
     uint8_t bc4_index_value[BCP_MAX_CHANNELS]; // [channel] 3-bit value, expanded to all 16 indices, mode 1 only
 };
