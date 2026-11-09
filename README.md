@@ -200,7 +200,7 @@ This avoids storing zero bytes in the residual and makes the representation part
 
 #### Flat blocks
 
-A block whose two endpoint colors are identical carries a uniform index word: all 16 indices hold the same 2-bit value. A global flat index mode, decided once in the first pass, collapses this: mode 1 is selected when at least one block has identical endpoints and every such block has a uniform index word, else mode 0. In mode 1 a flat block stores a single 2-bit value (expanded to all 16 indices on decode) instead of the top-table reference + mask + differences; in mode 0, or for a non-flat block, the indices are stored as usual. One byte of the mode is written in the stream header right after the top-table size. A decoder never needs the mode for a non-flat block, so the encoder and decoder always pick the same path.
+A block whose two endpoint colors are identical carries a uniform index word: all 16 indices hold the same 2-bit value. A global flat index mode, decided once in the first pass, collapses this: mode 1 is selected when at least one block has identical endpoints and every such block holds the same 2-bit value. In mode 1 a flat block stores no index payload at all: the value, stored once for the whole image in the stream header, is expanded to all 16 indices on decode, instead of the top-table reference + mask + differences; in mode 0, or for a non-flat block, the indices are stored as usual. The mode and the value share one header byte (mode | value << 1) right after the top-table size. A decoder never needs the mode for a non-flat block, so the encoder and decoder always pick the same path; an encoder that leaves a non-uniform or a differing index word on a flat block forces mode 0 and round-trips byte-exact.
 
 ## Compressed stream
 
@@ -216,7 +216,7 @@ The output buffer must be at least `packed_bc1_maxsize(width, height)` bytes. Th
 * 19 static models, in order: for each endpoint (0, 1): red (3 context buckets), green (3 context buckets), blue (3 context buckets) — 16 color models — then top-table reference, difference mask, table difference.
   Each is 3 + num_symbols bytes, no padding (max 259 bytes).
 * Top table size: one uint8_t (number of entries − 1).
-* Flat index mode: one uint8_t (0 or 1), then padded to a 4-byte boundary. See Block indices → Flat blocks.
+* Flat index mode + value: one uint8_t (mode | value << 1), then padded to a 4-byte boundary. See Block indices → Flat blocks.
 * Tile seed: one uint32_t (little-endian) — the two endpoint colors of the "previous block" used to predict the first block of each tile, averaged over the 64 tiles at compression time. Low 16 bits = color[0], high 16 bits = color[1].
 * Tile predictor flags: 8 bytes (little-endian uint64_t) — one bit per tile: 1 → endpoint colors of that tile are predicted from the row above (same zigzag position) after the first scanline, 0 → zigzag-previous block. See Per-tile predictor.
 * Tile dictionary enable flags: 8 bytes (little-endian uint64_t) — one bit per tile: 1 → the tile's blocks write the color-pair dictionary flag + reference per block, 0 → the six color deltas only (byte-identical to the dictionary-less format). See Per-tile enable flag.
@@ -239,7 +239,7 @@ Within a tile, the blocks are traversed in the zigzag row order. For each block:
 * For a tile with the dictionary disabled: no flag.
 * Two endpoints, each: green, red, blue deltas (7-bit values offset by 64).
 * If the block is flat (its two endpoint colors are identical) and the flat index mode is 1:
-  one 2-bit index value, expanded to all 16 indices on decode.
+  no index payload, the header value is expanded to all 16 indices on decode.
 * Otherwise: top-table reference (8-bit index), difference mask (4 bits), and one difference byte per set mask bit.
 ```
 
@@ -298,7 +298,7 @@ The 8-symbol models use a compact rank table (8 entries instead of 256): `3 + nu
 
 #### Flat blocks
 
-A block whose two endpoints are identical carries a uniform index word: all 16 indices hold the same 3-bit value. A per-channel flat index mode, decided once in the first pass, collapses this: mode 1 is selected for a channel when at least one block of that channel has identical endpoints and every such block has uniform indices, else mode 0. In mode 1 a flat block stores a single 3-bit value (expanded to all 16 indices on decode) instead of the 15 contextual symbols; in mode 0, or for a non-flat block, the indices are stored as usual. One byte of the mode per channel is written in the stream header after the tile seeds. A decoder never needs the mode for a non-flat block, so the encoder and decoder always pick the same path; an encoder that leaves a non-uniform index word on a flat block forces mode 0 and round-trips unchanged.
+A block whose two endpoints are identical carries a uniform index word: all 16 indices hold the same 3-bit value. A per-channel flat index mode, decided once in the first pass, collapses this: mode 1 is selected for a channel when at least one block of that channel has identical endpoints and every such block holds the same 3-bit value, else mode 0. In mode 1 a flat block stores no index payload at all: the value, stored once per channel for the whole image in the stream header, is expanded to all 16 indices on decode, instead of the 15 contextual symbols; in mode 0, or for a non-flat block, the indices are stored as usual. The mode and the value share one header byte per channel (mode | value << 1) after the tile seeds. A decoder never needs the mode for a non-flat block, so the encoder and decoder always pick the same path; an encoder that leaves a non-uniform or a differing index word on a flat block forces mode 0 and round-trips byte-exact.
 
 ### Compressed stream
 
@@ -308,14 +308,14 @@ As BC1, the stream does not include width, height or format: the BC4 / BC5 decom
 * 2 endpoint models per channel — 256-symbol static models, 3 + num_symbols bytes each, no padding (max 259).
 * 64 index models per channel — 8-symbol static models, 3 + num_symbols bytes each, no padding (max 11).
 * Tile seed: 2 bytes per channel (endpoint 0, endpoint 1).
-* Flat index mode: one uint8_t (0 or 1) per channel. See Indices → Flat blocks.
+* Flat index mode + value: one uint8_t (mode | value << 1) per channel. See Indices → Flat blocks.
 * Padded to a 2-byte boundary.
 * 63 tile offsets (uint16_t each), relative deltas in dword units. Tile 0 always starts the tile data; its offset is zero and not stored.
 * Padded to a 4-byte boundary.
 * 64 tile bitstreams, each 4-byte aligned, each flushed independently.
 ```
 
-For BC5 the red channel's models and seed come first, then the green channel's, then the shared offsets and tiles. Within a tile the blocks follow the zigzag row order; per block the payload is the red channel complete, then the green one, and per channel: endpoint 0, endpoint 1, then either one 3-bit index value (a flat block in mode 1, expanded to all 16 indices) or index 0 (3 raw bits) followed by indices 1..15 (each XORed with its intra-block prediction, as above).
+For BC5 the red channel's models and seed come first, then the green channel's, then the shared offsets and tiles. Within a tile the blocks follow the zigzag row order; per block the payload is the red channel complete, then the green one, and per channel: endpoint 0, endpoint 1, then either no index payload (a flat block in mode 1, the header value is expanded to all 16 indices on decode) or index 0 (3 raw bits) followed by indices 1..15 (each XORed with its intra-block prediction, as above).
 
 ### Status
 

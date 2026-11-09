@@ -540,14 +540,16 @@ struct bcp_context
     // matching blocks) pay no flag overhead. see the per-strip dictionary enable in init_static_models
     uint64_t strip_dict_enable;
 
-    // flat-index mode of the whole stream: 1 → a block whose two endpoints are identical stores a single
-    // 2-bit index value, expanded to all 16 indices, instead of the reference + mask + differences;
-    // 0 → every block stores its indices as usual. decided once in the first pass: 1 only if at least
-    // one block has identical endpoints and every such block has a uniform index word (v * 0x11111111),
-    // else 0 (an encoder that leaves garbage indices on a flat block forces mode 0). the flag is written
-    // in the stream header's alignment padding, absorbed except in the worst parity case (a few bytes,
-    // covered by packed_bc1_maxsize)
+    // flat-index mode of the whole stream: 1 → a block whose two endpoints are identical stores no
+    // index payload; the decoder expands the 2-bit value from the stream header to all 16 indices,
+    // instead of the reference + mask + differences; 0 → every block stores its indices as usual.
+    // decided once in the first pass: 1 only if at least one block has identical endpoints and every
+    // such block holds the same uniform index word, else 0 (an encoder that leaves garbage or
+    // differing indices on flat blocks forces mode 0, keeping the roundtrip byte-exact). the mode and
+    // the value share one header byte (mode | value << 1) written in the stream header's alignment
+    // padding, absorbed except in the worst parity case (a few bytes, covered by packed_bc1_maxsize)
     uint8_t bc1_index_mode;
+    uint8_t bc1_index_value; // 2-bit value of the shared index word, expanded to all 16 indices, mode 1 only
 
     // bc4/bc5: per-channel static models — the 2 endpoint models (256 symbols) and the 64
     // index models (8 symbols each, 8 x 8 [left][top] matrix); each retains the full 516-byte
@@ -556,12 +558,14 @@ struct bcp_context
     le_model bc4_index_model[BCP_MAX_CHANNELS][BC4_INDEX_CONTEXTS];
     uint8_t bc4_strip_seed[BCP_MAX_CHANNELS][2]; // [channel][endpoint]
 
-    // per-channel flat-index mode: 1 → a block whose two endpoints are identical stores a single 3-bit
-    // index value, expanded to all 16 indices, instead of the 15 contextual symbols; 0 → the indices
-    // are stored as usual. decided per channel in the first pass, same rule as the BC1 mode. one byte
-    // per channel in the stream header after the seeds, in the 2-byte alignment padding (worst case a
-    // couple bytes, covered by packed_bc4_maxsize / packed_bc5_maxsize)
+    // per-channel flat-index mode: 1 → a block whose two endpoints are identical stores no index
+    // payload; the decoder expands the 3-bit value from the stream header to all 16 indices, instead
+    // of the 15 contextual symbols; 0 → the indices are stored as usual. decided per channel in the
+    // first pass, same rule as the BC1 mode. the mode and the value share one header byte per channel
+    // (mode | value << 1) after the seeds, in the 2-byte alignment padding (worst case a couple bytes,
+    // covered by packed_bc4_maxsize / packed_bc5_maxsize)
     uint8_t bc4_index_mode[BCP_MAX_CHANNELS]; // [channel]
+    uint8_t bc4_index_value[BCP_MAX_CHANNELS]; // [channel] 3-bit value, expanded to all 16 indices, mode 1 only
 };
 
 typedef struct bc1_block
@@ -1268,11 +1272,14 @@ void init_static_models(bcp_context* ctx, const void* input, uint32_t width_bloc
     // symbols (the dictionary does not touch the indices). the color models fit on this pass price
     // the matched blocks in the per-strip dictionary decision below, the final color models are
     // refit on the deltas that are actually emitted after the decision
-    // the flat-index mode is decided here too: mode 1 (a block with identical endpoints stores one
-    // 2-bit index) only if at least one block has identical endpoints and every such block has a
-    // uniform index word, else mode 0 (garbage indices on a flat block force the full encoding)
+    // the flat-index mode is decided here too: mode 1 (a block with identical endpoints stores no
+    // index payload, the decoder expands the header value) only if at least one block has identical
+    // endpoints and every such block holds the same uniform index word, else mode 0 (garbage or
+    // differing indices on a flat block force the full encoding)
     bool flat_block = false;
     bool non_uniform_flat = false;
+    bool divergent_flat = false;
+    uint8_t flat_value = 0;
     for(uint32_t strip_index=0; strip_index<num_strips; ++strip_index)
     {
         bc1_block previous;
@@ -1300,10 +1307,14 @@ void init_static_models(bcp_context* ctx, const void* input, uint32_t width_bloc
 
                 if (current->color[0] == current->color[1])
                 {
-                    flat_block = true;
                     const uint8_t value = (uint8_t)(current->indices & 3);
                     if (current->indices != (uint32_t)value * 0x11111111u)
                         non_uniform_flat = true;
+                    if (!flat_block)
+                        flat_value = value;
+                    else if (value != flat_value)
+                        divergent_flat = true;
+                    flat_block = true;
                 }
 
                 uint8_t reference = nearest32(ctx->top_table, ctx->top_table_size, current->indices) & 0xff;
@@ -1327,7 +1338,16 @@ void init_static_models(bcp_context* ctx, const void* input, uint32_t width_bloc
         }
     }
 
-    ctx->bc1_index_mode = (flat_block && !non_uniform_flat) ? 1 : 0;
+    if (flat_block && !non_uniform_flat && !divergent_flat)
+    {
+        ctx->bc1_index_mode = 1;
+        ctx->bc1_index_value = flat_value;
+    }
+    else
+    {
+        ctx->bc1_index_mode = 0;
+        ctx->bc1_index_value = 0;
+    }
 
     init_color_models(ctx, &hist);
 
@@ -1540,9 +1560,9 @@ typedef struct bc4_hists
 // first block of each tile in chain order (as BC1), then one histogram pass with the exact
 // tile predictors of the encoder. there is no per-tile mode decision, so a single fit is final.
 // the per-channel flat-index mode is also decided in the histogram pass: mode 1 (a block whose
-// two endpoints are identical stores one 3-bit index) only if at least one such block exists and
-// every such block has uniform indices, else mode 0 (garbage indices on a flat block force the
-// full 15-symbol encoding)
+// two endpoints are identical stores no index payload, the decoder expands the header value) only if
+// at least one such block exists and every such block holds the same uniform 3-bit value, else mode
+// 0 (garbage or differing indices on a flat block force the full 15-symbol encoding)
 static void bc4_init_models(bcp_context* ctx, const void* image, uint32_t width_blocks, uint32_t height_blocks, uint32_t num_strips, uint32_t num_channels, uint32_t block_stride)
 {
     bc4_hists hist[BCP_MAX_CHANNELS] = { 0 };
@@ -1550,6 +1570,8 @@ static void bc4_init_models(bcp_context* ctx, const void* image, uint32_t width_
     uint8_t prev_e[BCP_MAX_CHANNELS][2], top_e[BCP_MAX_CHANNELS][2], top_prev_e[BCP_MAX_CHANNELS][2];
     bool flat_block[BCP_MAX_CHANNELS] = { false, false };
     bool non_uniform_flat[BCP_MAX_CHANNELS] = { false, false };
+    bool divergent_flat[BCP_MAX_CHANNELS] = { false, false };
+    uint8_t flat_value[BCP_MAX_CHANNELS] = { 0, 0 };
 
     // pass 1: tile seeds, the average of the first block of each tile in chain order
     for(uint32_t strip_index=0; strip_index<num_strips; ++strip_index)
@@ -1622,8 +1644,12 @@ static void bc4_init_models(bcp_context* ctx, const void* image, uint32_t width_
 
                     if (b->endpoint[0] == b->endpoint[1])
                     {
-                        flat_block[c] = true;
                         const uint8_t first = idx[0];
+                        if (!flat_block[c])
+                            flat_value[c] = first;
+                        else if (first != flat_value[c])
+                            divergent_flat[c] = true;
+
                         for(uint32_t i=0; i<16; ++i)
                         {
                             if (idx[i] != first)
@@ -1632,6 +1658,8 @@ static void bc4_init_models(bcp_context* ctx, const void* image, uint32_t width_
                                 break;
                             }
                         }
+
+                        flat_block[c] = true;
                     }
 
                     for(uint32_t i=1; i<16; ++i)
@@ -1657,7 +1685,18 @@ static void bc4_init_models(bcp_context* ctx, const void* image, uint32_t width_
     }
 
     for(uint32_t c=0; c<num_channels; ++c)
-        ctx->bc4_index_mode[c] = (flat_block[c] && !non_uniform_flat[c]) ? 1 : 0;
+    {
+        if (flat_block[c] && !non_uniform_flat[c] && !divergent_flat[c])
+        {
+            ctx->bc4_index_mode[c] = 1;
+            ctx->bc4_index_value[c] = flat_value[c];
+        }
+        else
+        {
+            ctx->bc4_index_mode[c] = 0;
+            ctx->bc4_index_value[c] = 0;
+        }
+    }
 
     for(uint32_t c=0; c<num_channels; ++c)
     {
@@ -1706,13 +1745,14 @@ static size_t bcp_compress_bc45(bcp_context* ctx, const void* image, uint32_t wi
             stream.buffer[stream.pos++] = ctx->bc4_strip_seed[c][e];
     }
 
-    // flat-index mode, one byte per channel, written right after the seeds. the model region is always
-    // even-sized, so this byte sits on an odd stream position and the 2-align below can never land on
-    // it and zero it, keeping the encoder and the decoder in agreement
+    // flat-index mode + value, one byte per channel (mode | value << 1), written right after the
+    // seeds. the model region is always even-sized, so these bytes sit on an odd stream position and
+    // the 2-align below can never land on them and zero them, keeping the encoder and the decoder in
+    // agreement
     if (stream.pos + num_channels > stream.length)
         return 0;
     for(uint32_t c=0; c<num_channels; ++c)
-        stream.buffer[stream.pos++] = ctx->bc4_index_mode[c];
+        stream.buffer[stream.pos++] = (uint8_t)(ctx->bc4_index_mode[c] | (ctx->bc4_index_value[c] << 1));
 
     stream_align(&stream, sizeof(uint16_t));
     size_t strips_offset_array_size = sizeof(uint16_t) * (*num_strips - 1);
@@ -1788,12 +1828,11 @@ static size_t bcp_compress_bc45(bcp_context* ctx, const void* image, uint32_t wi
                     // intra-block prediction, contextual on the 8 x 8 [left][top] matrix
                     bc4_unpack_indices(b, idx);
 
-                    // a flat block (identical endpoints) in mode 1 stores one 3-bit value, expanded to
-                    // all 16 indices on decode; otherwise the full 15 contextual symbols
+                    // a flat block (identical endpoints) in mode 1 stores no index payload: the
+                    // decoder expands the header value to all 16 indices; otherwise the full
+                    // 15 contextual symbols
                     const bool flat = (b->endpoint[0] == b->endpoint[1]);
-                    if (flat && ctx->bc4_index_mode[c])
-                        le_write_bits(&compressed_stream, idx[0], 3);
-                    else
+                    if (!(flat && ctx->bc4_index_mode[c]))
                     {
                         le_write_bits(&compressed_stream, idx[0], 3);
 
@@ -1869,7 +1908,11 @@ static bool bcp_decompress_bc45(bcp_context* ctx, const void* input, size_t inpu
     if (stream.pos + num_channels > stream.length)
         return false;
     for(uint32_t c=0; c<num_channels; ++c)
-        ctx->bc4_index_mode[c] = stream.buffer[stream.pos++]; // flat-index mode, after the seeds (see bc4_index_mode)
+    {
+        const uint8_t flat_byte = stream.buffer[stream.pos++]; // flat-index mode + value, after the seeds (see bc4_index_mode)
+        ctx->bc4_index_mode[c] = flat_byte & 1;
+        ctx->bc4_index_value[c] = (flat_byte >> 1) & 7;
+    }
 
     read_stream_align(&stream, sizeof(uint16_t));
     size_t strips_offset_array_size = sizeof(uint16_t) * (num_strips - 1);
@@ -1939,13 +1982,12 @@ static bool bcp_decompress_bc45(bcp_context* ctx, const void* input, size_t inpu
                 // index payload: the first index in raw 3 bits, then each index xored with its
                 // intra-block prediction, contextual on the 8 x 8 [left][top] matrix
                 // a flat block (identical endpoints, reconstructed exactly like the encoder sees the
-                // source) in mode 1 stores one 3-bit value, expanded to all 16 indices
+                // source) in mode 1 stores no index payload: the header value is expanded to all 16
                 const bool flat = (b->endpoint[0] == b->endpoint[1]);
                 if (flat && ctx->bc4_index_mode[c])
                 {
-                    const uint8_t value = le_read_bits(&compressed_stream, 3);
                     for(uint32_t i=0; i<16; ++i)
-                        idx[i] = value;
+                        idx[i] = ctx->bc4_index_value[c];
                 }
                 else
                 {
@@ -2048,7 +2090,7 @@ static size_t bcp_compress_bc1_impl(bcp_context* ctx, const void* bc1_image, uin
         return 0;
 
     stream.buffer[stream.pos++] = (uint8_t) (ctx->top_table_size - 1); // there is no zero toptable, so minus 1 to fit in a uint8_t
-    stream.buffer[stream.pos++] = ctx->bc1_index_mode; // flat-index mode, written in the alignment padding (see bc1_index_mode)
+    stream.buffer[stream.pos++] = (uint8_t)(ctx->bc1_index_mode | (ctx->bc1_index_value << 1)); // flat-index mode + value, written in the alignment padding (see bc1_index_mode)
     stream_align(&stream, sizeof(uint32_t));
 
     for(uint32_t j=0; j<4; ++j)
@@ -2161,12 +2203,11 @@ static size_t bcp_compress_bc1_impl(bcp_context* ctx, const void* bc1_image, uin
                     }
                 }
 
-                // a flat block (identical endpoints) in mode 1 stores one 2-bit value, expanded to all
-                // 16 indices on decode; otherwise the full reference + mask + differences
+                // a flat block (identical endpoints) in mode 1 stores no index payload: the decoder
+                // expands the header value to all 16 indices; otherwise the full reference + mask +
+                // differences
                 const bool flat = (current->color[0] == current->color[1]);
-                if (flat && ctx->bc1_index_mode)
-                    le_write_bits(&compressed_stream, current->indices & 3, 2);
-                else
+                if (!(flat && ctx->bc1_index_mode))
                 {
                     uint8_t reference = nearest32(ctx->top_table, ctx->top_table_size, current->indices) & 0xff;
 
@@ -2246,7 +2287,11 @@ static bool bcp_decompress_bc1_impl(bcp_context* ctx, const void* input, size_t 
     ctx->top_table_size = (uint32_t)stream.buffer[stream.pos++] + 1;
     if (stream.pos + 1 > stream.length)
         return false;
-    ctx->bc1_index_mode = stream.buffer[stream.pos++]; // flat-index mode, written right after the top-table size (see bc1_index_mode)
+    {
+        const uint8_t flat_byte = stream.buffer[stream.pos++]; // flat-index mode + value, written right after the top-table size (see bc1_index_mode)
+        ctx->bc1_index_mode = flat_byte & 1;
+        ctx->bc1_index_value = (flat_byte >> 1) & 3;
+    }
     read_stream_align(&stream, sizeof(uint32_t));
 
     if (stream.pos + sizeof(uint32_t) + 8 + 8 > stream.length)
@@ -2365,14 +2410,11 @@ static bool bcp_decompress_bc1_impl(bcp_context* ctx, const void* input, size_t 
             }
             
             // a flat block (identical endpoints, reconstructed exactly like the encoder sees the source) in
-            // mode 1 stores one 2-bit value, expanded to all 16 indices; otherwise the full reference +
-            // mask + differences
+            // mode 1 stores no index payload: the header value is expanded to all 16 indices; otherwise
+            // the full reference + mask + differences
             const bool flat = (current->color[0] == current->color[1]);
             if (flat && ctx->bc1_index_mode)
-            {
-                const uint8_t value = le_read_bits(&compressed_stream, 2);
-                current->indices = (uint32_t)value * 0x11111111u;
-            }
+                current->indices = (uint32_t)ctx->bc1_index_value * 0x11111111u;
             else
             {
                 uint32_t reference = le_decode_symbol(&compressed_stream, &ctx->table_reference_model);
