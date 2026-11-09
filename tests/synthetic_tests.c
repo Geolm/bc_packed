@@ -191,6 +191,113 @@ TEST identical_colors(void)
 }
 
 //-----------------------------------------------------------------------------------------------------------------------------
+// Identical endpoints all sharing the same non-zero uniform index word: the whole-image
+// flat-index value (mode 1, value 2) stored in the stream header
+TEST identical_colors_uniform_value(void)
+{
+    bc1_block* image = malloc(TEST_IMAGE_SIZE * sizeof(bc1_block));
+    if (!image)
+        return GREATEST_TEST_RES_FAIL;
+
+    for(uint32_t i=0; i<TEST_IMAGE_SIZE; ++i)
+    {
+        uint16_t c = (uint16_t)(i * 0x1F);
+        image[i] = (bc1_block)
+        {
+            .color = {c, c},
+            .indices = 0x22222222
+        };
+    }
+
+    greatest_test_res res = roundtrip(image, TEST_IMAGE_WIDTH, TEST_IMAGE_HEIGHT);
+    free(image);
+    return res;
+}
+
+//-----------------------------------------------------------------------------------------------------------------------------
+// Identical endpoints with DIVERGING uniform index words (values 0 and 1 on alternating blocks):
+// no single value for the whole image, the flat blocks fall back to the full index encoding (mode 0)
+TEST identical_colors_divergent(void)
+{
+    bc1_block* image = malloc(TEST_IMAGE_SIZE * sizeof(bc1_block));
+    if (!image)
+        return GREATEST_TEST_RES_FAIL;
+
+    for(uint32_t i=0; i<TEST_IMAGE_SIZE; ++i)
+    {
+        uint16_t c = (uint16_t)(i * 0x1F);
+        image[i] = (bc1_block)
+        {
+            .color = {c, c},
+            .indices = (i & 1) ? 0x11111111 : 0x00000000
+        };
+    }
+
+    greatest_test_res res = roundtrip(image, TEST_IMAGE_WIDTH, TEST_IMAGE_HEIGHT);
+    free(image);
+    return res;
+}
+
+//-----------------------------------------------------------------------------------------------------------------------------
+// Identical endpoints with a non-uniform garbage index word on every block: forces mode 0
+TEST identical_colors_garbage(void)
+{
+    bc1_block* image = malloc(TEST_IMAGE_SIZE * sizeof(bc1_block));
+    if (!image)
+        return GREATEST_TEST_RES_FAIL;
+
+    for(uint32_t i=0; i<TEST_IMAGE_SIZE; ++i)
+    {
+        uint16_t c = (uint16_t)(i * 0x1F);
+        image[i] = (bc1_block)
+        {
+            .color = {c, c},
+            .indices = 0xA5A53C3C
+        };
+    }
+
+    greatest_test_res res = roundtrip(image, TEST_IMAGE_WIDTH, TEST_IMAGE_HEIGHT);
+    free(image);
+    return res;
+}
+
+//-----------------------------------------------------------------------------------------------------------------------------
+// Identical endpoints sharing one value, interleaved with non-flat blocks: the flat blocks use the
+// header value, the non-flat ones keep the full index payload
+TEST identical_colors_mixed(void)
+{
+    bc1_block* image = malloc(TEST_IMAGE_SIZE * sizeof(bc1_block));
+    if (!image)
+        return GREATEST_TEST_RES_FAIL;
+
+    for(uint32_t i=0; i<TEST_IMAGE_SIZE; ++i)
+    {
+        uint16_t c = (uint16_t)(i * 0x1F);
+
+        if (i & 1)
+        {
+            image[i] = (bc1_block)
+            {
+                .color = {c, c},
+                .indices = 0x33333333
+            };
+        }
+        else
+        {
+            image[i] = (bc1_block)
+            {
+                .color = {c, (uint16_t)(c + 0x3A)},
+                .indices = 0x0F0F0F0F
+            };
+        }
+    }
+
+    greatest_test_res res = roundtrip(image, TEST_IMAGE_WIDTH, TEST_IMAGE_HEIGHT);
+    free(image);
+    return res;
+}
+
+//-----------------------------------------------------------------------------------------------------------------------------
 // Multi-resolution roundtrip testing with SplitMix32 random blocks
 TEST variable_resolutions_random(void)
 {
@@ -657,6 +764,112 @@ TEST bc45_flat(void)
 }
 
 //-----------------------------------------------------------------------------------------------------------------------------
+// writes all 16 indices of the block equal to [value] in the 48-bit little-endian index field
+static void bc45_set_uniform_indices(bc4_block* b, uint8_t value)
+{
+    uint64_t word = 0;
+    for(uint32_t i=0; i<16; ++i)
+        word |= (uint64_t)value << (3 * i);
+
+    for(uint32_t j=0; j<6; ++j)
+        b->indices[j] = (uint8_t)(word >> (8 * j));
+}
+
+//-----------------------------------------------------------------------------------------------------------------------------
+// one solid block value per channel with a near-uniform 0x33 word (6, 3, 1 repeating as 3-bit
+// values): the non-uniform word forces the full 15-symbol index encoding (mode 0), as bc45_flat
+TEST bc45_flat_uniform(void)
+{
+    bc4_block image[TEST_BC45_BLOCKS];
+    bc4_block image16[TEST_BC45_BLOCKS * 2]; // 16-byte BC5 block: the red bc4_block followed by the green one
+
+    for(uint32_t i=0; i<TEST_BC45_BLOCKS; ++i)
+    {
+        image[i].endpoint[0] = 0xC0;
+        image[i].endpoint[1] = 0xC0;
+        for(uint32_t j=0; j<6; ++j)
+            image[i].indices[j] = 0x33; // 3, 3, 3, 3, ... all 16 indices uniform as 3-bit values
+
+        memcpy(&image16[2 * i], &image[i], sizeof(bc4_block)); // red channel
+
+        // green channel: the same endpoints (XOR of two equal bytes) with a different uniform value
+        image16[2 * i + 1].endpoint[0] = (uint8_t)(image[i].endpoint[0] ^ 0x5A);
+        image16[2 * i + 1].endpoint[1] = (uint8_t)(image[i].endpoint[1] ^ 0x5A);
+        for(uint32_t j=0; j<6; ++j)
+            image16[2 * i + 1].indices[j] = 0x77; // 7, 7, 7, 7, ...
+    }
+
+    return bc45_both(image, image16, TEST_BC45_WIDTH, TEST_BC45_HEIGHT);
+}
+
+//-----------------------------------------------------------------------------------------------------------------------------
+// one solid block value per channel with a TRULY uniform index word (all 16 indices the same):
+// selects the flat-index mode 1, the value stored once per channel in the stream header
+TEST bc45_flat_uniform_word(void)
+{
+    bc4_block* image = malloc(TEST_BC45_BLOCKS * sizeof(bc4_block));
+    bc4_block* image16 = malloc(TEST_BC45_BLOCKS * 2 * sizeof(bc4_block)); // 16-byte BC5 block: the red bc4_block followed by the green one
+    if (!image || !image16)
+    {
+        free(image);
+        free(image16);
+        return GREATEST_TEST_RES_FAIL;
+    }
+
+    for(uint32_t i=0; i<TEST_BC45_BLOCKS; ++i)
+    {
+        image[i].endpoint[0] = 0xC0;
+        image[i].endpoint[1] = 0xC0;
+        bc45_set_uniform_indices(&image[i], 3);
+
+        memcpy(&image16[2 * i], &image[i], sizeof(bc4_block)); // red channel
+
+        // green channel: the same endpoints with a different uniform value
+        image16[2 * i + 1].endpoint[0] = (uint8_t)(0xC0 ^ 0x5A);
+        image16[2 * i + 1].endpoint[1] = (uint8_t)(0xC0 ^ 0x5A);
+        bc45_set_uniform_indices(&image16[2 * i + 1], 6);
+    }
+
+    greatest_test_res res = bc45_both(image, image16, TEST_BC45_WIDTH, TEST_BC45_HEIGHT);
+    free(image);
+    free(image16);
+    return res;
+}
+
+//-----------------------------------------------------------------------------------------------------------------------------
+// identical endpoints but DIVERGING uniform index values (3 / 5 alternating per block): the channel
+// falls back to the full 15-symbol index encoding (mode 0)
+TEST bc45_flat_divergent(void)
+{
+    bc4_block* image = malloc(TEST_BC45_BLOCKS * sizeof(bc4_block));
+    bc4_block* image16 = malloc(TEST_BC45_BLOCKS * 2 * sizeof(bc4_block)); // 16-byte BC5 block: the red bc4_block followed by the green one
+    if (!image || !image16)
+    {
+        free(image);
+        free(image16);
+        return GREATEST_TEST_RES_FAIL;
+    }
+
+    for(uint32_t i=0; i<TEST_BC45_BLOCKS; ++i)
+    {
+        image[i].endpoint[0] = 0xC0;
+        image[i].endpoint[1] = 0xC0;
+        bc45_set_uniform_indices(&image[i], (uint8_t)((i & 1) ? 5 : 3));
+
+        memcpy(&image16[2 * i], &image[i], sizeof(bc4_block)); // red channel
+
+        image16[2 * i + 1].endpoint[0] = (uint8_t)(0xC0 ^ 0x5A);
+        image16[2 * i + 1].endpoint[1] = (uint8_t)(0xC0 ^ 0x5A);
+        bc45_set_uniform_indices(&image16[2 * i + 1], (uint8_t)((i & 1) ? 7 : 1));
+    }
+
+    greatest_test_res res = bc45_both(image, image16, TEST_BC45_WIDTH, TEST_BC45_HEIGHT);
+    free(image);
+    free(image16);
+    return res;
+}
+
+//-----------------------------------------------------------------------------------------------------------------------------
 // alternating endpoint pairs and index patterns across the block grid
 TEST bc45_checkerboard(void)
 {
@@ -872,6 +1085,30 @@ TEST bc3_flat(void)
 
 
 //-----------------------------------------------------------------------------------------------------------------------------
+// one solid color (non-flat endpoints, color half in mode 0) + one solid alpha with UNIFORM indices
+// (flat endpoints, alpha half in the single-index mode 1): the two halves take different modes in
+// one stream, unlike bc3_flat whose non-uniform alpha indices force mode 0 in both halves
+TEST bc3_flat_uniform(void)
+{
+    bc3_block image[TEST_BC45_BLOCKS];
+
+    for(uint32_t i=0; i<TEST_BC45_BLOCKS; ++i)
+    {
+        image[i].color.color[0] = red;
+        image[i].color.color[1] = cyan;
+        image[i].color.indices = 0x33333333;
+
+        image[i].alpha.endpoint[0] = 0xC0;
+        image[i].alpha.endpoint[1] = 0xC0;
+        for(uint32_t j=0; j<6; ++j)
+            image[i].alpha.indices[j] = 0x33; // 3, 3, 3, 3, ... all 16 indices uniform as 3-bit values
+    }
+
+    return bc3_roundtrip(image, TEST_BC45_WIDTH, TEST_BC45_HEIGHT);
+}
+
+
+//-----------------------------------------------------------------------------------------------------------------------------
 // alternating color and alpha patterns across the block grid
 TEST bc3_checkerboard(void)
 {
@@ -973,10 +1210,14 @@ SUITE(suite_synthetic)
     (void)flat;
     (void)checkerboard;
     (void)bc45_flat;
+    (void)bc45_flat_uniform;
+    (void)bc45_flat_uniform_word;
+    (void)bc45_flat_divergent;
     (void)bc45_checkerboard;
     (void)bc45_gradient;
     (void)bc45_random_splitmix32;
     (void)bc3_flat;
+    (void)bc3_flat_uniform;
     (void)bc3_checkerboard;
     (void)bc3_gradient;
     (void)bc3_random_splitmix32;
@@ -984,6 +1225,10 @@ SUITE(suite_synthetic)
     (void)random_splitmix32;
     (void)color0_le_color1;
     (void)identical_colors;
+    (void)identical_colors_uniform_value;
+    (void)identical_colors_divergent;
+    (void)identical_colors_garbage;
+    (void)identical_colors_mixed;
     (void)strip_uniform_colors;
     (void)all_distinct_indices;
     (void)row_varying_colors;
@@ -1000,15 +1245,23 @@ SUITE(suite_synthetic)
     RUN_TEST(gradient);
     RUN_TEST(random_splitmix32);
     RUN_TEST(bc45_flat);
+    RUN_TEST(bc45_flat_uniform);
+    RUN_TEST(bc45_flat_uniform_word);
+    RUN_TEST(bc45_flat_divergent);
     RUN_TEST(bc45_checkerboard);
     RUN_TEST(bc45_gradient);
     RUN_TEST(bc45_random_splitmix32);
     RUN_TEST(bc3_flat);
+    RUN_TEST(bc3_flat_uniform);
     RUN_TEST(bc3_checkerboard);
     RUN_TEST(bc3_gradient);
     RUN_TEST(bc3_random_splitmix32);
     RUN_TEST(color0_le_color1);
     RUN_TEST(identical_colors);
+    RUN_TEST(identical_colors_uniform_value);
+    RUN_TEST(identical_colors_divergent);
+    RUN_TEST(identical_colors_garbage);
+    RUN_TEST(identical_colors_mixed);
     RUN_TEST(strip_uniform_colors);
     RUN_TEST(variable_resolutions_random);
     RUN_TEST(all_distinct_indices);
