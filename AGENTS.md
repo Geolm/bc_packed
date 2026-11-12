@@ -43,11 +43,15 @@ Don't modify this file.
 - Never sacrifice correctness or maintainability for unmeasured optimization.
 - Do not perform or interpret GPU profiling while the LLM is running. Request that the user collect and provide a standalone GPU profile instead.
 
-## Build & Test
+## Build
 - Config: `cmake -B build -S . -DCMAKE_BUILD_TYPE=Release`
 - Build: `cmake --build build`
 - Clean: `rm -rf build/`
 - Test: `./build/unit_tests`
+
+## Test
+- Debug issues directly in the actual project. Do not create separate programs to reproduce or debug its implementation; small standalone programs are allowed only to independently validate or inspect the project's output.
+- Use the existing code, build system, debugger, and runtime to identify and fix the root cause.
 - Every new feature requires test. Adding new tests is allowed.
 - Never modify/weaken tests to make them pass.
 - Verify tests actually run before claiming success.
