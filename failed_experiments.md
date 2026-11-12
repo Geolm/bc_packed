@@ -1058,6 +1058,40 @@ both are unmeasured, and the BC5 negative above is the stronger argument against
 
 ---
 
+## 24. Stream-format validation from the plan's "16 color models" (the 18-model correction)
+
+**Idea:** the header-compression plan describes the BC1 stream as "16 color models ... 19 models
+total", and its H1 validation requires the top-table byte *multiset* to be identical between the
+baseline and new streams (only the order may change). Built a scratch driver (session scratchpad,
+not the repo) that walks 19 model headers, then reads the top-table size byte and hashes the
+table entries, run over the whole suite with a baseline and a new build.
+
+**Result:** the driver reported changed table multisets on 7 of the 74 BC1 images, and the
+baseline stream appeared to hold a 16-entry table with an 8-symbol reference model while the
+in-process encoder state said 255 entries — an apparent format corruption that no amount of
+source reading reconciled (the encoder/decoder agree, every round-trip passes, the suite is
+green).
+
+**Root cause:** the stream actually carries **18** color models, not 16. The encoder and decoder
+loops store per endpoint red×3 + green×3 + blue×3 (three context buckets each) = 9 per endpoint
+× 2 endpoints = 18, then reference + mask + difference = **21 models total**. The "16" in the
+plan (and in older README / code comments) is an arithmetic slip; the scratch driver inherited
+it, so its walk ended 13 bytes early: its "reference model" was really the 11th color model, its
+"table size byte" was the mask model's count byte (0x0f → "16 entries"), and the "table" it
+hashed was the difference model's alphabet — plausible-looking garbage that differs between
+builds only where the 255-byte header shrink shifts the window. With the corrected walk (21
+models) **all 74 BC1 images have byte-identical table multisets** and identical per-component
+payload bits, and the BC4/5 "diffs" were the same misparse (those formats have no top table;
+their component-bit check had already passed for every image).
+
+**Kept:** the 18 / 21 counts are corrected in the README and the code comments. Any tool that
+parses the stream (the plan's validation, the tile plan's encoder trials, future stream
+differs) must walk 21 models for BC1 — the model headers are self-describing, but a wrong model
+count does not fail loudly: the drift lands mid-alphabet and reads plausible garbage until
+something compares against ground truth.
+
+---
+
 ## Open thread (not a failed experiment, just a lead)
 
 The better-VQ-codebook lead is **resolved and closed**: exp. 13 measured the spatially-smooth

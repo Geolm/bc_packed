@@ -179,16 +179,18 @@ TEST test_all_images_in_folder(const char *dir_path)
 
 
 //-----------------------------------------------------------------------------------------------------------------------------
-// BC4 / BC5 image roundtrips on the hardcoded sets of images/bc4 (AO maps) and images/bc5
-// (normal maps, red + green channels). the filenames are hardcoded, the folder is not scanned,
-// the per-image ratios are logged to the hourly CSV and printed to stdout: the average must
-// stay above 1:1
+// BC4 / BC5 image roundtrips on the hardcoded sets of images/bc4 (AO, roughness and atlas maps)
+// and images/bc5 (normal maps, red + green channels). the filenames are hardcoded, the folder is
+// not scanned, the per-image ratios are logged to the hourly CSV and printed to stdout: the
+// average must stay above 1.05
 static const char* const bc4_image_filenames[] =
 {
     "images/bc4/grey_roof_tiles_02_ao_1k.png",
     "images/bc4/patterned_cobblestone_ao_1k.png",
     "images/bc4/red_brick_ao_1k.png",
-    "images/bc4/rough_wood_ao_1k.png"
+    "images/bc4/rough_wood_ao_1k.png",
+    "images/bc4/Metal002_4K_Roughness.png",
+    "images/bc4/font_atlas.png"
 };
 
 static const char* const bc5_image_filenames[] =
@@ -203,7 +205,8 @@ static greatest_test_res run_bc_image_suite(bool bc5)
 {
     const char* format = bc5 ? "bc5" : "bc4";
     const char* const* filenames = bc5 ? bc5_image_filenames : bc4_image_filenames;
-    const uint32_t num_filenames = sizeof(bc4_image_filenames) / sizeof(bc4_image_filenames[0]);
+    const uint32_t num_filenames = bc5 ? sizeof(bc5_image_filenames) / sizeof(bc5_image_filenames[0])
+                                       : sizeof(bc4_image_filenames) / sizeof(bc4_image_filenames[0]);
 
     bcp_context* ctx = bcp_init(NULL);
     ASSERT(ctx != NULL);

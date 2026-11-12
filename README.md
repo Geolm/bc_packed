@@ -20,7 +20,7 @@ The compressor is CPU-side and can use significantly more computation than the d
 | Block type |  Average compression from the image suite | 
 |:-----: | :------------: 
 | BC1 | 1.49:1  
-| BC4 | 1.14:1
+| BC4 | 1.28:1
 | BC5 | 1.1:1  
 
 All compression ratio are better than zlib.
@@ -330,7 +330,7 @@ Everything is validated byte-exact over all 64 tiles, on CPU and GPU:
 * GPU roundtrips: the `bcp_decompress_bc4` / `bcp_decompress_bc5` Metal kernels decode the brick AO / normal maps (1024×1024, `images/bc4` / `images/bc5`) and the result is verified byte-identical to the stb-built textures, the same way the BC1 kernel is tested.
 
 * CPU: 8 synthetic 256×256 roundtrips (flat, checkerboard, gradient, SplitMix32 random, each as BC4 and BC5): the random pattern forces the raw-mode fallback and the full 64-context usage.
-* CPU: 4 AO maps (`images/bc4`) and 4 normal maps (`images/bc5`), 1024×1024, converted per block with stb_dxt: the per-image ratio is printed to stdout (no CSV) and the suite average must stay above 1:1. Measured: **1.1351:1** average for BC4 (1.0921 – 1.1592 per image) and **1.0985:1** for BC5 (1.0630 – 1.1339 per image). BC5 compression ratio looks modest but zlib only achieves 1.010563:1 for the same images.
+* CPU: 6 maps (`images/bc4`: 4 AO maps, a 4096×4096 roughness map, a 1748×1748 font atlas) and 4 normal maps (`images/bc5`), converted per block with stb_dxt: the per-image ratio is printed to stdout and logged to the hourly CSV, and the suite average must stay above 1.05. Measured: **1.2839:1** average for BC4 (1.0921 – 1.9432 per image, 1.9432 being the mostly-flat font atlas) and **1.0985:1** for BC5 (1.0630 – 1.1339 per image). BC5 compression ratio looks modest but zlib only achieves 1.010563:1 for the same images.
 
 The 8-bit formats leave less headroom than BC1: the indices of these maps sit close to 3 near-uniform bits each, so most of the gain comes from the endpoint deltas.
 
