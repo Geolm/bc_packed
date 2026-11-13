@@ -16,12 +16,13 @@ Don't modify this file.
 - Keep concise code clear: no cryptic names, excessive compression, clever tricks, or obfuscation.
 - Before adding code, reuse existing logic, remove redundancy, or simplify the design. Prefer deleting code over adding abstractions.
 
-## Comments
-- Do not write descriptive comments in .c implementation files. The code must explain itself through clear naming and straightforward logic.
-- Do not add comments that restate what the code does, explain obvious implementation details, or introduce sections of code.
-- Comments are allowed only when necessary to explain non-obvious reasoning, tricky algorithms, constraints, or workarounds.
-- API documentation belongs in the .h header files. Document public functions, types, and parameters there when useful.
-- Do not duplicate header documentation in the corresponding .c file.
+## Feature efficiency = (Expected benefit % / Added LoC) × 1,000
+* Reject low-ROI changes, even when technically beneficial.
+* Prefer skipping a feature over significantly increasing code size for negligible gains.
+* Every additional line of code must justify its maintenance and readability cost.
+* Avoid speculative features, unnecessary abstractions, and premature generalization.
+* Before implementation, report the expected benefit, estimated LoC, and feature efficiency.
+* If the ROI is poor, recommend not implementing the change.
 
 ## Memory
 - Libraries: no `malloc`/`free`; prefer caller-provided buffers. If a library needs more than the caller-provided buffer, return an error or a required-size value; don't allocate behind the caller's back.
@@ -42,6 +43,13 @@ Don't modify this file.
 - Optimize only based on measured/profiled improvements; no speculative complexity.
 - Never sacrifice correctness or maintainability for unmeasured optimization.
 - Do not perform or interpret GPU profiling while the LLM is running. Request that the user collect and provide a standalone GPU profile instead.
+
+## Comments
+- Do not write descriptive comments in .c implementation files. The code must explain itself through clear naming and straightforward logic.
+- Do not add comments that restate what the code does, explain obvious implementation details, or introduce sections of code.
+- Comments are allowed only when necessary to explain non-obvious reasoning, tricky algorithms, constraints, or workarounds.
+- API documentation belongs in the .h header files. Document public functions, types, and parameters there when useful.
+- Do not duplicate header documentation in the corresponding .c file.
 
 ## Build
 - Config: `cmake -B build -S . -DCMAKE_BUILD_TYPE=Release`
