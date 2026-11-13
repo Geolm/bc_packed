@@ -28,8 +28,9 @@
 //   BC1       [19 static models][top table size u8][flat index mode + value u8][4-align][strip seed u32]
 //             [strip predictor u64][strip dict enable u64][top table u32s][2-align][63 strip offsets u16,
 //             deltas in dword units][4-align][strip bitstreams]
-//   BC4 / BC5 [2 endpoint models per channel][64 index models per channel][strip seed, 2 bytes per channel]
-//             [flat index mode + value, 1 byte per channel][2-align][63 strip offsets u16, deltas in dword units]
+//   BC4 / BC5 per channel: [2 endpoint models][endpoint MTF-8 model (9 symbols)][first-index model (8
+//             symbols)][64 index models] then [strip seed, 2 bytes per channel][flat index mode + value
+//             + MTF-8 enable, 1 byte per channel][2-align][63 strip offsets u16, deltas in dword units]
 //             [4-align][strip bitstreams]
 //
 // The flat index mode (bit 0 of the mode + value byte, the value in the upper bits) is decided once per
@@ -37,6 +38,14 @@
 // endpoints and every such block holds the same uniform index value (2-bit for BC1, 3-bit per channel
 // for BC4 / BC5). A block with identical endpoints then stores no index payload: the header value is
 // expanded to all 16 indices, instead of the full index payload.
+//
+// The endpoint MTF-8 enable (bit 4 of the mode + value byte) is priced per channel: when enabled, each
+// block's endpoints are written as one 9-symbol MTF rank (0..7 = the (endpoint0, endpoint1) pair at
+// that position of the per-tile 8-entry move-to-front list, 8 = escape to the two endpoint deltas,
+// the list updated in either case, cleared per tile); when disabled the two endpoint deltas are
+// written as usual and the MTF model in the header is a dummy the decoder never reads from. The
+// first index of a non-flat block is the symbol of the per-channel 8-symbol first-index model,
+// instead of the raw 3-bit field.
 //
 // On a corrupted stream the decode runs to completion and the output is garbage, mirroring the
 // CPU version which only reports the failure after the whole strip was decoded. A valid stream
@@ -612,6 +621,43 @@ uint8_t bc4_index_context(uint8_t left, uint8_t top)
     return (uint8_t)(left * BC4_INDEX_DIM + top);
 }
 
+// mirror of mtf_touch (src/bc_packed.c): move [pair] to the front of the 8-entry endpoint-pair
+// MTF list, inserting it if new; the list holds distinct pairs, the oldest one is dropped once
+// it is full. [list] must hold the 8 entries, [count] the number of valid ones
+void mtf_touch(thread uint16_t* list, thread uint* count, uint16_t pair)
+{
+    uint at = 0;
+    bool found = false;
+    for (uint i = 0; i < *count; ++i)
+    {
+        if (list[i] == pair)
+        {
+            at = i;
+            found = true;
+            break;
+        }
+    }
+
+    if (found)
+    {
+        for (uint j = at; j > 0; --j)
+            list[j] = list[j - 1];
+    }
+    else if (*count < 8)
+    {
+        for (uint j = *count; j > 0; --j)
+            list[j] = list[j - 1];
+        (*count)++;
+    }
+    else
+    {
+        for (uint j = 7; j > 0; --j)
+            list[j] = list[j - 1];
+    }
+
+    list[0] = pair;
+}
+
 template <uint NumChannels>
 void bc45_decode_strip(const device uint8_t* input,
                        device uint8_t* output,
@@ -633,9 +679,12 @@ void bc45_decode_strip(const device uint8_t* input,
     output += (uint64_t)grid_pos.y * image_size;
 
     //-------------------------------------------------------------------------------------------------------------------------
-    // load the static models: per channel, the 2 endpoint models (256 symbols) then the 64
-    // compact index models (8 symbols)
+    // load the static models: per channel, the 2 endpoint models (256 symbols), the endpoint
+    // MTF-8 model (9 symbols, a dummy 1-symbol model when the channel's MTF is disabled), the
+    // first-index model (8 symbols) then the 64 compact index models (8 symbols)
     model_t endpoint[NumChannels][2];
+    model_t mtf[NumChannels];
+    model8_t first_index[NumChannels];
     model8_t index[NumChannels][BC4_INDEX_CONTEXTS];
 
     thread uint64_t pos = 0;
@@ -644,6 +693,12 @@ void bc45_decode_strip(const device uint8_t* input,
         for (uint e = 0; e < 2; ++e)
             if (!load_model(input, length, &pos, &endpoint[c][e]))
                 return;
+
+        if (!load_model(input, length, &pos, &mtf[c]))
+            return;
+
+        if (!load_model8(input, length, &pos, &first_index[c]))
+            return;
 
         for (uint i = 0; i < BC4_INDEX_CONTEXTS; ++i)
             if (!load_model8(input, length, &pos, &index[c][i]))
@@ -661,17 +716,20 @@ void bc45_decode_strip(const device uint8_t* input,
             seed[c][e] = input[pos++];
     }
 
-    // flat-index mode + value: one byte per channel (mode | value << 1), after the seeds, before the 2-align
+    // flat-index mode + value + endpoint MTF-8 enable: one byte per channel
+    // (mode | value << 1 | mtf << 4), after the seeds, before the 2-align
     if (pos + NumChannels > length)
         return;
 
     bool flat_mode[NumChannels];
     uint8_t flat_value[NumChannels];
+    bool mtf_enable[NumChannels];
     for (uint c = 0; c < NumChannels; ++c)
     {
         uint8_t flat_byte = input[pos++];
         flat_mode[c] = (flat_byte & 1) != 0;
         flat_value[c] = (flat_byte >> 1) & 7;
+        mtf_enable[c] = (flat_byte >> 4) != 0;
     }
 
     //-------------------------------------------------------------------------------------------------------------------------
@@ -715,6 +773,12 @@ void bc45_decode_strip(const device uint8_t* input,
         }
     }
 
+    // the MTF list is cleared per tile: one thread decodes one tile, so this is the whole state
+    uint16_t mtf_pair[2][8];
+    uint mtf_count[2];
+    for (uint c = 0; c < NumChannels; ++c)
+        mtf_count[c] = 0;
+
     const tile_bounds tb = tile_bounds_get(strip_id, width_blocks, height_blocks);
     const uint tile_width = tb.x1 - tb.x0;
 
@@ -744,13 +808,41 @@ void bc45_decode_strip(const device uint8_t* input,
                     top_e[c][1] = (uint8_t)((top >> 8) & 0xFF);
                 }
 
-                // endpoint payload: the two wrapped deltas against the strip-chain predictor
+                // endpoint payload: with MTF, the 9-symbol rank of the block's endpoint pair
+                // (0..7 = the pair at that list position, 8 = escape to the two wrapped deltas
+                // against the strip-chain predictor, the list updated in either case); without
+                // MTF, the two deltas only
                 uint8_t e[2];
-                for (uint j = 0; j < 2; ++j)
+                if (mtf_enable[c])
                 {
-                    uint8_t pred = bc4_endpoint_predict(first_row, row_start, prev_e[c][j], top_e[c][j], top_prev_e[c][j]);
+                    uint8_t rank = decode_symbol(&compressed_stream, &mtf[c]);
 
-                    e[j] = (uint8_t)(pred + decode_symbol(&compressed_stream, &endpoint[c][j]));
+                    if (rank < 8)
+                    {
+                        uint16_t pair = mtf_pair[c][rank];
+                        e[0] = (uint8_t)(pair & 0xFF);
+                        e[1] = (uint8_t)(pair >> 8);
+                    }
+                    else
+                    {
+                        for (uint j = 0; j < 2; ++j)
+                        {
+                            uint8_t pred = bc4_endpoint_predict(first_row, row_start, prev_e[c][j], top_e[c][j], top_prev_e[c][j]);
+
+                            e[j] = (uint8_t)(pred + decode_symbol(&compressed_stream, &endpoint[c][j]));
+                        }
+                    }
+
+                    mtf_touch(mtf_pair[c], &mtf_count[c], (uint16_t)(((uint16_t)e[1] << 8) | (uint16_t)e[0]));
+                }
+                else
+                {
+                    for (uint j = 0; j < 2; ++j)
+                    {
+                        uint8_t pred = bc4_endpoint_predict(first_row, row_start, prev_e[c][j], top_e[c][j], top_prev_e[c][j]);
+
+                        e[j] = (uint8_t)(pred + decode_symbol(&compressed_stream, &endpoint[c][j]));
+                    }
                 }
 
                 // a flat block (identical endpoints, reconstructed exactly like the encoder sees the
@@ -762,9 +854,9 @@ void bc45_decode_strip(const device uint8_t* input,
                 }
                 else
                 {
-                    // index payload: the first index in raw 3 bits, then each index xored with its
-                    // intra-block prediction, contextual on the 8 x 8 [left][top] matrix
-                    idx[0] = bs_read_bits(&compressed_stream, 3);
+                    // index payload: the first index with its 8-symbol model, then each index
+                    // xored with its intra-block prediction, contextual on the 8 x 8 [left][top] matrix
+                    idx[0] = decode_symbol8(&compressed_stream, &first_index[c]);
 
                     for (uint i = 1; i < 16; ++i)
                     {
