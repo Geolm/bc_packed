@@ -1196,6 +1196,152 @@ TEST bc45_per_channel_content(void)
     return res;
 }
 
+//-----------------------------------------------------------------------------------------------------------------------------
+// index words cycle through 8 distinct values in block order (a tile's 8-block rows cover the
+// whole period) and endpoint pairs cycle through four: nearly every block of a tile is a
+// dictionary hit. the control keeps the same endpoint pairs but uses all-distinct index
+// words: repeated words must compress, so the cycling image's stream is strictly shorter.
+// both images round-trip byte-exact, in BC4 and BC5
+TEST bc45_repeated_index_words(void)
+{
+    bc4_block image[TEST_BC45_BLOCKS];
+    bc4_block image16[TEST_BC45_BLOCKS * 2];
+    bc4_block distinct[TEST_BC45_BLOCKS];
+    uint32_t rng_state = 0x2A6E9C4Du;
+
+    for(uint32_t i=0; i<TEST_BC45_BLOCKS; ++i)
+    {
+        uint32_t t = i & 7;
+
+        image[i].endpoint[0] = (uint8_t)(0x10 + (i % 4) * 0x20);
+        image[i].endpoint[1] = (uint8_t)(0x08 + (i % 4) * 0x10);
+
+        uint64_t v = 0;
+        for(uint32_t k=0; k<16; ++k)
+            v |= (uint64_t)((t * 3 + k) & 7) << (3 * k);
+        for(uint32_t j=0; j<6; ++j)
+            image[i].indices[j] = (uint8_t)(v >> (8 * j));
+
+        // control: the same endpoint pairs, all-distinct index words
+        memcpy(distinct[i].endpoint, image[i].endpoint, sizeof(distinct[i].endpoint));
+        uint64_t w = 0;
+        for(uint32_t k=0; k<16; ++k)
+            w |= (uint64_t)(splitmix32(&rng_state) & 7) << (3 * k);
+        for(uint32_t j=0; j<6; ++j)
+            distinct[i].indices[j] = (uint8_t)(w >> (8 * j));
+
+        memcpy(&image16[2 * i], &image[i], sizeof(bc4_block)); // red channel
+        image16[2 * i + 1].endpoint[0] = (uint8_t)(image[i].endpoint[0] ^ 0x5A);
+        image16[2 * i + 1].endpoint[1] = (uint8_t)(image[i].endpoint[1] ^ 0x5A);
+        for(uint32_t j=0; j<6; ++j)
+            image16[2 * i + 1].indices[j] = (uint8_t)(image[i].indices[j] ^ 0x38);
+    }
+
+    greatest_test_res res = bc45_roundtrip(image, TEST_BC45_WIDTH, TEST_BC45_HEIGHT, 1);
+    if (res != GREATEST_TEST_RES_PASS)
+        return res;
+    res = bc45_roundtrip(image16, TEST_BC45_WIDTH, TEST_BC45_HEIGHT, 2);
+    if (res != GREATEST_TEST_RES_PASS)
+        return res;
+    res = bc45_roundtrip(distinct, TEST_BC45_WIDTH, TEST_BC45_HEIGHT, 1);
+    if (res != GREATEST_TEST_RES_PASS)
+        return res;
+
+    size_t repeated_length = bc45_stream_length(image, TEST_BC45_WIDTH, TEST_BC45_HEIGHT, 1);
+    size_t distinct_length = bc45_stream_length(distinct, TEST_BC45_WIDTH, TEST_BC45_HEIGHT, 1);
+    ASSERT(repeated_length != 0 && distinct_length != 0);
+    ASSERT(repeated_length < distinct_length);
+
+    PASS();
+}
+
+//-----------------------------------------------------------------------------------------------------------------------------
+// all-distinct index words (splitmix32 over 4096 blocks): no word repeats within any tile,
+// so the dictionary must stay gated off. the round-trip must stay byte-exact, in BC4 and BC5
+TEST bc45_distinct_index_words(void)
+{
+    bc4_block image[TEST_BC45_BLOCKS];
+    bc4_block image16[TEST_BC45_BLOCKS * 2];
+    uint32_t rng_state = 0x51B7A02Fu;
+
+    for(uint32_t i=0; i<TEST_BC45_BLOCKS; ++i)
+    {
+        image[i].endpoint[0] = (uint8_t)(0x10 + (i % 4) * 0x20);
+        image[i].endpoint[1] = (uint8_t)(0x08 + (i % 4) * 0x10);
+
+        uint64_t v = 0;
+        for(uint32_t k=0; k<16; ++k)
+            v |= (uint64_t)(splitmix32(&rng_state) & 7) << (3 * k);
+        for(uint32_t j=0; j<6; ++j)
+            image[i].indices[j] = (uint8_t)(v >> (8 * j));
+
+        memcpy(&image16[2 * i], &image[i], sizeof(bc4_block)); // red channel
+        image16[2 * i + 1].endpoint[0] = (uint8_t)(image[i].endpoint[0] ^ 0x5A);
+        image16[2 * i + 1].endpoint[1] = (uint8_t)(image[i].endpoint[1] ^ 0x5A);
+        for(uint32_t j=0; j<6; ++j)
+            image16[2 * i + 1].indices[j] = (uint8_t)(image[i].indices[j] ^ 0x38);
+    }
+
+    return bc45_both(image, image16, TEST_BC45_WIDTH, TEST_BC45_HEIGHT);
+}
+
+//-----------------------------------------------------------------------------------------------------------------------------
+// every block is flat (identical endpoints) with one of four non-uniform index words
+// cycling: the non-uniform words force flat-index mode 0 (the full 15-symbol payload), and
+// the repeating words make nearly every block a dictionary hit. the control uses
+// all-distinct non-uniform words: repeated words must compress, so the cycling image's
+// stream is strictly shorter. both images round-trip byte-exact, in BC4 and BC5
+TEST bc45_flat_repeated_words(void)
+{
+    bc4_block image[TEST_BC45_BLOCKS];
+    bc4_block image16[TEST_BC45_BLOCKS * 2];
+    bc4_block distinct[TEST_BC45_BLOCKS];
+    uint32_t rng_state = 0x9E34F6C8u;
+
+    for(uint32_t i=0; i<TEST_BC45_BLOCKS; ++i)
+    {
+        image[i].endpoint[0] = 0x40;
+        image[i].endpoint[1] = 0x40;
+
+        uint64_t v = 0;
+        for(uint32_t k=0; k<16; ++k)
+            v |= (uint64_t)(((i & 7) * 3 + k) & 7) << (3 * k);
+        for(uint32_t j=0; j<6; ++j)
+            image[i].indices[j] = (uint8_t)(v >> (8 * j));
+
+        // control: the same flat endpoints, all-distinct index words
+        memcpy(distinct[i].endpoint, image[i].endpoint, sizeof(distinct[i].endpoint));
+        uint64_t w = 0;
+        for(uint32_t k=0; k<16; ++k)
+            w |= (uint64_t)(splitmix32(&rng_state) & 7) << (3 * k);
+        for(uint32_t j=0; j<6; ++j)
+            distinct[i].indices[j] = (uint8_t)(w >> (8 * j));
+
+        memcpy(&image16[2 * i], &image[i], sizeof(bc4_block)); // red channel
+        image16[2 * i + 1].endpoint[0] = (uint8_t)(image[i].endpoint[0] ^ 0x5A);
+        image16[2 * i + 1].endpoint[1] = (uint8_t)(image[i].endpoint[1] ^ 0x5A);
+        for(uint32_t j=0; j<6; ++j)
+            image16[2 * i + 1].indices[j] = (uint8_t)(image[i].indices[j] ^ 0x38);
+    }
+
+    greatest_test_res res = bc45_roundtrip(image, TEST_BC45_WIDTH, TEST_BC45_HEIGHT, 1);
+    if (res != GREATEST_TEST_RES_PASS)
+        return res;
+    res = bc45_roundtrip(image16, TEST_BC45_WIDTH, TEST_BC45_HEIGHT, 2);
+    if (res != GREATEST_TEST_RES_PASS)
+        return res;
+    res = bc45_roundtrip(distinct, TEST_BC45_WIDTH, TEST_BC45_HEIGHT, 1);
+    if (res != GREATEST_TEST_RES_PASS)
+        return res;
+
+    size_t repeated_length = bc45_stream_length(image, TEST_BC45_WIDTH, TEST_BC45_HEIGHT, 1);
+    size_t distinct_length = bc45_stream_length(distinct, TEST_BC45_WIDTH, TEST_BC45_HEIGHT, 1);
+    ASSERT(repeated_length != 0 && distinct_length != 0);
+    ASSERT(repeated_length < distinct_length);
+
+    PASS();
+}
+
 
 //-----------------------------------------------------------------------------------------------------------------------------
 // helper function to validate a bc3 roundtrip: the compressed stream fits the documented
@@ -1396,6 +1542,9 @@ SUITE(suite_synthetic)
     RUN_TEST(bc45_distinct_endpoint_pairs);
     RUN_TEST(bc45_mixed_endpoint_pairs);
     RUN_TEST(bc45_per_channel_content);
+    RUN_TEST(bc45_repeated_index_words);
+    RUN_TEST(bc45_distinct_index_words);
+    RUN_TEST(bc45_flat_repeated_words);
     RUN_TEST(bc3_flat);
     RUN_TEST(bc3_flat_uniform);
     RUN_TEST(bc3_checkerboard);

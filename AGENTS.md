@@ -48,6 +48,7 @@ Don't modify this file.
 - Do not write descriptive comments in .c implementation files. The code must explain itself through clear naming and straightforward logic.
 - Do not add comments that restate what the code does, explain obvious implementation details, or introduce sections of code.
 - Comments are allowed only when necessary to explain non-obvious reasoning, tricky algorithms, constraints, or workarounds.
+- Keep comments short and local. A comment explains at most one branch and sits on it: on the branch's `if` / `else` line or its first statement, at most 2 lines. A comment above a construct must never describe more than the line it sits on; a self-evident branch gets no comment.
 - API documentation belongs in the .h header files. Document public functions, types, and parameters there when useful.
 - Do not duplicate header documentation in the corresponding .c file.
 

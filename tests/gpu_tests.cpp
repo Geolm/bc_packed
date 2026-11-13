@@ -151,6 +151,12 @@ static void metal_state_release(metal_state* state)
 // null; on failure it prints the diagnostic and releases whatever was created, returning false
 static bool metal_state_init(metal_state* state, const char* kernel_name)
 {
+    // opt-in to the Metal validation layer: running the suite with METAL_VALIDATION=1 in the
+    // environment sets MTL_DEBUG_LAYER before the first device creation, where the framework
+    // reads it
+    if (getenv("METAL_VALIDATION") != nullptr)
+        setenv("MTL_DEBUG_LAYER", "1", 1);
+
     state->device = MTL::CreateSystemDefaultDevice();
     if (state->device == nullptr)
     {

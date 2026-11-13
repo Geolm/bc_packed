@@ -13,7 +13,7 @@ extern "C" {
 //----------------------------------------------------------------------------------------------------------------------------
 // version
 #define BC_PACKED_MAJOR 2
-#define BC_PACKED_MINOR 0
+#define BC_PACKED_MINOR 1
 #define BC_PACKED_PATCH 0
 
 

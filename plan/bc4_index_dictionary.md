@@ -1,6 +1,9 @@
 # Plan: BC4/BC5 per-tile index-word dictionary (MTF, exact match)
 
-Status: design approved by the user, no code written.
+Status: implemented and verified (2026-11-13). 51/51 tests pass (Release + ASan), GPU validation
+layer clean (`METAL_VALIDATION=1`), font_atlas 682,144 B → 635,504 B (2.4040 vs the 2.406 gate),
+BC4 suite average 1.3608, the five real-content maps +12/+16 B (header slot only). Decode
+throughput and encode wall time measured within the §6 gates on this machine.
 
 Target: `font_atlas.png`, the only BC4 content class where bc_packed trails `zip -9` (596,663 B vs 682,144 B).
 65 % of its non-flat blocks share their 48-bit index word with another block, which is what this change exploits.
@@ -26,10 +29,11 @@ Target: `font_atlas.png`, the only BC4 content class where bc_packed trails `zip
 
 ## 3. Enabling (gating)
 
-- One plain `uint64_t` per channel, always written after the per-channel header bytes, as a contiguous block
-  (the header bytes of every channel, then the tile word of every channel — not interleaved): bit `i` = tile
-  `i` uses its dictionary. Same shape as BC1's `strip_dict_enable`, no flag, no conditional field. 8 bytes per
-  channel (16 for BC5), and 0 payload cost for an image where the gate disables every tile.
+- One plain `uint64_t` per channel, always written after the per-channel header bytes, u32-aligned so the
+  GPU reads it as words, as a contiguous block (the header bytes of every channel, then the tile word of
+  every channel — not interleaved): bit `i` = tile `i` uses its dictionary. Same shape as BC1's
+  `strip_dict_enable`, no flag, no conditional field. 8 bytes per channel (16 for BC5), and 0 payload cost
+  for an image where the gate disables every tile.
 - The rank model slot is always in the model region, like the endpoint MTF-8 slot: a channel whose gate
   disables every tile writes a dummy 1-symbol model (4 bytes, the decoder never reads from it), so a
   non-qualifying channel pays exactly the 8-byte tile word + 4-byte dummy — never the full 259-byte model.
