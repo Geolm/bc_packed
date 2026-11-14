@@ -1847,15 +1847,11 @@ static void bc4_init_models(bcp_context* ctx, const void* image, uint32_t width_
 
         // the MTF list and the index-word dictionary are cleared per tile, mirroring the
         // encoder; each channel owns a region of the shared hashmap
-        mtf_list mtf[BCP_MAX_CHANNELS];
-        bc4_dict dict[BCP_MAX_CHANNELS];
+        mtf_list mtf[BCP_MAX_CHANNELS] = { 0 };
+        bc4_dict dict[BCP_MAX_CHANNELS] = { 0 };
         for(uint32_t c=0; c<num_channels; ++c)
-        {
-            mtf[c].count = 0;
-            dict[c].count = 0;
             for(uint32_t i=0; i<BC4_DICT_MAP_SIZE; ++i)
                 ctx->hashmap[c * BC4_DICT_MAP_SIZE + i].count = 0;
-        }
 
         tile_bounds tb = tile_bounds_get(strip_index, width_blocks, height_blocks, num_strips);
         uint32_t tile_width = tb.x1 - tb.x0;
@@ -2184,13 +2180,11 @@ static size_t bcp_compress_bc45(bcp_context* ctx, const void* image, uint32_t wi
         }
 
         // the MTF list and the index-word dictionary are cleared per tile, mirroring the pre-pass
-        mtf_list mtf[BCP_MAX_CHANNELS];
-        bc4_dict dict[BCP_MAX_CHANNELS];
+        mtf_list mtf[BCP_MAX_CHANNELS] = { 0 };
+        bc4_dict dict[BCP_MAX_CHANNELS] = { 0 };
         uint8_t dict_enable[BCP_MAX_CHANNELS];
         for(uint32_t c=0; c<num_channels; ++c)
         {
-            mtf[c].count = 0;
-            dict[c].count = 0;
             dict_enable[c] = (uint8_t)((ctx->bc4_dict_enable[c] >> strip_index) & 1);
             for(uint32_t i=0; i<BC4_DICT_MAP_SIZE; ++i)
                 ctx->hashmap[c * BC4_DICT_MAP_SIZE + i].count = 0;
@@ -2396,15 +2390,11 @@ static bool bcp_decompress_bc45(bcp_context* ctx, const void* input, size_t inpu
     // the MTF list and the index-word dictionary are cleared per tile, one thread decodes one
     // tile so this is the whole state; the decoder keeps no lookup map (the rank names the
     // list position directly)
-    mtf_list mtf[BCP_MAX_CHANNELS];
-    bc4_dict dict[BCP_MAX_CHANNELS];
+    mtf_list mtf[BCP_MAX_CHANNELS] = { 0 };
+    bc4_dict dict[BCP_MAX_CHANNELS] = { 0 };
     uint8_t dict_enable[BCP_MAX_CHANNELS];
     for(uint32_t c=0; c<num_channels; ++c)
-    {
-        mtf[c].count = 0;
-        dict[c].count = 0;
         dict_enable[c] = (uint8_t)((ctx->bc4_dict_enable[c] >> strip_index) & 1);
-    }
 
     tile_bounds tb = tile_bounds_get(strip_index, width_blocks, height_blocks, num_strips);
     uint32_t tile_width = tb.x1 - tb.x0;
