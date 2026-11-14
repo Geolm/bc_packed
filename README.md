@@ -56,7 +56,7 @@ The techniques are adapted to make GPU decompression fast and simple:
 * **Static symbol ranking.** Symbols are remapped so that the most frequently used symbols have the lowest indices. The rank table is generated from a histogram during compression.
 * **Parallel decompression.** The texture is divided into 64 independent tiles. 64 GPU threads decompress the tiles in parallel, with no dependency between threads.
 
-Multiple independent Rice-Golomb models are used for the different data: endpoint color deltas (one set of red, green, blue per endpoint, red and blue each with one model per green-delta context bucket, and the second endpoint's green also contextual on the sign of the first endpoint's green — 16 color models, see Endpoints), top-table references, difference masks, and residual difference bytes (19 models in total).
+Multiple independent Rice-Golomb models are used for the different data: endpoint color deltas (red and blue each with one model per green-delta context bucket per endpoint, and the second endpoint's green also contextual on the sign of the first endpoint's green — 16 distinct color models on 18 stream slots, see Endpoints), top-table references, difference masks, and residual difference bytes (21 models in total).
 
 ### Rice-Golomb model
 
@@ -102,14 +102,14 @@ For example for a 1024x1024 texture : each thread will decode 32 blocks (in widt
 
 The 64 tiles lay out the block grid in an even split: tile `s` is `(tx, ty) = (s % gx, s / gx)` with bounds `x0 = tx * width_blocks / gx, x1 = (tx + 1) * width_blocks / gx` and the same for `y`, where `gx` is 8 / 4 / 2 / 1 for `width_blocks` of 32+ / 16+ / 8+ / less and `gy = 64 / gx` (both derived from the width, no header byte, no API change). The even split covers every row and column even when the block grid is not a multiple of the tile size, so images whose height in blocks is not a multiple of the tile row count no longer lose their trailing rows.
 
-As the models are static, each thread just loads the same 19 models from the stream (`le_static_model_load`); the color context is derived from the current block's own decoded green delta, so there is no adaptive state to keep in sync between threads.
+As the models are static, each thread just loads the same 21 models from the stream (`le_static_model_load`); the color context is derived from the current block's own decoded green delta, so there is no adaptive state to keep in sync between threads.
 
 As Rice encoding output is non-fixed, we stored in the stream 63 offsets (uint16_t), each a delta in dword units relative to the previous tile, so each thread knows where to start (tile 0 always starts the tile data, its implicit zero offset is not stored).
 
 ### Endpoints
 
 BC1 endpoints are predicted from the previous block's endpoints.
-One set of three independent Rice-Golomb models is used per endpoint for the R, G, and B components; red and blue each carry one model per context bucket, and the second endpoint's green does as well (keyed on the sign of the first endpoint's green delta) — 16 color models in total. Each (channel, endpoint, context) model is fitted to the color deltas that occur in its context, so every block is priced by a model that matches its own regime.
+One set of three independent Rice-Golomb models is used per endpoint for the R, G, and B components; red and blue each carry one model per context bucket, and the second endpoint's green does as well (keyed on the sign of the first endpoint's green delta) — 16 distinct color models in total (the stream keeps 18 slots: the first endpoint's green is uncontexted, its two extra slots are fixed dummy models, see the stream layout below). Each (channel, endpoint, context) model is fitted to the color deltas that occur in its context, so every block is priced by a model that matches its own regime.
 
 For each endpoint of each block:
 
@@ -213,7 +213,7 @@ The 64 tiles are the even split of the block grid (see Multiple streams): `gx` i
 The output buffer must be at least `packed_bc1_maxsize(width, height)` bytes. This is a very rough bound: `(width/4) * (height/4) * 16`, i.e. 2× the standard BC1 texture size. In practice the stream is much smaller.
 
 ```text
-* 19 static models, in order: for each endpoint (0, 1): red (3 context buckets), green (3 context buckets), blue (3 context buckets) — 16 color models — then top-table reference, difference mask, table difference.
+* 21 static models, in order: for each endpoint (0, 1): red (3 context buckets), green (3 context buckets), blue (3 context buckets) — 18 color model slots, 16 distinct: the first endpoint's green is uncontexted and its two other slots are fixed dummy 1-symbol models — then top-table reference, difference mask, table difference.
   Each is 3 + num_symbols bytes, no padding (max 259 bytes).
 * Top table size: one uint8_t (number of entries − 1).
 * Flat index mode + value: one uint8_t (mode | value << 1), then padded to a 4-byte boundary. See Block indices → Flat blocks.
@@ -243,7 +243,7 @@ Within a tile, the blocks are traversed in the zigzag row order. For each block:
 * Otherwise: top-table reference (8-bit index), difference mask (4 bits), and one difference byte per set mask bit.
 ```
 
-See Color-pair dictionary. The six color deltas, the top-table reference, the mask, and the difference bytes are all encoded with Rice-Golomb using one of the 19 static models; each red/blue uses the model of its (channel, endpoint, context) — the three-bucket green delta described in Endpoints — and each green uses the model of its (endpoint, context), the first endpoint uncontexted and the second contextual on the sign of the first endpoint's green delta. The dictionary flag and reference are raw bits, not Rice-Golomb symbols.
+See Color-pair dictionary. The six color deltas, the top-table reference, the mask, and the difference bytes are all encoded with Rice-Golomb using one of the 21 static models; each red/blue uses the model of its (channel, endpoint, context) — the three-bucket green delta described in Endpoints — and each green uses the model of its (endpoint, context), the first endpoint uncontexted and the second contextual on the sign of the first endpoint's green delta. The dictionary flag and reference are raw bits, not Rice-Golomb symbols.
 
 
 =======

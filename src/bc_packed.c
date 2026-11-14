@@ -2575,8 +2575,8 @@ static size_t bcp_compress_bc1_impl(bcp_context* ctx, const void* bc1_image, uin
 
     byte_stream stream = {.buffer = output, .length = output_length, .pos = 0};
 
-    // store models: per endpoint, the contextual red, green, and blue models (3 contexts each) —
-    // 16 color models — then the index models
+    // store models: per endpoint, the contextual red, green, and blue models (3 slots each) —
+    // 18 slots, 16 distinct: the first endpoint's green is uncontexted — then the index models
     for(uint32_t j=0; j<2; ++j)
     {
         for(uint32_t c=0; c<COLOR_DELTA_CONTEXTS; ++c)
@@ -2767,8 +2767,8 @@ static bool bcp_decompress_bc1_impl(bcp_context* ctx, const void* input, size_t 
 
     byte_stream stream = {.buffer = (uint8_t *) input, .length = input_length, .pos = 0};
 
-    // load models: per endpoint, the contextual red, green, and blue models (3 contexts each) —
-    // 16 color models — then the index models
+    // load models: per endpoint, the contextual red, green, and blue models (3 slots each) —
+    // 18 slots, 16 distinct: the first endpoint's green is uncontexted — then the index models
     for(uint32_t j=0; j<2; ++j)
     {
         for(uint32_t c=0; c<COLOR_DELTA_CONTEXTS; ++c)
