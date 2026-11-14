@@ -20,7 +20,7 @@ The compressor is CPU-side and can use significantly more computation than the d
 | Block type |  Average compression from the image suite | 
 |:-----: | :------------: 
 | BC1 | 1.49:1  
-| BC4 | 1.14:1
+| [BC4](logs/bc4_zip.md) | 1.36:1
 | BC5 | 1.1:1  
 
 All compression ratio are better than zlib.
@@ -56,7 +56,7 @@ The techniques are adapted to make GPU decompression fast and simple:
 * **Static symbol ranking.** Symbols are remapped so that the most frequently used symbols have the lowest indices. The rank table is generated from a histogram during compression.
 * **Parallel decompression.** The texture is divided into 64 independent tiles. 64 GPU threads decompress the tiles in parallel, with no dependency between threads.
 
-Multiple independent Rice-Golomb models are used for the different data: endpoint color deltas (one set of red, green, blue per endpoint, red and blue each with one model per green-delta context bucket, and the second endpoint's green also contextual on the sign of the first endpoint's green — 16 color models, see Endpoints), top-table references, difference masks, and residual difference bytes (19 models in total).
+Multiple independent Rice-Golomb models are used for the different data: endpoint color deltas (red and blue each with one model per green-delta context bucket per endpoint, and the second endpoint's green also contextual on the sign of the first endpoint's green — 16 distinct color models on 18 stream slots, see Endpoints), top-table references, difference masks, and residual difference bytes (21 models in total).
 
 ### Rice-Golomb model
 
@@ -102,14 +102,14 @@ For example for a 1024x1024 texture : each thread will decode 32 blocks (in widt
 
 The 64 tiles lay out the block grid in an even split: tile `s` is `(tx, ty) = (s % gx, s / gx)` with bounds `x0 = tx * width_blocks / gx, x1 = (tx + 1) * width_blocks / gx` and the same for `y`, where `gx` is 8 / 4 / 2 / 1 for `width_blocks` of 32+ / 16+ / 8+ / less and `gy = 64 / gx` (both derived from the width, no header byte, no API change). The even split covers every row and column even when the block grid is not a multiple of the tile size, so images whose height in blocks is not a multiple of the tile row count no longer lose their trailing rows.
 
-As the models are static, each thread just loads the same 19 models from the stream (`le_static_model_load`); the color context is derived from the current block's own decoded green delta, so there is no adaptive state to keep in sync between threads.
+As the models are static, each thread just loads the same 21 models from the stream (`le_static_model_load`); the color context is derived from the current block's own decoded green delta, so there is no adaptive state to keep in sync between threads.
 
 As Rice encoding output is non-fixed, we stored in the stream 63 offsets (uint16_t), each a delta in dword units relative to the previous tile, so each thread knows where to start (tile 0 always starts the tile data, its implicit zero offset is not stored).
 
 ### Endpoints
 
 BC1 endpoints are predicted from the previous block's endpoints.
-One set of three independent Rice-Golomb models is used per endpoint for the R, G, and B components; red and blue each carry one model per context bucket, and the second endpoint's green does as well (keyed on the sign of the first endpoint's green delta) — 16 color models in total. Each (channel, endpoint, context) model is fitted to the color deltas that occur in its context, so every block is priced by a model that matches its own regime.
+One set of three independent Rice-Golomb models is used per endpoint for the R, G, and B components; red and blue each carry one model per context bucket, and the second endpoint's green does as well (keyed on the sign of the first endpoint's green delta) — 16 distinct color models in total (the stream keeps 18 slots: the first endpoint's green is uncontexted, its two extra slots are fixed dummy models, see the stream layout below). Each (channel, endpoint, context) model is fitted to the color deltas that occur in its context, so every block is priced by a model that matches its own regime.
 
 For each endpoint of each block:
 
@@ -213,7 +213,7 @@ The 64 tiles are the even split of the block grid (see Multiple streams): `gx` i
 The output buffer must be at least `packed_bc1_maxsize(width, height)` bytes. This is a very rough bound: `(width/4) * (height/4) * 16`, i.e. 2× the standard BC1 texture size. In practice the stream is much smaller.
 
 ```text
-* 19 static models, in order: for each endpoint (0, 1): red (3 context buckets), green (3 context buckets), blue (3 context buckets) — 16 color models — then top-table reference, difference mask, table difference.
+* 21 static models, in order: for each endpoint (0, 1): red (3 context buckets), green (3 context buckets), blue (3 context buckets) — 18 color model slots, 16 distinct: the first endpoint's green is uncontexted and its two other slots are fixed dummy 1-symbol models — then top-table reference, difference mask, table difference.
   Each is 3 + num_symbols bytes, no padding (max 259 bytes).
 * Top table size: one uint8_t (number of entries − 1).
 * Flat index mode + value: one uint8_t (mode | value << 1), then padded to a 4-byte boundary. See Block indices → Flat blocks.
@@ -243,7 +243,7 @@ Within a tile, the blocks are traversed in the zigzag row order. For each block:
 * Otherwise: top-table reference (8-bit index), difference mask (4 bits), and one difference byte per set mask bit.
 ```
 
-See Color-pair dictionary. The six color deltas, the top-table reference, the mask, and the difference bytes are all encoded with Rice-Golomb using one of the 19 static models; each red/blue uses the model of its (channel, endpoint, context) — the three-bucket green delta described in Endpoints — and each green uses the model of its (endpoint, context), the first endpoint uncontexted and the second contextual on the sign of the first endpoint's green delta. The dictionary flag and reference are raw bits, not Rice-Golomb symbols.
+See Color-pair dictionary. The six color deltas, the top-table reference, the mask, and the difference bytes are all encoded with Rice-Golomb using one of the 21 static models; each red/blue uses the model of its (channel, endpoint, context) — the three-bucket green delta described in Endpoints — and each green uses the model of its (endpoint, context), the first endpoint uncontexted and the second contextual on the sign of the first endpoint's green delta. The dictionary flag and reference are raw bits, not Rice-Golomb symbols.
 
 
 =======
@@ -277,12 +277,21 @@ other blocks:          pred = previous + top - top_previous   (mod 256)
 
 `previous` is the chain-previous block in the BC1 zigzag order, `top` the block of the row above at the same column, `top_previous` the block above the chain-previous. All references stay inside the tile, so the 64 tiles remain independent. The tile seed is the per-endpoint average of the first block of each tile, stored in the stream header like the BC1 color seed.
 
+#### Endpoint MTF-8
+
+Optionally (a flag per channel, bit 4 of the flat-index header byte, decided in the first pass), the two endpoint deltas of a block are replaced by one symbol of a 9-symbol static model: an 8-entry move-to-front list of the last distinct (endpoint0, endpoint1) pairs of the tile's zigzag chain, cleared per tile. Rank 0..7 is the pair at that MTF position (the pair moves to the front); rank 8 is an escape that stores the two wrapped endpoint deltas exactly as above (the predictor is unchanged), and the new pair is inserted at the front of the list. The list is identical on the encoder and the decoder because every decoded pair is the same one, so the state stays in sync. The endpoint models are fitted on the escaped blocks only when the flag is set, on every block otherwise.
+
+The first pass prices the endpoint histogram with and without MTF (payload bits plus the model headers each stores; a disabled channel writes a dummy 1-symbol MTF model, the stream layout is fixed and the flag is read after the models) and keeps the cheaper per channel — no heuristic. Textures with many repeated endpoint pairs (atlas-style content) switch on, natural textures usually keep the deltas.
+
 ### Indices
 
 The 16 3-bit indices of a block are encoded in raster order:
 
 ```text
-index 0:   3 raw bits (no model)
+index 0:   the first index, encoded with a static 8-symbol model (one per channel),
+            replacing the previous raw 3-bit field; the Rice / raw fallback of the
+            fitter is the self-gate, so a near-uniform first index costs the same
+            3 bits as raw and no flag is needed
 index i:   symbol = prediction XOR index[i], encoded with a static 8-symbol Rice-Golomb model
            prediction = index[i-1]   (left)
                        index[i-4]    (directly above, for the rows at offset 4, 8, 12)
@@ -292,7 +301,7 @@ index i:   symbol = prediction XOR index[i], encoded with a static 8-symbol Rice
                        the missing neighbor defaulting to 0
 ```
 
-That is an 8 x 8 matrix = 64 index models per channel. The context is derived from the already decoded indices themselves, so the model selection costs no stream bits.
+That is an 8 x 8 matrix = 64 index models plus one first-index model per channel. The context is derived from the already decoded indices themselves, so the model selection costs no stream bits.
 
 The 8-symbol models use a compact rank table (8 entries instead of 256): `3 + num_symbols ≤ 11` bytes each in the stream.
 
@@ -300,22 +309,44 @@ The 8-symbol models use a compact rank table (8 entries instead of 256): `3 + nu
 
 A block whose two endpoints are identical carries a uniform index word: all 16 indices hold the same 3-bit value. A per-channel flat index mode, decided once in the first pass, collapses this: mode 1 is selected for a channel when at least one block of that channel has identical endpoints and every such block holds the same 3-bit value, else mode 0. In mode 1 a flat block stores no index payload at all: the value, stored once per channel for the whole image in the stream header, is expanded to all 16 indices on decode, instead of the 15 contextual symbols; in mode 0, or for a non-flat block, the indices are stored as usual. The mode and the value share one header byte per channel (mode | value << 1) after the tile seeds. A decoder never needs the mode for a non-flat block, so the encoder and decoder always pick the same path; an encoder that leaves a non-uniform or a differing index word on a flat block forces mode 0 and round-trips byte-exact.
 
+#### Index-word dictionary
+
+When a tile's index words repeat, a block's whole payload can be replaced by one symbol. Each channel of an enabled tile keeps a move-to-front list of at most 255 distinct 48-bit index words (the block's six index bytes): the stored symbol is the word's rank 0..254, and 255 is the escape — the full payload above is stored and the word is inserted at the front of the list. A rank hit copies the word at that list position into the block's indices. The list is cleared per tile, like the endpoint MTF-8, and the decoder rebuilds it exactly: a rank names a list position, never a word, so no lookup structure is needed on decode.
+
+The dictionary is gated per tile by one global per-channel decision, priced exactly in a third pre-pass: the tile is enabled when the hit payloads it skips, priced with the fitted index models, outweigh the rank symbols it adds, priced with the fitted rank model — one rank model per channel for the whole image, never a per-tile model. A channel with no enabled tile pays only the always-present rank model slot (a dummy 1-symbol model) and its 8-byte tile word.
+
 ### Compressed stream
 
 As BC1, the stream does not include width, height or format: the BC4 / BC5 decompressors are separate entry points and know their own header.
 
 ```text
-* 2 endpoint models per channel — 256-symbol static models, 3 + num_symbols bytes each, no padding (max 259).
-* 64 index models per channel — 8-symbol static models, 3 + num_symbols bytes each, no padding (max 11).
+* Per channel, in order:
+  - 2 endpoint models — 256-symbol static models, 3 + num_symbols bytes each, no padding (max 259).
+    Fitted on the MTF-escaped blocks when the channel's MTF-8 flag is set, on every block otherwise.
+  - 1 endpoint MTF-8 model — 9-symbol static model, 3 + num_symbols bytes, no padding (max 12).
+    A dummy 1-symbol model (4 bytes) when the flag is clear: the layout is fixed and the flag
+    is only readable after the model region, so the slot is always present.
+  - 1 first-index model — 8-symbol static model for the first index of each non-flat block,
+    3 + num_symbols bytes, no padding (max 11).
+  - 1 index-word dictionary rank model — 256-symbol static model (ranks 0..254 + escape),
+    3 + num_symbols bytes, no padding (max 259). A dummy 1-symbol model (4 bytes) when no tile
+    of the channel is enabled: the layout is fixed and the tile word is only readable after
+    the model region, so the slot is always present.
+  - 64 index models — 8-symbol static models, 3 + num_symbols bytes each, no padding (max 11).
 * Tile seed: 2 bytes per channel (endpoint 0, endpoint 1).
-* Flat index mode + value: one uint8_t (mode | value << 1) per channel. See Indices → Flat blocks.
+* Flat index mode + value + endpoint MTF-8 enable: one uint8_t (mode | value << 1 | mtf << 4) per channel.
+  See Indices → Flat blocks and Endpoints → Endpoint MTF-8.
+* Padded to a 4-byte boundary.
+* Index-word dictionary tile word: one uint64 per channel, a contiguous block (bit i = tile i:
+  the tile stores dictionary ranks instead of the index payload), u32-aligned so the GPU reads
+  it as words. See Indices → Index-word dictionary.
 * Padded to a 2-byte boundary.
 * 63 tile offsets (uint16_t each), relative deltas in dword units. Tile 0 always starts the tile data; its offset is zero and not stored.
 * Padded to a 4-byte boundary.
 * 64 tile bitstreams, each 4-byte aligned, each flushed independently.
 ```
 
-For BC5 the red channel's models and seed come first, then the green channel's, then the shared offsets and tiles. Within a tile the blocks follow the zigzag row order; per block the payload is the red channel complete, then the green one, and per channel: endpoint 0, endpoint 1, then either no index payload (a flat block in mode 1, the header value is expanded to all 16 indices on decode) or index 0 (3 raw bits) followed by indices 1..15 (each XORed with its intra-block prediction, as above).
+For BC5 the red channel's models and seed come first, then the green channel's, then the shared offsets and tiles. Within a tile the blocks follow the zigzag row order; per block the payload is the red channel complete, then the green one, and per channel: with MTF-8 enabled, the 9-symbol MTF rank of the block's endpoint pair (0..7 = the pair at that position of the per-tile move-to-front list, 8 = the two wrapped endpoint deltas, the list updated in either case and cleared per tile); without it, the two wrapped endpoint deltas; then either no index payload (a flat block in mode 1, the header value is expanded to all 16 indices on decode), or, for an enabled tile, the 256-symbol rank of the block's 48-bit index word (0..254 = the word at that position of the per-tile move-to-front list is expanded into the block's indices, 255 = the full payload below, the word inserted at the front of the list), or index 0 with the first-index model followed by indices 1..15 (each XORed with its intra-block prediction, as above).
 
 ### Status
 
@@ -327,10 +358,10 @@ For BC5 the red channel's models and seed come first, then the green channel's, 
 
 Everything is validated byte-exact over all 64 tiles, on CPU and GPU:
 
-* GPU roundtrips: the `bcp_decompress_bc4` / `bcp_decompress_bc5` Metal kernels decode the brick AO / normal maps (1024×1024, `images/bc4` / `images/bc5`) and the result is verified byte-identical to the stb-built textures, the same way the BC1 kernel is tested.
+* GPU roundtrips: the `bcp_decompress_bc4` / `bcp_decompress_bc5` Metal kernels decode the brick AO / normal maps (1024×1024, `images/bc4` / `images/bc5`) and a synthetic 256×256 texture whose endpoint pairs and index words repeat within the tiles (the content class the real brick maps do not exercise; the repetition enables the index-word dictionary on those tiles, so the kernel's mirror of the per-tile list is exercised), the result verified byte-identical to the stb-built / generated textures, the same way the BC1 kernel is tested. The suite is run with the Metal validation layer on (`METAL_VALIDATION=1 ./build/unit_tests`).
 
-* CPU: 8 synthetic 256×256 roundtrips (flat, checkerboard, gradient, SplitMix32 random, each as BC4 and BC5): the random pattern forces the raw-mode fallback and the full 64-context usage.
-* CPU: 4 AO maps (`images/bc4`) and 4 normal maps (`images/bc5`), 1024×1024, converted per block with stb_dxt: the per-image ratio is printed to stdout (no CSV) and the suite average must stay above 1:1. Measured: **1.1351:1** average for BC4 (1.0921 – 1.1592 per image) and **1.0985:1** for BC5 (1.0630 – 1.1339 per image). BC5 compression ratio looks modest but zlib only achieves 1.010563:1 for the same images.
+* CPU: 14 synthetic 256×256 roundtrips: the flat / checkerboard / gradient / SplitMix32 random patterns as BC4 and BC5 (including the flat-index mode variants and a per-column predictor), plus the endpoint-pair content classes — repeated pairs, asserted to compress strictly smaller than an all-distinct-pairs control with the same index words, all-distinct pairs, a half-repeated / half-distinct mix, and a BC5 with repeated red / distinct green (per-channel independence) — and the index-word dictionary classes: 8 cycling index words asserted to compress strictly smaller than an all-distinct-words control with the same endpoint pairs, all-distinct words (the dictionary must stay gated off), and cycling non-uniform words in mode-0 flat blocks. The tests check results only: byte-exact roundtrips and stream sizes, never the stream layout. The random pattern forces the raw-mode fallback and the full 64-context usage.
+* CPU: 6 maps (`images/bc4`: 4 AO maps, a 4096×4096 roughness map, a 1748×1748 font atlas) and 4 normal maps (`images/bc5`), converted per block with stb_dxt: the per-image ratio is printed to stdout and logged to the hourly CSV, and the suite average must stay above 1.05. Measured: **1.3608:1** average for BC4 (1.0920 – 2.4040 per image, 2.4040 being the mostly-flat font atlas, where the endpoint MTF-8 flag and the index-word dictionary switch on) and **1.0985:1** for BC5 (1.0629 – 1.1339 per image). BC5 compression ratio looks modest but zlib only achieves 1.010563:1 for the same images.
 
 The 8-bit formats leave less headroom than BC1: the indices of these maps sit close to 3 near-uniform bits each, so most of the gain comes from the endpoint deltas.
 

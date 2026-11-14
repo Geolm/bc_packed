@@ -45,6 +45,7 @@ Rice `k` and rank table per endpoint fits better. Kept.
 | 20 | Color-pair sliding dictionary: a 1-bit flag + a `ceil(log2(min(pos,256)))`-bit reference to a matching block within the last 256 replaces the six color deltas when the two endpoint colors exactly repeat, plus a per-strip enable flag | round-trips (CPU + GPU); forced version was a net loss (25 improved / 44 regressed), the per-strip version: 44 improved / 5 regressed / 25 flat, the flat ones byte-identical to the baseline | 1.4587 → 1.4654 (+0.46%) avg; 1.4020 → 1.4073 (+0.38%) byte-weighted; best +2.95% (wall2), worst −0.14% (kodim15) | **kept — this is the new baseline** (the per-strip flag turns the forced-match net loss into a net win) |
 | 21 | `bc4_index_family` endpoint-range thresholds: 30+ split variants on the 10-image bc4/bc5/bc3 suite (3-family 8/16 → 5/40; also 2- and 4-family splits) | round-trips (CPU + GPU); 10/10 images improved, best −1.04% (bc3 leak-stain alpha), worst −0.02%; 2- and 4-family counts all lose, the 3-family minimum is a wide plateau (t1 4..6 / t2 32..48 all ≥ −0.19%) | bc4 1.1244 → 1.1279, bc5 1.0756 → 1.0772, bc3 2.7149 → 2.7307 (suite averages); stream −0.235% overall | **kept — this is the new baseline for bc4/bc5/bc3** (the 74-image bc1 suite is untouched; the README's "obvious tuning lever" exercised) |
 | 22 | 8 x 8 tiles: the 64 streams become an even 8 x 8 tile of the block grid (bounds from one shared helper, `gx` 8/4/2/1 by width, `gy = 64/gx`); same walk inside a tile; the even split keeps the trailing rows of non-tile-multiple images (a breaking stream-format change) | round-trips (CPU + GPU); 62/74 BC1 images improve, worst −2.9% (horizontal-grain wood), best +9%; CPU + GPU decompression inside noise | bc1 1.4676 → 1.4905 (+1.6%); bc4 1.1342 → 1.1351, bc5 1.0995 → 1.0985 (neutral); bc3 2.8199 → 2.8787 (+2.1%) | **kept — this is the new baseline** (tiles replace full-width strips; no header byte / API change, stream layout is versioned by the compressor) |
+| 25 | Per-image tile-layout search (all formats) + per-tile local reference alphabet (BC1): trial-encode every `gx` 1..64 and keep the smallest stream; promote the 8/16/32 most frequent references to the front of a permuted global alphabet per tile, exact-size gated by a stream flag | round-trips (CPU + GPU, including a forced-local GPU case); ASan + Metal validation clean; CPU decode inside noise; encoder ~3.2x slower | bc1 1.4907 → 1.4993 (+0.58%); bc4 1.2839 → 1.2876 (+0.29%); bc5 1.0985 → 1.1007 (+0.20%); bc3 4.2240 → 4.2972 (+1.73%) | **reverted** — below the +1.0% combined target and not worth ~700 LoC + 3.2x encoder time; the local alphabet alone contributes ~+0.1% |
 
 ---
 
@@ -1055,6 +1056,93 @@ the full 16-texel contextualization. If a variant is ever revisited, the cost mu
 per-row or per-tile granularity (e.g. only the 4 left-edge texels, which need no read of the
 block above) or the neighbor map must collapse to a 2-bit quantile instead of an 8-way search;
 both are unmeasured, and the BC5 negative above is the stronger argument against the lever.
+
+---
+
+## 24. Stream-format validation from the plan's "16 color models" (the 18-model correction)
+
+**Idea:** the header-compression plan describes the BC1 stream as "16 color models ... 19 models
+total", and its H1 validation requires the top-table byte *multiset* to be identical between the
+baseline and new streams (only the order may change). Built a scratch driver (session scratchpad,
+not the repo) that walks 19 model headers, then reads the top-table size byte and hashes the
+table entries, run over the whole suite with a baseline and a new build.
+
+**Result:** the driver reported changed table multisets on 7 of the 74 BC1 images, and the
+baseline stream appeared to hold a 16-entry table with an 8-symbol reference model while the
+in-process encoder state said 255 entries — an apparent format corruption that no amount of
+source reading reconciled (the encoder/decoder agree, every round-trip passes, the suite is
+green).
+
+**Root cause:** the stream actually carries **18** color models, not 16. The encoder and decoder
+loops store per endpoint red×3 + green×3 + blue×3 (three context buckets each) = 9 per endpoint
+× 2 endpoints = 18, then reference + mask + difference = **21 models total**. The "16" in the
+plan (and in older README / code comments) is an arithmetic slip; the scratch driver inherited
+it, so its walk ended 13 bytes early: its "reference model" was really the 11th color model, its
+"table size byte" was the mask model's count byte (0x0f → "16 entries"), and the "table" it
+hashed was the difference model's alphabet — plausible-looking garbage that differs between
+builds only where the 255-byte header shrink shifts the window. With the corrected walk (21
+models) **all 74 BC1 images have byte-identical table multisets** and identical per-component
+payload bits, and the BC4/5 "diffs" were the same misparse (those formats have no top table;
+their component-bit check had already passed for every image).
+
+**Kept:** the 18 / 21 counts are corrected in the README and the code comments. Any tool that
+parses the stream (the plan's validation, the tile plan's encoder trials, future stream
+differs) must walk 21 models for BC1 — the model headers are self-describing, but a wrong model
+count does not fail loudly: the drift lands mid-alphabet and reads plausible garbage until
+something compares against ground truth.
+
+---
+
+## 25. Per-image tile layout search + per-tile local reference alphabet (implemented, measured, reverted)
+
+**Idea (plan/tile_layout_and_local_reference.md):** two decode-cheap features sharing one
+evaluation mechanism. (1) Exp 22 fixed an 8 x 8 tile grid; replace it with a per-image search:
+try every `gx = 1, 2, 4, 8, 16, 32, 64` with `gx <= width_blocks`, `gy = 64 / gx`, encode the full
+stream for each and emit the smallest (8 x 8 wins a tie, then the lower `layout_log2`). (2) BC1
+per-tile local reference alphabet: count the references each tile emits, promote its 8 / 16 / 32
+most frequent ones to the front of a permuted copy of the global alphabet, fit a local
+`(k, q_escape)` and use it only when `2 + 8*S + 16 + local payload` beats the global payload.
+A stream flag selects all-global (zero extra bits) or per-tile decisions; the encoder computes
+both exact sizes and emits the smaller one.
+
+**Stage 0 offline study** (`logs/study_layout_localref.csv`, the real pipeline with a forced
+grid): per-tile reference entropy **7.043 bits** vs the global 7.49 (the concentration gate
+passes), the local option wins on **61/74** images at 8 x 8, layout-only **+0.45%**, combined
+**+0.514%** on the BC1 suite.
+
+**Result (74-image BC1 suite + the BC4 / BC5 / BC3 suites, all CPU + GPU round-trips byte-exact):**
+
+| suite | baseline (exp 22-24) | new | gain |
+|---|---:|---:|---:|
+| BC1 | 1.4907 | **1.4993** | **+0.58%** |
+| BC4 | 1.2839 | **1.2876** | +0.29% |
+| BC5 | 1.0985 | **1.1007** | +0.20% |
+| BC3 | 4.2240 | **4.2972** | +1.73% |
+
+- The BC1 gain clears the layout-only fallback bar (**>= +0.4%**) and the combined +0.5%
+  floor, but misses the combined +1.0% acceptance target. The local alphabet contributes only
+  about +0.1% on top of the layout search (the study predicted +0.06%); it is exact-size gated,
+  so it cannot regress a stream, but it is the first thing to drop if the format is simplified.
+- Encoder cost: the full unit-test binary goes 11.7 s -> 36.9 s wall (~3.2x), all of it in
+  compression (8 trial encodes + 2 model inits per image). CPU decompression is inside noise
+  (ground.png 2323.5 -> 2351.6 MiB/s). No scratch buffer is needed: the winning layout is
+  re-encoded once at the end.
+- Header: the layout byte has zero net cost in practice (it sits in the existing 4-byte header
+  padding); BC5 can grow by 2 bytes in the worst parity case, covered by `packed_bc5_maxsize`.
+  `packed_bc1_maxsize` / `packed_bc4_maxsize` are raised by 4 / 2 bytes for the same reason.
+- Validation: ASan clean, Metal validation layers clean, BC1 CPU and GPU decode identical,
+  including a new synthetic GPU case that forces the local alphabet on.
+
+**Reverted — not shipped.** The implementation worked (all CPU + GPU round-trips byte-exact,
+ASan and Metal validation clean, deterministic), but the size gain does not justify the cost:
+about **700 lines** changed in `src/bc_packed.c` (plus the Metal mirror and tests), a **3.2x**
+encoder-time multiplier, a new header byte in every BC1 / BC4 / BC5 stream (BC3 twice), and a
+format break (version 2.0.0) — for **+0.58%** on BC1, with the local-alphabet half of it worth
+only ~+0.1%. This is below the plan's +1.0% combined acceptance target and too close to the
++0.5% floor to carry the complexity. The code, tests, shader changes and README updates were
+reverted; the stage 0 study (`logs/study_layout_localref.csv`) and the numbers above remain as
+the record. If this is ever revisited, start from the layout search alone (the +0.45% part) and
+drop the per-tile local alphabet unless it grows beyond a marginal win.
 
 ---
 

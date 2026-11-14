@@ -151,6 +151,12 @@ static void metal_state_release(metal_state* state)
 // null; on failure it prints the diagnostic and releases whatever was created, returning false
 static bool metal_state_init(metal_state* state, const char* kernel_name)
 {
+    // opt-in to the Metal validation layer: running the suite with METAL_VALIDATION=1 in the
+    // environment sets MTL_DEBUG_LAYER before the first device creation, where the framework
+    // reads it
+    if (getenv("METAL_VALIDATION") != nullptr)
+        setenv("MTL_DEBUG_LAYER", "1", 1);
+
     state->device = MTL::CreateSystemDefaultDevice();
     if (state->device == nullptr)
     {
@@ -282,36 +288,15 @@ static void build_bc5_texture(const uint8_t* rgba, uint32_t width, uint32_t heig
 }
 
 //-----------------------------------------------------------------------------------------------------------------------------
-// Full GPU roundtrip + throughput measurement of one image with one format: load the image,
-// build the standard texture, compress it on the CPU, decode it on the GPU (64 threads, one per
-// strip, over GPU_DECODE_RUNS tiled runs), verify the decoded image is byte-identical to the
-// original texture, and print the measured GPU rate in MiB/s. Returns greatest's result.
-static greatest_test_res metal_gpu_decompression(const char* image_file, const char* format_name,
-                                                 const char* kernel_name, size_t block_bytes,
-                                                 packed_maxsize_fn maxsize, bcp_compress_fn compress,
-                                                 build_texture_fn build)
+// GPU roundtrip + throughput measurement of a standard texture with one format: compress it on
+// the CPU, decode it on the GPU (64 threads, one per strip, over GPU_DECODE_RUNS tiled runs),
+// verify the decoded image is byte-identical to [original], and print the measured GPU rate in
+// MiB/s. Returns greatest's result.
+static greatest_test_res metal_gpu_roundtrip(const char* name, const uint8_t* original, size_t image_size,
+                                             uint32_t width, uint32_t height,
+                                             packed_maxsize_fn maxsize, bcp_compress_fn compress,
+                                             const char* kernel_name)
 {
-    // load the image and build the original standard texture
-    uint32_t width = 0, height = 0, channels = 0;
-    uint8_t* rgba = stbi_load(image_file, (int*)&width, (int*)&height, (int*)&channels, 4);
-    if (rgba == nullptr)
-    {
-        fprintf(stderr, "==> unable to load %s, run the test from the project root\n", image_file);
-        FAIL();
-    }
-
-    // constraints enforced by both the compressors and the compute kernels
-    ASSERT(width >= 16 && height >= 256 && (width & 3) == 0 && (height & 3) == 0);
-
-    const uint32_t width_blocks = width / 4;
-    const uint32_t height_blocks = height / 4;
-    const size_t image_size = (size_t)width_blocks * height_blocks * block_bytes;
-
-    uint8_t* original = (uint8_t*)malloc(image_size);
-    ASSERT(original != nullptr);
-    build(rgba, width, height, original);
-    stbi_image_free(rgba);
-
     // compress the standard texture on the CPU
     bcp_context* ctx = bcp_init(nullptr);
     ASSERT(ctx != nullptr);
@@ -325,8 +310,8 @@ static greatest_test_res metal_gpu_decompression(const char* image_file, const c
     ASSERT(compressed_length != 0);
     ASSERT(compressed_length <= compressed_size);
 
-    fprintf(stdout, "==> %s %ux%u : %u KiB %s, %zu bytes compressed\n",
-            image_file, width, height, (uint32_t)(image_size / 1024), format_name, compressed_length);
+    fprintf(stdout, "==> %s %ux%u : %u KiB, %zu bytes compressed\n",
+            name, width, height, (uint32_t)(image_size / 1024), compressed_length);
 
     // create the Metal objects: the device, the compiled shader, the pipeline, the queue
     metal_state state = { nullptr, nullptr, nullptr, nullptr, nullptr, nullptr };
@@ -407,9 +392,45 @@ static greatest_test_res metal_gpu_decompression(const char* image_file, const c
     free(decoded);
     free(compressed);
     bcp_terminate(ctx);
-    free(original);
 
     PASS();
+}
+
+
+//-----------------------------------------------------------------------------------------------------------------------------
+// Full GPU roundtrip of one image file with one format: load the image, build the standard
+// texture, then run the shared GPU roundtrip + throughput measurement
+static greatest_test_res metal_gpu_decompression(const char* image_file,
+                                                 const char* kernel_name, size_t block_bytes,
+                                                 packed_maxsize_fn maxsize, bcp_compress_fn compress,
+                                                 build_texture_fn build)
+{
+    // load the image and build the original standard texture
+    uint32_t width = 0, height = 0, channels = 0;
+    uint8_t* rgba = stbi_load(image_file, (int*)&width, (int*)&height, (int*)&channels, 4);
+    if (rgba == nullptr)
+    {
+        fprintf(stderr, "==> unable to load %s, run the test from the project root\n", image_file);
+        FAIL();
+    }
+
+    // constraints enforced by both the compressors and the compute kernels
+    ASSERT(width >= 16 && height >= 256 && (width & 3) == 0 && (height & 3) == 0);
+
+    const uint32_t width_blocks = width / 4;
+    const uint32_t height_blocks = height / 4;
+    const size_t image_size = (size_t)width_blocks * height_blocks * block_bytes;
+
+    uint8_t* original = (uint8_t*)malloc(image_size);
+    ASSERT(original != nullptr);
+    build(rgba, width, height, original);
+    stbi_image_free(rgba);
+
+    greatest_test_res res = metal_gpu_roundtrip(image_file, original, image_size, (uint32_t)width, (uint32_t)height,
+                                                maxsize, compress, kernel_name);
+
+    free(original);
+    return res;
 }
 
 
@@ -419,20 +440,69 @@ static greatest_test_res metal_gpu_decompression(const char* image_file, const c
 
 TEST metal_gpu_decompression_bc1(void)
 {
-    return metal_gpu_decompression(BC1_IMAGE_FILE, "BC1", "bcp_decompress_bc1", 8,
+    return metal_gpu_decompression(BC1_IMAGE_FILE, "bcp_decompress_bc1", 8,
                                    packed_bc1_maxsize, bcp_compress_bc1, build_bc1_texture);
 }
 
 TEST metal_gpu_decompression_bc4(void)
 {
-    return metal_gpu_decompression(BC4_IMAGE_FILE, "BC4", "bcp_decompress_bc4", 8,
+    return metal_gpu_decompression(BC4_IMAGE_FILE, "bcp_decompress_bc4", 8,
                                    packed_bc4_maxsize, bcp_compress_bc4, build_bc4_texture);
 }
 
 TEST metal_gpu_decompression_bc5(void)
 {
-    return metal_gpu_decompression(BC5_IMAGE_FILE, "BC5", "bcp_decompress_bc5", 16,
+    return metal_gpu_decompression(BC5_IMAGE_FILE, "bcp_decompress_bc5", 16,
                                    packed_bc5_maxsize, bcp_compress_bc5, build_bc5_texture);
+}
+
+//-----------------------------------------------------------------------------------------------------------------------------
+// Synthetic GPU roundtrip of the BC4 / BC5 content class the real brick maps do not exercise:
+// endpoint pairs that repeat within the tiles, plus a skewed first index. Built in memory,
+// no image file needed.
+TEST metal_gpu_decompression_bc45_synthetic(void)
+{
+    const uint32_t width = 256, height = 256;
+    const uint32_t width_blocks = width / 4;
+    const uint32_t height_blocks = height / 4;
+    const uint32_t num_blocks = width_blocks * height_blocks;
+
+    // 4 distinct endpoint pairs cycling in x (period 4 divides the row width, so it holds in the
+    // zigzag chain too): the MTF list is full after the first four blocks of each tile and the
+    // rest are rank hits. the rest of the indices are position-derived, the first is constant
+    bc4_block* bc4 = (bc4_block*)malloc(num_blocks * sizeof(bc4_block));
+    bc4_block* bc5 = (bc4_block*)malloc(num_blocks * 2 * sizeof(bc4_block));
+    ASSERT(bc4 != nullptr && bc5 != nullptr);
+
+    for (uint32_t i = 0; i < num_blocks; ++i)
+    {
+        const uint32_t t = (i % width_blocks) & 3;
+
+        bc4[i].endpoint[0] = (uint8_t)(0x10 + t * 0x20);
+        bc4[i].endpoint[1] = (uint8_t)(0x08 + t * 0x10);
+
+        uint64_t v = 0;
+        for (uint32_t k = 1; k < 16; ++k)
+            v |= (uint64_t)(((i % width_blocks) ^ (i / width_blocks) ^ k) & 7) << (3 * k);
+        for (uint32_t j = 0; j < 6; ++j)
+            bc4[i].indices[j] = (uint8_t)(v >> (8 * j));
+
+        memcpy(&bc5[2 * i], &bc4[i], sizeof(bc4_block));
+        bc5[2 * i + 1].endpoint[0] = (uint8_t)(bc4[i].endpoint[0] ^ 0x5A);
+        bc5[2 * i + 1].endpoint[1] = (uint8_t)(bc4[i].endpoint[1] ^ 0x5A);
+        for (uint32_t j = 0; j < 6; ++j)
+            bc5[2 * i + 1].indices[j] = (uint8_t)(bc4[i].indices[j] ^ 0x38);
+    }
+
+    greatest_test_res res = metal_gpu_roundtrip("synthetic bc4", (const uint8_t*)bc4, num_blocks * 8, width, height,
+                                                packed_bc4_maxsize, bcp_compress_bc4, "bcp_decompress_bc4");
+    if (res == GREATEST_TEST_RES_PASS)
+        res = metal_gpu_roundtrip("synthetic bc5", (const uint8_t*)bc5, num_blocks * 16, width, height,
+                                  packed_bc5_maxsize, bcp_compress_bc5, "bcp_decompress_bc5");
+
+    free(bc4);
+    free(bc5);
+    return res;
 }
 
 extern "C" {
@@ -442,6 +512,7 @@ SUITE(suite_gpu)
     RUN_TEST(metal_gpu_decompression_bc1);
     RUN_TEST(metal_gpu_decompression_bc4);
     RUN_TEST(metal_gpu_decompression_bc5);
+    RUN_TEST(metal_gpu_decompression_bc45_synthetic);
 }
 
 }
