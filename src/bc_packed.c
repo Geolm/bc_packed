@@ -1585,11 +1585,12 @@ typedef struct mtf_list
 } mtf_list;
 
 //-----------------------------------------------------------------------------------------------------------------------------
-// rank of [pair] in the MTF list, BC4_MTF_SIZE if absent (the escape symbol)
-static inline uint32_t mtf_rank(const mtf_list* m, uint16_t pair)
+// rank of [pair] in the MTF list, BC4_MTF_SIZE if absent (the escape symbol); the list is
+// passed by value: it is 20 bytes and this keeps the inlined body free of pointer reads
+static inline uint32_t mtf_rank(const mtf_list m, uint16_t pair)
 {
-    for (uint32_t i = 0; i < m->count; ++i)
-        if (m->pair[i] == pair)
+    for (uint32_t i = 0; i < m.count; ++i)
+        if (m.pair[i] == pair)
             return i;
 
     return BC4_MTF_SIZE;
@@ -1598,11 +1599,11 @@ static inline uint32_t mtf_rank(const mtf_list* m, uint16_t pair)
 //-----------------------------------------------------------------------------------------------------------------------------
 // move [pair] to the front of the list, inserting it if new: the list holds distinct pairs,
 // the oldest one is dropped once it is full
-static inline void mtf_touch(mtf_list* m, uint16_t pair)
+static inline mtf_list mtf_touch(mtf_list m, uint16_t pair)
 {
     int32_t at = -1;
-    for (uint32_t i = 0; i < m->count; ++i)
-        if (m->pair[i] == pair)
+    for (uint32_t i = 0; i < m.count; ++i)
+        if (m.pair[i] == pair)
         {
             at = (int32_t)i;
             break;
@@ -1611,21 +1612,22 @@ static inline void mtf_touch(mtf_list* m, uint16_t pair)
     if (at >= 0)
     {
         for (int32_t j = at; j > 0; --j)
-            m->pair[j] = m->pair[j - 1];
+            m.pair[j] = m.pair[j - 1];
     }
-    else if (m->count < BC4_MTF_SIZE)
+    else if (m.count < BC4_MTF_SIZE)
     {
-        for (uint32_t j = m->count; j > 0; --j)
-            m->pair[j] = m->pair[j - 1];
-        m->count++;
+        for (uint32_t j = m.count; j > 0; --j)
+            m.pair[j] = m.pair[j - 1];
+        m.count++;
     }
     else
     {
         for (uint32_t j = BC4_MTF_SIZE - 1; j > 0; --j)
-            m->pair[j] = m->pair[j - 1];
+            m.pair[j] = m.pair[j - 1];
     }
 
-    m->pair[0] = pair;
+    m.pair[0] = pair;
+    return m;
 }
 
 //-----------------------------------------------------------------------------------------------------------------------------
@@ -1879,10 +1881,10 @@ static void bc4_init_models(bcp_context* ctx, const void* image, uint32_t width_
                     }
 
                     uint16_t pair = (uint16_t)(b->endpoint[0] | (b->endpoint[1] << 8));
-                    uint32_t rank = mtf_rank(&mtf[c], pair);
+                    uint32_t rank = mtf_rank(mtf[c], pair);
                     // MTF-8 is priced in both variants: the rank histogram plus, on escape, the endpoint deltas
                     mtf_hist[c][rank]++;
-                    mtf_touch(&mtf[c], pair);
+                    mtf[c] = mtf_touch(mtf[c], pair);
 
                     for(uint32_t e=0; e<2; ++e)
                     {
@@ -2219,10 +2221,10 @@ static size_t bcp_compress_bc45(bcp_context* ctx, const void* image, uint32_t wi
                         // the 9-symbol rank of the block's pair: 0..7 = the pair at that list position,
                         // 8 = escape to the two wrapped deltas; the list is updated in either case
                         uint16_t pair = (uint16_t)(b->endpoint[0] | (b->endpoint[1] << 8));
-                        uint32_t rank = mtf_rank(&mtf[c], pair);
+                        uint32_t rank = mtf_rank(mtf[c], pair);
 
                         le_encode_symbol(&compressed_stream, &ctx->bc4_mtf_model[c], (uint8_t)rank);
-                        mtf_touch(&mtf[c], pair);
+                        mtf[c] = mtf_touch(mtf[c], pair);
 
                         if (rank >= BC4_MTF_SIZE)
                         {
@@ -2439,7 +2441,7 @@ static bool bcp_decompress_bc45(bcp_context* ctx, const void* input, size_t inpu
                         }
                     }
 
-                    mtf_touch(&mtf[c], (uint16_t)(b->endpoint[0] | (b->endpoint[1] << 8)));
+                    mtf[c] = mtf_touch(mtf[c], (uint16_t)(b->endpoint[0] | (b->endpoint[1] << 8)));
                 }
                 else
                 {

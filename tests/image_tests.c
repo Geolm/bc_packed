@@ -1,6 +1,8 @@
 #include "test_helpers.h"
 #include <dirent.h>
+#include <limits.h>
 #include <stdio.h>
+#include <sys/param.h>
 #include <time.h>
 #include <inttypes.h>
 
@@ -110,7 +112,7 @@ TEST test_all_images_in_folder(const char *dir_path)
         if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) 
             continue;
 
-        char file_path[1024];
+        char file_path[PATH_MAX + NAME_MAX + 2];
         snprintf(file_path, sizeof(file_path), "%s/%s", dir_path, entry->d_name);
         
         // load and convert to bc1
