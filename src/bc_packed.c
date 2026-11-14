@@ -1750,6 +1750,12 @@ typedef struct bc4_hists
 } bc4_hists;
 
 //-----------------------------------------------------------------------------------------------------------------------------
+// gcc 13 misreports the per-strip MTF state as maybe-uninitialized in the ipa-constprop
+// clones of this function; the state is zero-initialized at declaration, a false positive
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
+#endif
 static void bc4_init_models(bcp_context* ctx, const void* image, uint32_t width_blocks, uint32_t height_blocks, uint32_t num_strips, uint32_t num_channels, uint32_t block_stride)
 {
     if (!hashmap_ensure(ctx, (uint32_t)BCP_MAX_CHANNELS * BC4_DICT_MAP_SIZE))
@@ -2050,6 +2056,9 @@ static void bc4_init_models(bcp_context* ctx, const void* image, uint32_t width_
             le_static_model_init(&ctx->bc4_dict_rank_model[c], NULL, BC4_DICT_SIZE + 1); // no tile enabled: a dummy 1-symbol model, never used
     }
 }
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 
 //-----------------------------------------------------------------------------------------------------------------------------
 // Index payload of a block that stores indices: the first index with its 8-symbol model, then
@@ -2087,6 +2096,12 @@ static inline void bc4_decode_index_payload(le_stream* s, le_model* first_index,
 //-----------------------------------------------------------------------------------------------------------------------------
 // Compresses a BC4 / BC5 texture: [image] holds (width/4) * (height/4) blocks, each
 // [num_channels] bc4_block (1 for BC4, red + green for BC5). shared by the two formats
+// gcc 13 misreports the per-strip MTF state as maybe-uninitialized in the ipa-constprop
+// clones of this function; the state is zero-initialized at declaration, a false positive
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
+#endif
 static size_t bcp_compress_bc45(bcp_context* ctx, const void* image, uint32_t width, uint32_t height, uint8_t* output, size_t output_length, uint32_t* num_strips, uint32_t num_channels, uint32_t block_stride)
 {
     if ((width < 16) || (height < 256) || !image || !ctx || !output || !num_strips || (num_channels < 1) || (num_channels > BCP_MAX_CHANNELS))
@@ -2308,6 +2323,9 @@ static size_t bcp_compress_bc45(bcp_context* ctx, const void* image, uint32_t wi
 
     return stream.pos;
 }
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 
 //-----------------------------------------------------------------------------------------------------------------------------
 // Decompresses one strip of a BC4 / BC5 stream: the mirror of bcp_compress_bc45, the strip-chain
