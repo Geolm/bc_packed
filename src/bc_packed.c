@@ -1760,6 +1760,8 @@ static void bc4_init_models(bcp_context* ctx, const void* image, uint32_t width_
     uint32_t mtf_hist[BCP_MAX_CHANNELS][BC4_MTF_SIZE + 1] = { 0 }; // MTF ranks 0..BC4_MTF_SIZE-1 + escape
     uint32_t first_hist[BCP_MAX_CHANNELS][8] = { 0 }; // first index of the non-flat blocks
     uint32_t sums[BCP_MAX_CHANNELS][2] = { 0 };
+    mtf_list mtf[BCP_MAX_CHANNELS] = { 0 };
+    bc4_dict dict[BCP_MAX_CHANNELS] = { 0 };
     uint8_t prev_e[BCP_MAX_CHANNELS][2], top_e[BCP_MAX_CHANNELS][2], top_prev_e[BCP_MAX_CHANNELS][2];
     bool flat_block[BCP_MAX_CHANNELS] = { false, false };
     bool non_uniform_flat[BCP_MAX_CHANNELS] = { false, false };
@@ -1849,8 +1851,11 @@ static void bc4_init_models(bcp_context* ctx, const void* image, uint32_t width_
 
         // the MTF list and the index-word dictionary are cleared per tile, mirroring the
         // encoder; each channel owns a region of the shared hashmap
-        mtf_list mtf[BCP_MAX_CHANNELS] = { 0 };
-        bc4_dict dict[BCP_MAX_CHANNELS] = { 0 };
+        for(uint32_t c=0; c<BCP_MAX_CHANNELS; ++c)
+        {
+            mtf[c] = (mtf_list){ 0 };
+            dict[c] = (bc4_dict){ 0 };
+        }
         for(uint32_t c=0; c<num_channels; ++c)
             for(uint32_t i=0; i<BC4_DICT_MAP_SIZE; ++i)
                 ctx->hashmap[c * BC4_DICT_MAP_SIZE + i].count = 0;
@@ -1971,8 +1976,7 @@ static void bc4_init_models(bcp_context* ctx, const void* image, uint32_t width_
 
     // pass 3: gate the dictionary per tile: re-simulate the list, price the skipped hit
     // payloads against the fitted index models and the rank symbols against the fitted rank
-    // model, enable the tile when the saved bits win
-    bc4_dict dict[BCP_MAX_CHANNELS];
+    // model, enable the tile when the saved bits win; reuses [dict], re-cleared per strip
     for(uint32_t strip_index=0; strip_index<num_strips; ++strip_index)
     {
         uint64_t saved[BCP_MAX_CHANNELS];
@@ -2158,6 +2162,9 @@ static size_t bcp_compress_bc45(bcp_context* ctx, const void* image, uint32_t wi
     stream_align(&stream, sizeof(uint32_t));
     size_t previous_offset = stream.pos;
 
+    mtf_list mtf[BCP_MAX_CHANNELS] = { 0 };
+    bc4_dict dict[BCP_MAX_CHANNELS] = { 0 };
+
     for(uint32_t strip_index=0; strip_index<*num_strips; ++strip_index)
     {
         le_stream compressed_stream;
@@ -2182,8 +2189,11 @@ static size_t bcp_compress_bc45(bcp_context* ctx, const void* image, uint32_t wi
         }
 
         // the MTF list and the index-word dictionary are cleared per tile, mirroring the pre-pass
-        mtf_list mtf[BCP_MAX_CHANNELS] = { 0 };
-        bc4_dict dict[BCP_MAX_CHANNELS] = { 0 };
+        for(uint32_t c=0; c<BCP_MAX_CHANNELS; ++c)
+        {
+            mtf[c] = (mtf_list){ 0 };
+            dict[c] = (bc4_dict){ 0 };
+        }
         uint8_t dict_enable[BCP_MAX_CHANNELS];
         for(uint32_t c=0; c<num_channels; ++c)
         {
