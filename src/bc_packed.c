@@ -1585,12 +1585,11 @@ typedef struct mtf_list
 } mtf_list;
 
 //-----------------------------------------------------------------------------------------------------------------------------
-// rank of [pair] in the MTF list, BC4_MTF_SIZE if absent (the escape symbol); the list is
-// passed by value: it is 20 bytes and this keeps the inlined body free of pointer reads
-static inline uint32_t mtf_rank(const mtf_list m, uint16_t pair)
+// rank of [pair] in the MTF list, BC4_MTF_SIZE if absent (the escape symbol)
+static inline uint32_t mtf_rank(const mtf_list* m, uint16_t pair)
 {
-    for (uint32_t i = 0; i < m.count; ++i)
-        if (m.pair[i] == pair)
+    for (uint32_t i = 0; i < m->count; ++i)
+        if (m->pair[i] == pair)
             return i;
 
     return BC4_MTF_SIZE;
@@ -1599,11 +1598,11 @@ static inline uint32_t mtf_rank(const mtf_list m, uint16_t pair)
 //-----------------------------------------------------------------------------------------------------------------------------
 // move [pair] to the front of the list, inserting it if new: the list holds distinct pairs,
 // the oldest one is dropped once it is full
-static inline mtf_list mtf_touch(mtf_list m, uint16_t pair)
+static inline void mtf_touch(mtf_list* m, uint16_t pair)
 {
     int32_t at = -1;
-    for (uint32_t i = 0; i < m.count; ++i)
-        if (m.pair[i] == pair)
+    for (uint32_t i = 0; i < m->count; ++i)
+        if (m->pair[i] == pair)
         {
             at = (int32_t)i;
             break;
@@ -1612,22 +1611,21 @@ static inline mtf_list mtf_touch(mtf_list m, uint16_t pair)
     if (at >= 0)
     {
         for (int32_t j = at; j > 0; --j)
-            m.pair[j] = m.pair[j - 1];
+            m->pair[j] = m->pair[j - 1];
     }
-    else if (m.count < BC4_MTF_SIZE)
+    else if (m->count < BC4_MTF_SIZE)
     {
-        for (uint32_t j = m.count; j > 0; --j)
-            m.pair[j] = m.pair[j - 1];
-        m.count++;
+        for (uint32_t j = m->count; j > 0; --j)
+            m->pair[j] = m->pair[j - 1];
+        m->count++;
     }
     else
     {
         for (uint32_t j = BC4_MTF_SIZE - 1; j > 0; --j)
-            m.pair[j] = m.pair[j - 1];
+            m->pair[j] = m->pair[j - 1];
     }
 
-    m.pair[0] = pair;
-    return m;
+    m->pair[0] = pair;
 }
 
 //-----------------------------------------------------------------------------------------------------------------------------
@@ -1751,7 +1749,7 @@ typedef struct bc4_hists
 
 //-----------------------------------------------------------------------------------------------------------------------------
 // gcc 13 misreports the per-strip MTF state as maybe-uninitialized in the ipa-constprop
-// clones of this function; the state is zero-initialized at declaration, a false positive
+// clones of this function; count is cleared per strip and pair is only read below count
 #if defined(__GNUC__) && !defined(__clang__)
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
@@ -1766,8 +1764,6 @@ static void bc4_init_models(bcp_context* ctx, const void* image, uint32_t width_
     uint32_t mtf_hist[BCP_MAX_CHANNELS][BC4_MTF_SIZE + 1] = { 0 }; // MTF ranks 0..BC4_MTF_SIZE-1 + escape
     uint32_t first_hist[BCP_MAX_CHANNELS][8] = { 0 }; // first index of the non-flat blocks
     uint32_t sums[BCP_MAX_CHANNELS][2] = { 0 };
-    mtf_list mtf[BCP_MAX_CHANNELS] = { 0 };
-    bc4_dict dict[BCP_MAX_CHANNELS] = { 0 };
     uint8_t prev_e[BCP_MAX_CHANNELS][2], top_e[BCP_MAX_CHANNELS][2], top_prev_e[BCP_MAX_CHANNELS][2];
     bool flat_block[BCP_MAX_CHANNELS] = { false, false };
     bool non_uniform_flat[BCP_MAX_CHANNELS] = { false, false };
@@ -1857,14 +1853,15 @@ static void bc4_init_models(bcp_context* ctx, const void* image, uint32_t width_
 
         // the MTF list and the index-word dictionary are cleared per tile, mirroring the
         // encoder; each channel owns a region of the shared hashmap
-        for(uint32_t c=0; c<BCP_MAX_CHANNELS; ++c)
-        {
-            mtf[c] = (mtf_list){ 0 };
-            dict[c] = (bc4_dict){ 0 };
-        }
+        mtf_list mtf[BCP_MAX_CHANNELS];
+        bc4_dict dict[BCP_MAX_CHANNELS];
         for(uint32_t c=0; c<num_channels; ++c)
+        {
+            mtf[c].count = 0;
+            dict[c].count = 0;
             for(uint32_t i=0; i<BC4_DICT_MAP_SIZE; ++i)
                 ctx->hashmap[c * BC4_DICT_MAP_SIZE + i].count = 0;
+        }
 
         tile_bounds tb = tile_bounds_get(strip_index, width_blocks, height_blocks, num_strips);
         uint32_t tile_width = tb.x1 - tb.x0;
@@ -1892,10 +1889,10 @@ static void bc4_init_models(bcp_context* ctx, const void* image, uint32_t width_
                     }
 
                     uint16_t pair = (uint16_t)(b->endpoint[0] | (b->endpoint[1] << 8));
-                    uint32_t rank = mtf_rank(mtf[c], pair);
+                    uint32_t rank = mtf_rank(&mtf[c], pair);
                     // MTF-8 is priced in both variants: the rank histogram plus, on escape, the endpoint deltas
                     mtf_hist[c][rank]++;
-                    mtf[c] = mtf_touch(mtf[c], pair);
+                    mtf_touch(&mtf[c], pair);
 
                     for(uint32_t e=0; e<2; ++e)
                     {
@@ -1982,7 +1979,8 @@ static void bc4_init_models(bcp_context* ctx, const void* image, uint32_t width_
 
     // pass 3: gate the dictionary per tile: re-simulate the list, price the skipped hit
     // payloads against the fitted index models and the rank symbols against the fitted rank
-    // model, enable the tile when the saved bits win; reuses [dict], re-cleared per strip
+    // model, enable the tile when the saved bits win
+    bc4_dict dict[BCP_MAX_CHANNELS];
     for(uint32_t strip_index=0; strip_index<num_strips; ++strip_index)
     {
         uint64_t saved[BCP_MAX_CHANNELS];
@@ -2097,7 +2095,7 @@ static inline void bc4_decode_index_payload(le_stream* s, le_model* first_index,
 // Compresses a BC4 / BC5 texture: [image] holds (width/4) * (height/4) blocks, each
 // [num_channels] bc4_block (1 for BC4, red + green for BC5). shared by the two formats
 // gcc 13 misreports the per-strip MTF state as maybe-uninitialized in the ipa-constprop
-// clones of this function; the state is zero-initialized at declaration, a false positive
+// clones of this function; count is cleared per strip and pair is only read below count
 #if defined(__GNUC__) && !defined(__clang__)
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
@@ -2177,9 +2175,6 @@ static size_t bcp_compress_bc45(bcp_context* ctx, const void* image, uint32_t wi
     stream_align(&stream, sizeof(uint32_t));
     size_t previous_offset = stream.pos;
 
-    mtf_list mtf[BCP_MAX_CHANNELS] = { 0 };
-    bc4_dict dict[BCP_MAX_CHANNELS] = { 0 };
-
     for(uint32_t strip_index=0; strip_index<*num_strips; ++strip_index)
     {
         le_stream compressed_stream;
@@ -2204,14 +2199,13 @@ static size_t bcp_compress_bc45(bcp_context* ctx, const void* image, uint32_t wi
         }
 
         // the MTF list and the index-word dictionary are cleared per tile, mirroring the pre-pass
-        for(uint32_t c=0; c<BCP_MAX_CHANNELS; ++c)
-        {
-            mtf[c] = (mtf_list){ 0 };
-            dict[c] = (bc4_dict){ 0 };
-        }
+        mtf_list mtf[BCP_MAX_CHANNELS];
+        bc4_dict dict[BCP_MAX_CHANNELS];
         uint8_t dict_enable[BCP_MAX_CHANNELS];
         for(uint32_t c=0; c<num_channels; ++c)
         {
+            mtf[c].count = 0;
+            dict[c].count = 0;
             dict_enable[c] = (uint8_t)((ctx->bc4_dict_enable[c] >> strip_index) & 1);
             for(uint32_t i=0; i<BC4_DICT_MAP_SIZE; ++i)
                 ctx->hashmap[c * BC4_DICT_MAP_SIZE + i].count = 0;
@@ -2246,10 +2240,10 @@ static size_t bcp_compress_bc45(bcp_context* ctx, const void* image, uint32_t wi
                         // the 9-symbol rank of the block's pair: 0..7 = the pair at that list position,
                         // 8 = escape to the two wrapped deltas; the list is updated in either case
                         uint16_t pair = (uint16_t)(b->endpoint[0] | (b->endpoint[1] << 8));
-                        uint32_t rank = mtf_rank(mtf[c], pair);
+                        uint32_t rank = mtf_rank(&mtf[c], pair);
 
                         le_encode_symbol(&compressed_stream, &ctx->bc4_mtf_model[c], (uint8_t)rank);
-                        mtf[c] = mtf_touch(mtf[c], pair);
+                        mtf_touch(&mtf[c], pair);
 
                         if (rank >= BC4_MTF_SIZE)
                         {
@@ -2420,11 +2414,15 @@ static bool bcp_decompress_bc45(bcp_context* ctx, const void* input, size_t inpu
     // the MTF list and the index-word dictionary are cleared per tile, one thread decodes one
     // tile so this is the whole state; the decoder keeps no lookup map (the rank names the
     // list position directly)
-    mtf_list mtf[BCP_MAX_CHANNELS] = { 0 };
-    bc4_dict dict[BCP_MAX_CHANNELS] = { 0 };
+    mtf_list mtf[BCP_MAX_CHANNELS];
+    bc4_dict dict[BCP_MAX_CHANNELS];
     uint8_t dict_enable[BCP_MAX_CHANNELS];
     for(uint32_t c=0; c<num_channels; ++c)
+    {
+        mtf[c].count = 0;
+        dict[c].count = 0;
         dict_enable[c] = (uint8_t)((ctx->bc4_dict_enable[c] >> strip_index) & 1);
+    }
 
     tile_bounds tb = tile_bounds_get(strip_index, width_blocks, height_blocks, num_strips);
     uint32_t tile_width = tb.x1 - tb.x0;
@@ -2469,7 +2467,7 @@ static bool bcp_decompress_bc45(bcp_context* ctx, const void* input, size_t inpu
                         }
                     }
 
-                    mtf[c] = mtf_touch(mtf[c], (uint16_t)(b->endpoint[0] | (b->endpoint[1] << 8)));
+                    mtf_touch(&mtf[c], (uint16_t)(b->endpoint[0] | (b->endpoint[1] << 8)));
                 }
                 else
                 {
