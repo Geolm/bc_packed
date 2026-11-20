@@ -360,7 +360,7 @@ kernel void bcp_decompress_bc1(const device uint8_t* input [[buffer(0)]],
     if (grid_pos.x >= NUM_STRIPS)
         return;
 
-    if ((args.width < 16) || (args.height < 256))
+    if ((args.width < 16) || (args.height < 256) || (args.width & 3) || (args.height & 3))
         return;
 
     const uint strip_id = grid_pos.x;
@@ -709,7 +709,7 @@ void bc45_decode_strip(const device uint8_t* input,
                        constant decode_args_t& args,
                        uint3 grid_pos)
 {
-    if ((args.width < 16) || (args.height < 256) || (grid_pos.x >= NUM_STRIPS))
+    if ((args.width < 16) || (args.height < 256) || (args.width & 3) || (args.height & 3) || (grid_pos.x >= NUM_STRIPS))
         return;
 
     const uint strip_id = grid_pos.x;

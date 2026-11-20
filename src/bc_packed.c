@@ -2102,7 +2102,8 @@ static inline void bc4_decode_index_payload(le_stream* s, le_model* first_index,
 #endif
 static size_t bcp_compress_bc45(bcp_context* ctx, const void* image, uint32_t width, uint32_t height, uint8_t* output, size_t output_length, uint32_t* num_strips, uint32_t num_channels, uint32_t block_stride)
 {
-    if ((width < 16) || (height < 256) || !image || !ctx || !output || !num_strips || (num_channels < 1) || (num_channels > BCP_MAX_CHANNELS))
+    if ((width < 16) || (height < 256) || (width & 3) || (height & 3) || !image || !ctx || !output ||
+        !num_strips || (num_channels < 1) || (num_channels > BCP_MAX_CHANNELS))
         return 0;
 
     *num_strips = 64;   // for now, could depend on the resolution in the future
@@ -2326,7 +2327,8 @@ static size_t bcp_compress_bc45(bcp_context* ctx, const void* image, uint32_t wi
 // references (top / top_previous) are read back from [output], which holds the decoded rows
 static bool bcp_decompress_bc45(bcp_context* ctx, const void* input, size_t input_length, uint32_t width, uint32_t height, uint32_t num_strips, void* output, uint32_t strip_index, uint32_t num_channels, uint32_t block_stride)
 {
-    if ((width < 16) || (height < 256) || !input || !ctx || !output || (num_strips == 0) || (strip_index >= num_strips) || (num_channels < 1) || (num_channels > BCP_MAX_CHANNELS))
+    if ((width < 16) || (height < 256) || (width & 3) || (height & 3) || !input || !ctx || !output ||
+        (num_strips == 0) || (strip_index >= num_strips) || (num_channels < 1) || (num_channels > BCP_MAX_CHANNELS))
         return false;
 
     const uint32_t height_blocks = height / 4;
@@ -2533,7 +2535,10 @@ static bool bcp_decompress_bc45(bcp_context* ctx, const void* input, size_t inpu
 //-----------------------------------------------------------------------------------------------------------------------------
 bcp_context* bcp_init(bcp_mem_interface* user_mem)
 {
-    bcp_mem_interface mem = (user_mem) ? *user_mem : default_allocator();
+    bcp_mem_interface mem = default_allocator();
+
+    if ((user_mem != NULL) && (user_mem->malloc_fn != NULL) && (user_mem->realloc_fn != NULL) && (user_mem->free_fn != NULL))
+        mem = *user_mem;
 
     bcp_context* ctx = mem.malloc_fn(sizeof(bcp_context), mem.user);
     if (ctx == NULL)
@@ -2547,10 +2552,13 @@ bcp_context* bcp_init(bcp_mem_interface* user_mem)
 //-----------------------------------------------------------------------------------------------------------------------------
 size_t packed_bc1_maxsize(uint32_t width, uint32_t height)
 {
-    // very rough. the +4 covers the worst-case header growth of the flat-index mode byte: it is written
-    // right after the top-table size, before the 4-byte align, so the header can grow by up to the
-    // 4-byte alignment quantum
-    return (width/4) * (height/4) * 2 * sizeof(bc1_block) + 4;
+    // worst-case header in bytes: the color models at their max rank tables (16 of 3 + 128,
+    // the two uncontexted endpoint-0 green slots always save the dummy 3 + 1 model), the
+    // reference / difference models of 3 + 256, the mask model of 3 + 16, the size + mode
+    // bytes (2), the alignment paddings (3 + 1 + 3), the seed + predictor + dict-enable words
+    // (20), the full top table (1024) and the 63 strip offsets (126):
+    // 16 * 131 + 2 * 4 + 2 * 259 + 19 + 2 + 7 + 20 + 1024 + 126 = 3820
+    return (width/4) * (height/4) * 2 * sizeof(bc1_block) + 3820;
 }
 
 //-----------------------------------------------------------------------------------------------------------------------------
@@ -2558,7 +2566,7 @@ size_t packed_bc1_maxsize(uint32_t width, uint32_t height)
 // 2 for the color half of a BC3 grid (see bcp_compress_bc3)
 static size_t bcp_compress_bc1_impl(bcp_context* ctx, const void* bc1_image, uint32_t block_stride, uint32_t width, uint32_t height, uint8_t* output, size_t output_length, uint32_t* num_strips)
 {
-    if (width < 16 || height < 256 || !bc1_image || !ctx || !output || !num_strips)
+    if (width < 16 || height < 256 || (width & 3) || (height & 3) || !bc1_image || !ctx || !output || !num_strips)
         return 0;
 
     *num_strips = 64;   // for now, could depend on the resolution in the future
@@ -2759,7 +2767,7 @@ size_t bcp_compress_bc1(bcp_context* ctx, const void* bc1_image, uint32_t width,
 // 2 for the color half of a BC3 grid (see bcp_decompress_bc3)
 static bool bcp_decompress_bc1_impl(bcp_context* ctx, const void* input, size_t input_length, uint32_t width, uint32_t height, uint32_t num_strips, void* output, uint32_t strip_index, uint32_t block_stride)
 {
-    if (width < 16 || height < 256 || !input || !ctx || !output || strip_index >= num_strips)
+    if (width < 16 || height < 256 || (width & 3) || (height & 3) || !input || !ctx || !output || strip_index >= num_strips)
         return false;
 
     const uint32_t height_blocks = height / 4;
@@ -2947,15 +2955,19 @@ bool bcp_decompress_bc1(bcp_context* ctx, const void* input, size_t input_length
 //-----------------------------------------------------------------------------------------------------------------------------
 size_t packed_bc4_maxsize(uint32_t width, uint32_t height)
 {
-    // very rough: 2x the standard BC4 block size, the BC1 convention. the +296 covers the worst-case
-    // header growth: the three per-channel model slots (MTF-8 3 + 9, first-index 3 + 8, dictionary
-    // rank 3 + 256 bytes), the header byte, the 4-byte align and the 8-byte dictionary tile word
-    return (width/4) * (height/4) * 2 * sizeof(bc4_block) + 296;
+    // worst-case header in bytes: the 2 endpoint models of 3 + 256, the MTF-8 model of 3 + 9,
+    // the first-index model of 3 + 8, the dictionary rank model of 3 + 256, the 64 index models
+    // of 3 + 8, the 2 seed bytes, the header byte, the alignment paddings (3 + 1 + 3), the
+    // 8-byte dictionary tile word and the 63 strip offsets (126):
+    // 2 * 259 + 12 + 11 + 259 + 64 * 11 + 2 + 1 + 7 + 8 + 126 = 1648
+    return (width/4) * (height/4) * 2 * sizeof(bc4_block) + 1648;
 }
 
 //-----------------------------------------------------------------------------------------------------------------------------
 size_t packed_bc5_maxsize(uint32_t width, uint32_t height)
 {
+    // 2 channels: the exact BC5 worst-case header (3163) stays below 2x the BC4 one, so the
+    // doubling keeps a valid bound
     return 2 * packed_bc4_maxsize(width, height);
 }
 
@@ -3054,6 +3066,9 @@ bool bcp_decompress_bc3(bcp_context* ctx, const void* input, size_t input_length
 //-----------------------------------------------------------------------------------------------------------------------------
 void bcp_terminate(bcp_context* ctx)
 {
+    if (ctx == NULL)
+        return;
+
     bcp_mem_interface mem = ctx->mem;
 
     mem.free_fn(ctx->hashmap, mem.user);

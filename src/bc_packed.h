@@ -14,12 +14,13 @@ extern "C" {
 // version
 #define BC_PACKED_MAJOR 2
 #define BC_PACKED_MINOR 1
-#define BC_PACKED_PATCH 5
+#define BC_PACKED_PATCH 6
 
 
 //----------------------------------------------------------------------------------------------------------------------------
 // Memory interface, used for the large working buffers of the compressor.
-// If NULL is passed to bcp_init, a standard malloc/realloc/free backend is used.
+// If NULL is passed to bcp_init, or the interface has a missing function pointer,
+// a standard malloc/realloc/free backend is used.
 
 typedef struct bcp_mem_interface
 {
@@ -32,6 +33,9 @@ typedef struct bcp_mem_interface
 
 typedef struct bcp_context bcp_context;
 
+// Not thread-safe: compression and decompression both rewrite the context state
+// (models, top table, stream flags), so use one context per thread.
+
 
 //----------------------------------------------------------------------------------------------------------------------------
 // Creates a context. Returns NULL if the allocation fails.
@@ -42,8 +46,10 @@ bcp_context* bcp_init(bcp_mem_interface* mem);
 void bcp_terminate(bcp_context* ctx);
 
 //----------------------------------------------------------------------------------------------------------------------------
-// Maximum size of the compressed stream for a given texture, in bytes.
-// The [output] buffer of bcp_compress_bc1 must be at least this large.
+// Upper bound of the compressed stream size for a given texture, in bytes, for regular
+// content: the worst-case stream header plus 2x the standard BC1 size. Highly
+// incompressible content can still exceed it; bcp_compress_bc1 returns 0 when the
+// [output] buffer is too small.
 size_t packed_bc1_maxsize(uint32_t width, uint32_t height);
 
 //----------------------------------------------------------------------------------------------------------------------------
@@ -61,14 +67,16 @@ size_t bcp_compress_bc1(bcp_context* ctx, const void* bc1_image, uint32_t width,
 //      [width, height] dimensions of the output BC1 image
 //      [num_strips]    number of strips, as returned by bcp_compress_bc1
 //      [output]        must be big enough to contain a BC1 image of width x height
-//      [strip_index]   index of the strip, must be in [0; num_strips[
+//      [strip_index]   index of the strip, must be in [0; num_strips[)
 // Returns false on error otherwise true
 bool bcp_decompress_bc1(bcp_context* ctx, const void* input, size_t input_length, uint32_t width, uint32_t height, uint32_t num_strips, void* output, uint32_t strip_index);
 
 //----------------------------------------------------------------------------------------------------------------------------
-// Maximum size of the compressed stream for a given BC4 / BC5 texture, in bytes:
-// 2x the standard block size, 16 bytes per 4x4 block for BC4 and 32 for BC5.
-// The [output] buffer of bcp_compress_bc4 / bcp_compress_bc5 must be at least this large.
+// Upper bound of the compressed stream size for a given BC4 / BC5 texture, in bytes, for
+// regular content: the worst-case stream header plus 2x the standard block size, 16 bytes
+// per 4x4 block for BC4 and 32 for BC5 (packed_bc5_maxsize = 2 x packed_bc4_maxsize).
+// Highly incompressible content can still exceed it; bcp_compress_bc4 / bcp_compress_bc5
+// return 0 when the [output] buffer is too small.
 size_t packed_bc4_maxsize(uint32_t width, uint32_t height);
 size_t packed_bc5_maxsize(uint32_t width, uint32_t height);
 
@@ -91,15 +99,15 @@ size_t bcp_compress_bc5(bcp_context* ctx, const void* bc5_image, uint32_t width,
 //      [width, height] dimensions of the output BC4 / BC5 image
 //      [num_strips]    number of strips, as returned by bcp_compress_bc4 / bcp_compress_bc5
 //      [output]        must be big enough to contain a BC4 / BC5 image of width x height
-//      [strip_index]   index of the strip, must be in [0; num_strips[
+//      [strip_index]   index of the strip, must be in [0; num_strips[)
 // Returns false on error otherwise true
 bool bcp_decompress_bc4(bcp_context* ctx, const void* input, size_t input_length, uint32_t width, uint32_t height, uint32_t num_strips, void* output, uint32_t strip_index);
 bool bcp_decompress_bc5(bcp_context* ctx, const void* input, size_t input_length, uint32_t width, uint32_t height, uint32_t num_strips, void* output, uint32_t strip_index);
 
 //----------------------------------------------------------------------------------------------------------------------------
-// Maximum size of the compressed stream for a given BC3 texture, in bytes:
-// packed_bc1_maxsize + packed_bc4_maxsize + 4 (the prefix, see the stream description below).
-// The [output] buffer of bcp_compress_bc3 must be at least this large.
+// Upper bound of the compressed stream size for a given BC3 texture, in bytes, with the
+// same convention as BC1 / BC4: packed_bc1_maxsize + packed_bc4_maxsize + 4 (the prefix,
+// see the stream description below).
 size_t packed_bc3_maxsize(uint32_t width, uint32_t height);
 
 //----------------------------------------------------------------------------------------------------------------------------

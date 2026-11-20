@@ -1525,6 +1525,131 @@ TEST bc3_random_splitmix32(void)
 
 
 //-----------------------------------------------------------------------------------------------------------------------------
+// the malloc half of a partially initialized memory interface: only present so the
+// fallback test can build an interface with exactly one of the three function pointers
+static void* partial_mem_malloc(size_t size, void* user)
+{
+    (void)user;
+    return malloc(size);
+}
+
+//-----------------------------------------------------------------------------------------------------------------------------
+// bcp_terminate documents that NULL is accepted; it must return without touching the backend
+TEST terminate_null(void)
+{
+    bcp_terminate(NULL);
+
+    PASS();
+}
+
+//-----------------------------------------------------------------------------------------------------------------------------
+// the API documents width / height as multiples of 4; anything else must be rejected up
+// front, not silently truncated to the largest multiple of 4
+TEST invalid_dimensions(void)
+{
+    bcp_context* ctx = bcp_init(NULL);
+    ASSERT(ctx != NULL);
+
+    bc1_block image[TINY_IMAGE_BLOCKS];
+    for (uint32_t i = 0; i < TINY_IMAGE_BLOCKS; ++i)
+        image[i] = (bc1_block) { .color = {red, cyan}, .indices = 0x33333333 };
+
+    bc4_block image4[TINY_IMAGE_BLOCKS];
+    for (uint32_t i = 0; i < TINY_IMAGE_BLOCKS; ++i)
+    {
+        image4[i].endpoint[0] = 0x10;
+        image4[i].endpoint[1] = 0x20;
+        for (uint32_t j = 0; j < 6; ++j)
+            image4[i].indices[j] = (uint8_t)(i + j);
+    }
+
+    const size_t buffer_size = packed_bc1_maxsize(16, 256);
+    uint8_t* buffer = malloc(buffer_size);
+    ASSERT(buffer != NULL);
+
+    uint32_t num_strips = 0;
+    ASSERT(bcp_compress_bc1(ctx, image, 18, 256, buffer, buffer_size, &num_strips) == 0);
+    ASSERT(bcp_compress_bc1(ctx, image, 16, 258, buffer, buffer_size, &num_strips) == 0);
+    ASSERT(bcp_compress_bc1(ctx, image, 18, 258, buffer, buffer_size, &num_strips) == 0);
+    ASSERT(bcp_compress_bc4(ctx, image4, 18, 256, buffer, buffer_size, &num_strips) == 0);
+    ASSERT(bcp_compress_bc5(ctx, image4, 16, 258, buffer, buffer_size, &num_strips) == 0);
+    ASSERT(bcp_compress_bc3(ctx, image, 18, 256, buffer, buffer_size, &num_strips) == 0);
+
+    bc1_block* output = malloc(TINY_IMAGE_BLOCKS * sizeof(bc1_block));
+    ASSERT(output != NULL);
+    ASSERT(bcp_decompress_bc1(ctx, buffer, 8, 18, 256, 64, output, 0) == false);
+    ASSERT(bcp_decompress_bc1(ctx, buffer, 8, 16, 258, 64, output, 0) == false);
+    ASSERT(bcp_decompress_bc4(ctx, buffer, 8, 18, 256, 64, output, 0) == false);
+    ASSERT(bcp_decompress_bc5(ctx, buffer, 8, 16, 258, 64, output, 0) == false);
+
+    free(output);
+    free(buffer);
+    bcp_terminate(ctx);
+
+    PASS();
+}
+
+//-----------------------------------------------------------------------------------------------------------------------------
+// a user memory interface with a missing function pointer must fall back to the default
+// malloc/realloc/free backend instead of calling the NULL pointer on the first hashmap
+// growth / free
+TEST partial_mem_interface(void)
+{
+    bcp_mem_interface partial;
+    memset(&partial, 0, sizeof(partial));
+    partial.malloc_fn = partial_mem_malloc;
+
+    bcp_context* ctx = bcp_init(&partial);
+    ASSERT(ctx != NULL);
+
+    bc1_block image[TINY_IMAGE_BLOCKS];
+    for (uint32_t i = 0; i < TINY_IMAGE_BLOCKS; ++i)
+        image[i] = (bc1_block) { .color = {red, cyan}, .indices = 0x33333333 };
+
+    const size_t buffer_size = packed_bc1_maxsize(16, 256);
+    uint8_t* buffer = malloc(buffer_size);
+    ASSERT(buffer != NULL);
+
+    // the compression run grows the working hashmap (the missing realloc_fn would be called)
+    // and bcp_terminate frees it (the missing free_fn would be called)
+    uint32_t num_strips = 0;
+    ASSERT(bcp_compress_bc1(ctx, image, 16, 256, buffer, buffer_size, &num_strips) != 0);
+
+    free(buffer);
+    bcp_terminate(ctx);
+
+    PASS();
+}
+
+//-----------------------------------------------------------------------------------------------------------------------------
+// pseudo-random content at the minimum supported size: the incompressible case that fills
+// the model rank tables, where the worst-case header term of packed_bc1_maxsize (3820 bytes)
+// dominates the small payload budget. the stream must fit the documented maxsize buffer and
+// round-trip byte-exact
+TEST tiny_random_maxsize(void)
+{
+    const uint32_t width = 16;
+    const uint32_t height = 256;
+
+    bc1_block image[TINY_IMAGE_BLOCKS];
+    uint32_t rng_state = 0xA5A5A5A5u;
+    for (uint32_t i = 0; i < TINY_IMAGE_BLOCKS; ++i)
+    {
+        uint32_t r1 = splitmix32(&rng_state);
+        uint32_t r2 = splitmix32(&rng_state);
+
+        image[i] = (bc1_block)
+        {
+            .color = {(uint16_t)(r1 & 0xFFFF), (uint16_t)(r1 >> 16)},
+            .indices = r2
+        };
+    }
+
+    return roundtrip(image, width, height);
+}
+
+
+//-----------------------------------------------------------------------------------------------------------------------------
 SUITE(suite_synthetic)
 {
     RUN_TEST(flat);
@@ -1567,4 +1692,8 @@ SUITE(suite_synthetic)
     RUN_TEST(tile_uniform_colors);
     RUN_TEST(tile_column_predictor);
     RUN_TEST(odd_dimensions);
+    RUN_TEST(terminate_null);
+    RUN_TEST(invalid_dimensions);
+    RUN_TEST(partial_mem_interface);
+    RUN_TEST(tiny_random_maxsize);
 }

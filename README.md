@@ -197,7 +197,7 @@ distance = popcount(block_indices XOR table_entry)
 ### Stream
 
 * Self-describing: no width / height / format in the stream — the user stores that.
-* Output buffer ≥ `packed_bc1_maxsize(w, h) = (w/4) * (h/4) * 16` (2× standard BC1; actual streams are much smaller).
+* Output buffer ≥ `packed_bc1_maxsize(w, h) = (w/4) * (h/4) * 16 + 3820` (2× standard BC1 payload estimate + the worst-case 3820-byte header; actual streams are much smaller, highly incompressible content can still exceed the bound — the compressor returns 0 then).
 
 ## BC4 / BC5
 
@@ -285,7 +285,7 @@ rank 255    → escape: the full payload; the word is inserted at the front
 
 * CPU + GPU; the Metal kernels `bcp_decompress_bc4` / `bcp_decompress_bc5` are bit-identical to the CPU (one thread per tile). M5 Pro 1024×1024: **14540 MiB/s** BC4, **7868 MiB/s** BC5.
 * `width >= 16`, `height >= 256` (multiples of 4).
-* Output buffer ≥ `packed_bc4_maxsize` / `packed_bc5_maxsize` (2× standard block size: 16 / 32 bytes per 4×4 block).
+* Output buffer ≥ `packed_bc4_maxsize` / `packed_bc5_maxsize` (2× standard block size, 16 / 32 bytes per 4×4 block, plus the worst-case header: +1648 bytes for BC4, `packed_bc5_maxsize = 2 × packed_bc4_maxsize`; same return-0 convention as BC1).
 
 **Validation** — byte-exact over all 64 tiles, CPU and GPU:
 
@@ -302,7 +302,7 @@ BC1 color + BC4 alpha in the standard D3D layout, 16 bytes per 4×4 block. Entry
 * **Scheme** — composition of the two pipelines: BC1 on the color half, single-channel BC4 on the alpha half. No payload logic, model, or context state is new — the tiles, zigzag chains, predictors, top table, dictionaries, and models are all the existing ones, fitted on their own half.
 * **Stream** — self-describing: a u32 LE prefix (BC1 substream size), then the BC1 stream of the color half, then the BC4 stream of the alpha half (1 channel). Each substream is self-contained; the halves share the 64-tile split, so one `bcp_decompress_bc3` call decodes one tile of both.
 * **Status** — CPU only (BC3 is niche; no Metal decoder, the BC1/BC4 kernels cover the two halves). `width >= 16`, `height >= 256`. Output buffer ≥ `packed_bc3_maxsize` (2× 32 bytes per 4×4 block) + 4-byte prefix.
-* **Validation** — byte-exact on CPU: 4 synthetic 256×256 roundtrips (flat / checkerboard / gradient / random, both halves at once); 2 albedo + alpha maps (`images/bc3`), suite average must stay above 1:1 — measured **2.8787:1** (3.2210:1 leak-stain_albedo, 2.5364:1 leaves).
+* **Validation** — byte-exact on CPU: 4 synthetic 256×256 roundtrips (flat / checkerboard / gradient / random, both halves at once); 2 albedo + alpha maps (`images/bc3`), suite average must stay above 2.7:1 — measured **4.4413:1** (4.8761:1 leak-stain_albedo, 4.0064:1 leaves).
 
 ## Images
 
